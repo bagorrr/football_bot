@@ -779,7 +779,16 @@ class TelethonProvider:
             if isinstance(entry, SourceChatRegistryEntry):
                 generations[identity] = entry.registry_generation
             elif isinstance(entry, TelegramPeerIdentity):
-                generations[identity] = 1
+                generation = (
+                    self._source_scope_generation_lookup(identity)
+                    if self._source_scope_generation_lookup is not None
+                    else 1
+                )
+                if type(generation) is not int or generation < 1:
+                    raise TelethonConformanceError(
+                        key="APPROVED_SOURCE_CHATS", status="scope_invalid"
+                    )
+                generations[identity] = generation
             else:
                 raise TelethonConformanceError(
                     key="APPROVED_SOURCE_CHATS", status="scope_invalid"
@@ -3257,7 +3266,20 @@ class TelethonProvider:
                 try:
                     asyncio.get_running_loop()
                 except RuntimeError:
-                    result = asyncio.run(cast(Coroutine[Any, Any, Any], result))
+                    client_loop = getattr(self._client, "loop", None)
+                    if (
+                        isinstance(client_loop, asyncio.AbstractEventLoop)
+                        and client_loop.is_running()
+                    ):
+
+                        async def await_result() -> Any:
+                            return await result
+
+                        result = asyncio.run_coroutine_threadsafe(
+                            await_result(), client_loop
+                        ).result()
+                    else:
+                        result = asyncio.run(cast(Coroutine[Any, Any, Any], result))
                 else:
                     raise RuntimeError("Telethon provider cannot block a running loop")
             return result
@@ -3307,12 +3329,15 @@ class TelethonIngestionAdapter:
         live_update_callback: Callable[[TelegramPeerIdentity], None] | None = None,
         message_identity_lookup: Callable[[int], TelegramPeerIdentity | None]
         | None = None,
+        source_scope_generation_lookup: Callable[[TelegramPeerIdentity], int | None]
+        | None = None,
     ) -> TelethonIngestionAdapter:
         """Compose and verify the concrete provider at the T2 boundary."""
         scope = tuple(approved_source_chats)
         source = runtime.create_production_provider(
             approved_source_chats=scope,
             message_identity_lookup=message_identity_lookup,
+            source_scope_generation_lookup=source_scope_generation_lookup,
         )
         runtime.verify_conformance(
             transport=source,

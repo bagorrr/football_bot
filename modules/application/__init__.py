@@ -17271,6 +17271,10 @@ class RuntimeApplication:
                         and definition.version == 2
                     )
                     or (
+                        definition.name is ContractName.SOURCE_DATA_DELETION_REMINDER
+                        and definition.version == 2
+                    )
+                    or (
                         definition.name is ContractName.RUN_SEARCH
                         and definition.version in {2, 3}
                     )
@@ -18518,6 +18522,7 @@ class RuntimeApplication:
             result = self.store.accept_source_data_deletion_reminder(
                 incoming=envelope,
                 received_at=self.clock.now(),
+                administrator_id=self.telegram_admin_user_id,
             )
             return result is ConsumeResult.APPLIED
         if self.role is RuntimeRole.APPLICATION and envelope.contract_name in {
@@ -19121,6 +19126,7 @@ class RuntimeApplication:
             self.store.accept_source_data_deletion_reminder(
                 incoming=supported_incoming,
                 received_at=self.clock.now(),
+                administrator_id=self.telegram_admin_user_id,
             )
             return True
         if (
@@ -22189,7 +22195,10 @@ class RuntimeApplication:
             kind=TelegramPeerKind(raw_peer_kind),
             telegram_id=telegram_chat_id,
         )
-        if telegram_user_id != self.telegram_admin_user_id:
+        if (
+            self.telegram_admin_user_id is not None
+            and telegram_user_id != self.telegram_admin_user_id
+        ):
             self.store.consume(
                 incoming=incoming,
                 supported_versions=self.versions_for(incoming.contract_name),
@@ -22332,7 +22341,10 @@ class RuntimeApplication:
         )
         if inject_outbox_conflict:
             outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
-        if telegram_user_id != self.telegram_admin_user_id:
+        if (
+            self.telegram_admin_user_id is not None
+            and telegram_user_id != self.telegram_admin_user_id
+        ):
             self._fail_source_chat_registration(
                 incoming,
                 telegram_user_id=telegram_user_id,
@@ -22854,7 +22866,10 @@ class RuntimeApplication:
                 outgoing=failure,
             )
             return
-        if telegram_user_id != self.telegram_admin_user_id:
+        if (
+            self.telegram_admin_user_id is not None
+            and telegram_user_id != self.telegram_admin_user_id
+        ):
             self._fail_source_chat_registration(
                 incoming,
                 telegram_user_id=telegram_user_id,

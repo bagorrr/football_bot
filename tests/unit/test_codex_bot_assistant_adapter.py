@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event, Lock
@@ -530,6 +531,57 @@ def test_sdk_worker_uses_one_ephemeral_read_only_turn_and_disables_tools() -> No
     )
     assert rejected["failure_code"] == "invalid_configuration"
     assert untrusted_sdk.clients == []
+
+
+def test_sdk_worker_accepts_semantic_date_context_without_enabling_tools() -> None:
+    request = replace(
+        _request(locale="de", message="nächstes Wochenende"),
+        stage=ConversationStage.REQUIRED_DATE,
+        prompt_version="semantic-interpretation-v1",
+        context_policy_version="semantic-interpretation-context-v1",
+        completed_search_id="",
+        current_time=datetime(2026, 9, 13, 8, 15, tzinfo=UTC),
+        iana_timezone="Europe/Berlin",
+        local_date="2026-09-13",
+        timezone_data_version="tzdb-controlled-1",
+    )
+    payload = _input_envelope(request)
+    settings = BotAssistantSdkSettings()
+    fake_sdk = _FakeSdkBindings()
+
+    result = run_codex_worker_turn(
+        payload,
+        environment={
+            "PATH": os.defpath,
+            "HOME": "/tmp/isolated-home",
+            "TMPDIR": "/tmp/isolated-tmp",
+            "CODEX_HOME": "/protected/codex-subscription-store",
+            **settings.to_worker_projection(),
+        },
+        sdk_bindings=fake_sdk.bindings,
+        cwd=Path("/tmp/empty-worker"),
+    )
+
+    assert result["outcome"] == "success"
+    assert len(fake_sdk.clients) == 1
+    client = fake_sdk.clients[0]
+    assert client.thread_start_args["ephemeral"] is True
+    assert client.thread_start_args["sandbox"] is fake_sdk.sandbox.read_only
+    assert client.config.config_overrides == CODEX_CONFIG_OVERRIDES
+    assert client.threads[0].run_args["effort"] == "high"
+    assert client.threads[0].run_args["sandbox"] is fake_sdk.sandbox.read_only
+    semantic_prompt = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "assistant"
+            / "prompts"
+            / "semantic-interpretation-v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert (
+        client.thread_start_args["developer_instructions"]
+        == semantic_prompt["developer_instructions"]
+    )
 
 
 @pytest.mark.parametrize(

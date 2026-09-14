@@ -1255,6 +1255,12 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read the current active generation for account-page scope gating."""
         ...
 
+    def active_source_chat_ingestion_scope(
+        self,
+    ) -> tuple[tuple[TelegramPeerIdentity, int], ...]:
+        """Read only active Source Chat identities and generations for T2."""
+        ...
+
     def initialize_account_ingestion_checkpoint(
         self,
         checkpoint: TelegramAccountCheckpoint,
@@ -1486,8 +1492,9 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         incoming: ContractEnvelope,
         received_at: datetime,
+        administrator_id: int | None = None,
     ) -> ConsumeResult:
-        """Queue one body-free administrator reminder delivery."""
+        """Queue one reminder for the T1-configured administrator destination."""
         ...
 
     def source_data_deletion_replay_barriers(

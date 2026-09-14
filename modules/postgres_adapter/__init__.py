@@ -2759,6 +2759,14 @@ class PostgresAcceptanceObserver:
         )
 
 
+class PostgresRoleReadinessError(RuntimeError):
+    """A redacted database-role startup check failed."""
+
+    def __init__(self, *, status: str) -> None:
+        self.status = status
+        super().__init__(f"PostgreSQL role readiness {status}")
+
+
 class PostgresRoleStore:
     """Persistence capability scoped to one runtime credential and owner."""
 
@@ -2788,6 +2796,21 @@ class PostgresRoleStore:
     def require_classifier_promotion(self) -> bool:
         """Return whether every classifier publication needs promotion evidence."""
         return self._require_classifier_promotion
+
+    def check_startup_readiness(self) -> None:
+        """Check database availability, role identity, and migrated schema."""
+        try:
+            with psycopg.connect(self._database_url) as connection:
+                row = connection.execute(
+                    """
+                    SELECT SESSION_USER,
+                           to_regnamespace('football_runtime') IS NOT NULL
+                    """
+                ).fetchone()
+        except Exception:
+            raise PostgresRoleReadinessError(status="database_unavailable") from None
+        if row is None or row[0] != self._role.database_role or row[1] is not True:
+            raise PostgresRoleReadinessError(status="identity_or_schema_mismatch")
 
     def commit_initial(
         self,
@@ -3808,6 +3831,35 @@ class PostgresRoleStore:
         if type(generation) is not int or generation < 1:
             raise ValueError("Source Chat ingestion generation is invalid")
         return generation
+
+    def active_source_chat_ingestion_scope(
+        self,
+    ) -> tuple[tuple[TelegramPeerIdentity, int], ...]:
+        """Read only active typed Telegram identities and generations through T2."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT peer_kind, telegram_chat_id, registry_generation
+                FROM football_runtime.read_active_source_chat_ingestion_scope()
+                """
+            ).fetchall()
+        scope: list[tuple[TelegramPeerIdentity, int]] = []
+        for row in rows:
+            generation = row["registry_generation"]
+            if type(generation) is not int or generation < 1:
+                raise ValueError("Source Chat ingestion generation is invalid")
+            scope.append(
+                (
+                    TelegramPeerIdentity(
+                        kind=TelegramPeerKind(row["peer_kind"]),
+                        telegram_id=row["telegram_chat_id"],
+                    ),
+                    generation,
+                )
+            )
+        return tuple(scope)
 
     def ensure_source_chat_history_progress(
         self,
@@ -6870,7 +6922,7 @@ class PostgresRoleStore:
     def remind_source_data_deletion_requests(
         self, *, as_of: datetime, administrator_id: int | None = None
     ) -> int:
-        """Deliver due body-free reminders without changing workflow state."""
+        """Queue due body-free reminders for Bot Assistant delivery."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
         if as_of.tzinfo is None:
@@ -6907,18 +6959,17 @@ class PostgresRoleStore:
             )
             rows = result.fetchall()
             for row in rows:
-                if administrator_id is not None:
-                    _insert_outbox(
-                        connection,
-                        _source_data_deletion_reminder_envelope(
-                            request_id=row["request_id"],
-                            administrator_id=administrator_id,
-                            status=row["status"],
-                            reminder_at=as_of,
-                            deadline_at=row["deadline_at"],
-                            reminder_count=row["reminder_count"],
-                        ),
-                    )
+                _insert_outbox(
+                    connection,
+                    _source_data_deletion_reminder_envelope(
+                        request_id=row["request_id"],
+                        administrator_id=administrator_id,
+                        status=row["status"],
+                        reminder_at=as_of,
+                        deadline_at=row["deadline_at"],
+                        reminder_count=row["reminder_count"],
+                    ),
+                )
                 _record_source_data_deletion_audit(
                     connection,
                     request_id=row["request_id"],
@@ -7109,8 +7160,9 @@ class PostgresRoleStore:
         *,
         incoming: ContractEnvelope,
         received_at: datetime,
+        administrator_id: int | None = None,
     ) -> ConsumeResult:
-        """Queue one body-free reminder for the configured administrator."""
+        """Queue one reminder for the T1-configured administrator destination."""
         if self._role is not RuntimeRole.BOT_ASSISTANT:
             raise ConversationAccessDeniedError
         if incoming.contract_name is not ContractName.SOURCE_DATA_DELETION_REMINDER:
@@ -7119,7 +7171,13 @@ class PostgresRoleStore:
         if not isinstance(payload, dict):
             raise TypeError("Source Data Deletion reminder payload is invalid")
         request_id = cast(str, payload["request_id"])
-        administrator_id = cast(int, payload["telegram_admin_user_id"])
+        if type(administrator_id) is not int or administrator_id < 1:
+            raise ValueError("Source Data Deletion administrator is unavailable")
+        if (
+            incoming.contract_version == 1
+            and payload.get("telegram_admin_user_id") != administrator_id
+        ):
+            raise ValueError("Source Data Deletion administrator identity mismatch")
         reminder_count = cast(int, payload["reminder_count"])
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             if not _begin_owned_contract(
@@ -18811,7 +18869,7 @@ def _record_source_data_deletion_audit(
 def _source_data_deletion_reminder_envelope(
     *,
     request_id: str,
-    administrator_id: int,
+    administrator_id: int | None,
     status: str,
     reminder_at: datetime,
     deadline_at: datetime,
@@ -18824,7 +18882,7 @@ def _source_data_deletion_reminder_envelope(
     )
     return ContractEnvelope(
         contract_name=ContractName.SOURCE_DATA_DELETION_REMINDER,
-        contract_version=1,
+        contract_version=1 if administrator_id is not None else 2,
         message_id=message_id,
         producer=RuntimeRole.APPLICATION,
         consumer=RuntimeRole.BOT_ASSISTANT,
@@ -18838,11 +18896,15 @@ def _source_data_deletion_reminder_envelope(
         recorded_at=reminder_at,
         payload={
             "request_id": request_id,
-            "telegram_admin_user_id": administrator_id,
             "status": status,
             "reminder_at": reminder_at.isoformat(),
             "deadline_at": deadline_at.isoformat(),
             "reminder_count": reminder_count,
+            **(
+                {"telegram_admin_user_id": administrator_id}
+                if administrator_id is not None
+                else {}
+            ),
         },
     )
 

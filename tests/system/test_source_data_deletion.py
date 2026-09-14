@@ -1124,6 +1124,38 @@ def test_source_data_deletion_reminder_delivery_and_failure_rearm(
     assert failed.next_reminder_at == clock.now()
 
 
+def test_source_data_deletion_reminder_uses_bot_assistant_identity_only() -> None:
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    administrator_id = 46_805
+    delivery = ControlledTelegramDeliveryAdapter()
+    system = _new_system(
+        clock=clock,
+        administrator_id=administrator_id,
+        telegram_delivery=delivery,
+        application_uses_admin_config=False,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="isolated-reminder:start",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    request = system.create_source_data_deletion_request(
+        request_id="deletion-request:isolated-reminder",
+        source_author_telegram_id=78_906,
+        source_chat_key="source-chat:chat:4680106",
+        support_case_pointer="support-case:isolated-reminder",
+    )
+    assert request.next_reminder_at is not None
+    clock.advance_to(request.next_reminder_at)
+
+    assert system.remind_source_data_deletion_requests() == 1
+    assert system.process_next_contract_handoff(RuntimeRole.BOT_ASSISTANT)
+    assert system.deliver_next_bot_message()
+
+    assert delivery.messages[-1].telegram_user_id == administrator_id
+
+
 def test_bot_source_data_cleanup_removes_result_context_and_retained_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1570,6 +1602,7 @@ def _new_system(
     administrator_id: int,
     telegram_ingestion: ControlledTelegramIngestionAdapter | None = None,
     telegram_delivery: ControlledTelegramDeliveryAdapter | None = None,
+    application_uses_admin_config: bool = True,
 ) -> AcceptanceSpine:
     return boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
@@ -1579,6 +1612,14 @@ def _new_system(
         model=ControlledModelAdapter(),
         location_resolver=ControlledLocationResolverAdapter(),
         telegram_admin_user_id=administrator_id,
+        telegram_admin_user_ids=(
+            {
+                RuntimeRole.APPLICATION: None,
+                RuntimeRole.BOT_ASSISTANT: administrator_id,
+            }
+            if not application_uses_admin_config
+            else None
+        ),
     )
 
 

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from threading import Thread
 from types import SimpleNamespace
 
 import pytest
@@ -565,6 +567,47 @@ def test_production_telethon_provider_is_lazy_and_wires_live_client_boundary() -
     assert client.calls[:3] == ["connect", "is_user_authorized", "get_me"]
     assert len(client.handlers) == 3
     assert client.calls[-2:] == ["catch_up", "run_until_disconnected"]
+
+
+def test_provider_schedules_async_transport_calls_on_its_running_client_loop() -> None:
+    loop = asyncio.new_event_loop()
+    loop_started = asyncio.Event()
+    observed_loops: list[asyncio.AbstractEventLoop] = []
+
+    class _LoopClient:
+        def __init__(self) -> None:
+            self.loop = loop
+
+        async def connect(self) -> None:
+            observed_loops.append(asyncio.get_running_loop())
+
+        async def is_user_authorized(self) -> bool:
+            observed_loops.append(asyncio.get_running_loop())
+            return True
+
+        async def get_me(self) -> object:
+            observed_loops.append(asyncio.get_running_loop())
+            return SimpleNamespace(id=123456)
+
+    def run_loop() -> None:
+        asyncio.set_event_loop(loop)
+        loop.call_soon(loop_started.set)
+        loop.run_forever()
+
+    thread = Thread(target=run_loop, daemon=True)
+    thread.start()
+    try:
+        assert asyncio.run_coroutine_threadsafe(loop_started.wait(), loop).result(
+            timeout=2
+        )
+        provider = TelethonProvider(client=_LoopClient())
+
+        assert provider.authenticate() == 123456
+        assert observed_loops == [loop, loop, loop]
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
 
 
 class _DifferenceClientProbe:

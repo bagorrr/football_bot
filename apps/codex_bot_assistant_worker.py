@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -77,6 +78,7 @@ _ALLOWED_WORKER_ENVIRONMENT_KEYS = {
     "LC_CTYPE",
     *T3_BOT_ASSISTANT_CONFIG_KEYS,
 }
+_LOCALE_PATTERN = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", re.IGNORECASE)
 
 
 def run_codex_worker_turn(
@@ -273,6 +275,11 @@ def _validate_context(
     fields = context_artifact.get("context_fields")
     locales = context_artifact.get("allowed_locales")
     stages = context_artifact.get("allowed_stages")
+    allow_bcp47_locales = context_artifact.get("allow_bcp47_locales", False)
+    locale = context.get("locale")
+    locale_allowed = isinstance(locales, list) and locale in locales
+    if not locale_allowed and allow_bcp47_locales is True and isinstance(locale, str):
+        locale_allowed = _LOCALE_PATTERN.fullmatch(locale) is not None
     external_knowledge_allowed = context_artifact.get("external_knowledge_allowed")
     if (
         not isinstance(fields, list)
@@ -280,7 +287,8 @@ def _validate_context(
         or set(context) != set(fields)
         or not isinstance(locales, list)
         or not isinstance(stages, list)
-        or context.get("locale") not in locales
+        or type(allow_bcp47_locales) is not bool
+        or not locale_allowed
         or context.get("stage") not in stages
         or policy.get("external_knowledge_allowed") is not external_knowledge_allowed
         or external_knowledge_allowed is not False

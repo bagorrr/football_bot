@@ -35,6 +35,7 @@ jobs:
               tests/system/test_migrations.py
               tests/system/test_opponent_search.py
               tests/system/test_required_date.py
+              tests/system/test_source_data_deletion.py
               tests/system/test_transfer_search.py
           - shard: remaining-system-2
             pytest_args: >-

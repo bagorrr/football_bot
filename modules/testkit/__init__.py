@@ -5109,6 +5109,7 @@ def boot_acceptance_spine(
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
     telegram_admin_user_id: int | None = None,
+    telegram_admin_user_ids: Mapping[RuntimeRole, int | None] | None = None,
     classifier_projection: Mapping[str, object] | None = None,
 ) -> AcceptanceSpine:
     """Provision the administrative test seam and boot each role separately.
@@ -5196,7 +5197,11 @@ def boot_acceptance_spine(
                 else None
             ),
             telegram_admin_user_id=(
-                telegram_admin_user_id
+                (
+                    telegram_admin_user_ids.get(role)
+                    if telegram_admin_user_ids is not None
+                    else telegram_admin_user_id
+                )
                 if role in {RuntimeRole.APPLICATION, RuntimeRole.BOT_ASSISTANT}
                 else None
             ),
@@ -5227,6 +5232,7 @@ def boot_legacy_acceptance_spine(
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
     telegram_admin_user_id: int | None = None,
+    telegram_admin_user_ids: Mapping[RuntimeRole, int | None] | None = None,
     classifier_projection: Mapping[str, object] | None = None,
 ) -> AcceptanceSpine:
     """Boot a named legacy fixture with its compatibility opt-out enabled."""
@@ -5243,6 +5249,7 @@ def boot_legacy_acceptance_spine(
         date_interpretation=date_interpretation,
         timezone_data=timezone_data,
         telegram_admin_user_id=telegram_admin_user_id,
+        telegram_admin_user_ids=telegram_admin_user_ids,
         classifier_projection=classifier_projection,
     )
 

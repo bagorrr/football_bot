@@ -804,6 +804,36 @@ def test_long_polling_requires_the_configured_private_administrator_destination(
     assert transport.poll_offsets == []
 
 
+def test_readiness_checks_identity_and_admin_chat_without_poll_or_send() -> None:
+    transport = ControlledBotApiTransport()
+    runtime = BotApiRuntime.from_mapping(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:fake-token",
+            "TELEGRAM_ADMIN_USER_ID": "456789",
+        },
+        transport_factory=lambda _configuration: transport,
+    )
+    ingress = BotApiIngress(
+        configuration=runtime.configuration,
+        transport=transport,
+        store=InMemoryBotApiContinuityStore(),
+        consumer=lambda _update: None,
+        delivery=BotApiDeliveryAdapter(transport, retry_sleep=lambda _seconds: None),
+        clock=_FixedClock(),
+    )
+
+    identity = ingress.verify_readiness()
+
+    assert identity == transport.identity
+    assert [name for name, _ in transport.calls] == [
+        "getMe",
+        "getWebhookInfo",
+        "getChat",
+    ]
+    assert transport.poll_offsets == []
+    assert transport.sent_messages == []
+
+
 def test_delivery_retries_rate_limit_and_proven_pre_effect_failure() -> None:
     transport = ControlledBotApiTransport(
         rate_limits_remaining=1,
