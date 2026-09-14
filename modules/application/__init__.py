@@ -8852,9 +8852,7 @@ class ConversationOnboarding:
             self._queue_country_ambiguity(
                 update_id=update_id,
                 current=current,
-                candidates=tuple(
-                    _location_label(candidate, locale) for candidate in candidates
-                ),
+                candidates=candidates,
             )
             return
         if not candidates:
@@ -8974,28 +8972,36 @@ class ConversationOnboarding:
         *,
         update_id: str,
         current: ConversationState,
-        candidates: tuple[str, ...],
+        candidates: tuple[LocationCandidate, ...],
     ) -> None:
         locale = current.locale
         if locale is None:
             raise RuntimeError("Conversation Language is missing")
         copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
         back_label = _DIRECTION_COPY[copy_locale][2][5]
-        candidate_text = _format_list(copy_locale, candidates)
-        message = TelegramMessage(
-            delivery_id=f"onboarding:{update_id}",
-            telegram_user_id=current.telegram_user_id,
-            display_locale=locale,
-            screen_revision=current.screen_revision,
-            text=_AMBIGUOUS_COUNTRY_COPY[copy_locale].format(candidates=candidate_text),
-            button_rows=(
-                (
+        candidate_text = _format_list(
+            copy_locale,
+            tuple(_location_label(candidate, copy_locale) for candidate in candidates),
+        )
+        message = _with_geonames_attribution(
+            TelegramMessage(
+                delivery_id=f"onboarding:{update_id}",
+                telegram_user_id=current.telegram_user_id,
+                display_locale=locale,
+                screen_revision=current.screen_revision,
+                text=_AMBIGUOUS_COUNTRY_COPY[copy_locale].format(
+                    candidates=candidate_text
+                ),
+                button_rows=(
                     (
-                        back_label,
-                        f"direction:back:{current.screen_revision}",
+                        (
+                            back_label,
+                            f"direction:back:{current.screen_revision}",
+                        ),
                     ),
                 ),
             ),
+            *(candidate.place_id for candidate in candidates),
         )
         self._store.commit_conversation_presentation(
             update_id=update_id,
@@ -9092,16 +9098,22 @@ class ConversationOnboarding:
             raise RuntimeError("Conversation Language is missing")
         copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
         back_label = _DIRECTION_COPY[copy_locale][2][5]
-        message = TelegramMessage(
-            delivery_id=f"onboarding:{update_id}",
-            telegram_user_id=current.telegram_user_id,
-            display_locale=locale,
-            screen_revision=current.screen_revision,
-            text=_CITY_RESOLUTION_COPY[copy_locale][outcome].format(
-                country=_location_label(country, copy_locale),
-                candidates=_format_city_candidates(copy_locale, candidates),
+        message = _with_geonames_attribution(
+            TelegramMessage(
+                delivery_id=f"onboarding:{update_id}",
+                telegram_user_id=current.telegram_user_id,
+                display_locale=locale,
+                screen_revision=current.screen_revision,
+                text=_CITY_RESOLUTION_COPY[copy_locale][outcome].format(
+                    country=_location_label(country, copy_locale),
+                    candidates=_format_city_candidates(copy_locale, candidates),
+                ),
+                button_rows=(
+                    ((back_label, f"direction:back:{current.screen_revision}"),),
+                ),
             ),
-            button_rows=(((back_label, f"direction:back:{current.screen_revision}"),),),
+            country.place_id,
+            *(candidate.place_id for candidate in candidates),
         )
         self._store.commit_conversation_presentation(
             update_id=update_id,
@@ -9327,15 +9339,20 @@ class ConversationOnboarding:
             raise RuntimeError("Conversation Language is missing")
         copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
         back_label = _DIRECTION_COPY[copy_locale][2][5]
-        message = TelegramMessage(
-            delivery_id=f"onboarding:{update_id}",
-            telegram_user_id=current.telegram_user_id,
-            display_locale=locale,
-            screen_revision=current.screen_revision,
-            text=_SEARCH_AREA_RESOLUTION_COPY[copy_locale][outcome].format(
-                city=_location_label(city, copy_locale)
+        message = _with_geonames_attribution(
+            TelegramMessage(
+                delivery_id=f"onboarding:{update_id}",
+                telegram_user_id=current.telegram_user_id,
+                display_locale=locale,
+                screen_revision=current.screen_revision,
+                text=_SEARCH_AREA_RESOLUTION_COPY[copy_locale][outcome].format(
+                    city=_location_label(city, copy_locale)
+                ),
+                button_rows=(
+                    ((back_label, f"direction:back:{current.screen_revision}"),),
+                ),
             ),
-            button_rows=(((back_label, f"direction:back:{current.screen_revision}"),),),
+            city.place_id,
         )
         self._store.commit_conversation_presentation(
             update_id=update_id,
@@ -10992,6 +11009,20 @@ def _location_label(
     return labels.get(copy_locale, location.display_name)
 
 
+def _with_geonames_attribution(
+    message: TelegramMessage, *place_ids: str | None
+) -> TelegramMessage:
+    if not any(
+        place_id is not None and place_id.startswith("geonames:")
+        for place_id in place_ids
+    ):
+        return message
+    return replace(
+        message,
+        text=f"{message.text}\n\n© GeoNames — https://www.geonames.org/",
+    )
+
+
 def _merge_location_candidates(
     first: LocationCandidate,
     second: LocationCandidate,
@@ -11441,13 +11472,16 @@ def _country_message(
             ((other_country, f"location:other-country:{screen_revision}"),),
             ((back_label, f"direction:back:{screen_revision}"),),
         )
-    return TelegramMessage(
-        delivery_id=f"onboarding:{update_id}",
-        telegram_user_id=telegram_user_id,
-        display_locale=locale,
-        screen_revision=screen_revision,
-        text=_COUNTRY_COPY[copy_locale][user_intent],
-        button_rows=button_rows,
+    return _with_geonames_attribution(
+        TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=_COUNTRY_COPY[copy_locale][user_intent],
+            button_rows=button_rows,
+        ),
+        suggestion.country.place_id if suggestion is not None else None,
     )
 
 
@@ -11466,11 +11500,13 @@ def _city_message(
     button_rows: tuple[tuple[tuple[str, str], ...], ...] = (
         ((back_label, f"direction:back:{screen_revision}"),),
     )
+    visible_place_ids = [country.place_id]
     if (
         suggestion is not None
         and suggestion.city is not None
         and suggestion.city.country_id == country.place_id
     ):
+        visible_place_ids.append(suggestion.city.place_id)
         _, other_city = _OTHER_LOCATION_COPY[copy_locale]
         button_rows = (
             (
@@ -11483,16 +11519,19 @@ def _city_message(
             ((other_city, f"location:other-city:{screen_revision}"),),
             ((back_label, f"direction:back:{screen_revision}"),),
         )
-    return TelegramMessage(
-        delivery_id=f"onboarding:{update_id}",
-        telegram_user_id=telegram_user_id,
-        display_locale=locale,
-        screen_revision=screen_revision,
-        text=(
-            f"{confirmation.format(country=_location_label(country, copy_locale))}"
-            f"\n\n{question}"
+    return _with_geonames_attribution(
+        TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=(
+                f"{confirmation.format(country=_location_label(country, copy_locale))}"
+                f"\n\n{question}"
+            ),
+            button_rows=button_rows,
         ),
-        button_rows=button_rows,
+        *visible_place_ids,
     )
 
 
@@ -11507,17 +11546,20 @@ def _search_area_message(
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     heading, selected_city, instruction = _SEARCH_AREA_COPY[copy_locale]
     back_label = _DIRECTION_COPY[copy_locale][2][5]
-    return TelegramMessage(
-        delivery_id=f"onboarding:{update_id}",
-        telegram_user_id=telegram_user_id,
-        display_locale=locale,
-        screen_revision=screen_revision,
-        text=(
-            f"{heading}\n\n"
-            f"{selected_city.format(city=_location_label(city, copy_locale))}"
-            f"\n\n{instruction}"
+    return _with_geonames_attribution(
+        TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=(
+                f"{heading}\n\n"
+                f"{selected_city.format(city=_location_label(city, copy_locale))}"
+                f"\n\n{instruction}"
+            ),
+            button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
         ),
-        button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
+        city.place_id,
     )
 
 
@@ -11543,13 +11585,18 @@ def _required_date_message(
         locale=copy_locale,
         whole_city_label=whole_city_label,
     )
-    return TelegramMessage(
-        delivery_id=f"onboarding:{update_id}",
-        telegram_user_id=telegram_user_id,
-        display_locale=locale,
-        screen_revision=screen_revision,
-        text=f"✅ {heading}: **{scope}**.\n\n{_REQUIRED_DATE_COPY[copy_locale]}",
-        button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
+    return _with_geonames_attribution(
+        TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=f"✅ {heading}: **{scope}**.\n\n{_REQUIRED_DATE_COPY[copy_locale]}",
+            button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
+        ),
+        country.place_id,
+        city.place_id,
+        *(area.place_id for area in areas),
     )
 
 
@@ -11591,17 +11638,22 @@ def _post_core_message(
         in {UserIntent.NEW_TEAM_SEARCH, UserIntent.TRANSFER_PLAYER_SEARCH}
         else "details:open"
     )
-    return TelegramMessage(
-        delivery_id=f"onboarding:{update_id}",
-        telegram_user_id=telegram_user_id,
-        display_locale=locale,
-        screen_revision=screen_revision,
-        text=f"✅ {heading}: **{scope}**.\n\n{body}",
-        button_rows=(
-            ((back_label, f"direction:back:{screen_revision}"),),
-            ((details_label, f"{details_callback}:{screen_revision}"),),
-            ((search_label, f"search:submit:{screen_revision}"),),
+    return _with_geonames_attribution(
+        TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=f"✅ {heading}: **{scope}**.\n\n{body}",
+            button_rows=(
+                ((back_label, f"direction:back:{screen_revision}"),),
+                ((details_label, f"{details_callback}:{screen_revision}"),),
+                ((search_label, f"search:submit:{screen_revision}"),),
+            ),
         ),
+        country.place_id,
+        city.place_id,
+        *(area.place_id for area in areas),
     )
 
 
@@ -12591,12 +12643,17 @@ def _render_result_presentation(
     selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
     """Render one canonical card and add pagination only for a multi-result set."""
-    message = _result_renderer_for(result)(
-        delivery_id=delivery_id,
-        telegram_user_id=telegram_user_id,
-        locale=locale,
-        screen_revision=screen_revision,
-        result=result,
+    result_facts = dict(result.card_facts)
+    message = _with_geonames_attribution(
+        _result_renderer_for(result)(
+            delivery_id=delivery_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=screen_revision,
+            result=result,
+        ),
+        result_facts.get("city_id"),
+        result_facts.get("place_id"),
     )
     if result_count <= 1:
         return message

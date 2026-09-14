@@ -150,8 +150,9 @@ Rate exhaustion, timeout, provider errors, invalid hierarchy, and missing
 timezone fail closed; there is no model-knowledge fallback.
 
 GeoNames data is supplied under CC BY and GeoNames requests require the account
-username. Before release, keep a visible GeoNames credit with a provider link
-where GeoNames-backed places are presented. Review the current
+username. User-facing place presentations include a visible GeoNames credit
+with a provider link; the result-card regression verifies the final rendered
+message. Review the current
 [GeoNames terms and attribution](https://www.geonames.org/export/) and
 [web-service documentation](https://www.geonames.org/export/web-services.html)
 when usage or provider policy changes.
