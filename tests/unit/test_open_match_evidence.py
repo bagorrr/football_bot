@@ -29,6 +29,7 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    SearchAreaInterpretation,
 )
 
 
@@ -240,6 +241,11 @@ class _LocalizedLocationResolver:
                 ),
             )
         )
+
+    def resolve_search_area(
+        self, query: LocationResolutionQuery
+    ) -> tuple[SearchAreaInterpretation, ...]:
+        return ()
 
 
 class _RussianOnlyLocationResolver(_LocalizedLocationResolver):

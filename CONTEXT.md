@@ -264,6 +264,10 @@ _Avoid_: Detected Country, inferred country, current country
 A typed geographic refinement within one confirmed city, such as an administrative district, neighborhood, named locality, or the vicinity of a station, landmark, or address.
 _Avoid_: District when the place is not an administrative district, Location constraint
 
+**Search Area Candidate**:
+One proposed normalized Sub-city Area from a Bot User's Search Area input that has not yet passed application validation.
+_Avoid_: Location Candidate, confirmed Search Area
+
 **Location Mention**:
 The exact Source Message text or source reference that expresses a place.
 _Avoid_: Location Candidate, Opportunity Location, normalized location

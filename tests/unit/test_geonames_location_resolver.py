@@ -4,10 +4,12 @@ from collections.abc import Callable, Mapping
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request
 
+import modules.domain as domain
 from modules.application import _resolve_source_location_across_supported_locales
 from modules.domain import (
     ConversationStage,
     GeographicType,
+    LocationCandidate,
     LocationResolutionQuery,
 )
 from modules.geonames_location_resolver import (
@@ -226,7 +228,7 @@ def test_city_candidate_requires_geonames_ancestry_and_installed_timezone() -> N
     ]
 
 
-def test_search_area_keeps_city_and_country_as_verified_terminal_parents() -> None:
+def test_search_area_uses_its_own_candidate_model_and_verified_parents() -> None:
     transport = ScriptedGeoNamesTransport(
         {
             "getJSON": {
@@ -266,7 +268,7 @@ def test_search_area_keeps_city_and_country_as_verified_terminal_parents() -> No
         transport=transport,
     )
 
-    resolution = adapter.resolve(
+    interpretations = adapter.resolve_search_area(
         LocationResolutionQuery(
             text="Komendantsky Prospekt",
             locale="en",
@@ -276,8 +278,10 @@ def test_search_area_keeps_city_and_country_as_verified_terminal_parents() -> No
         )
     )
 
-    assert len(resolution.interpretations) == 1
-    candidate = resolution.interpretations[0].places[0]
+    assert len(interpretations) == 1
+    candidate = interpretations[0].candidates[0]
+    assert type(candidate) is domain.SearchAreaCandidate
+    assert not isinstance(candidate, LocationCandidate)
     assert candidate.geographic_type is GeographicType.STATION
     assert candidate.verified_parent_ids[-2:] == (
         "geonames:200",
@@ -289,6 +293,92 @@ def test_search_area_keeps_city_and_country_as_verified_terminal_parents() -> No
     )
     assert any(
         call[1].get("featureClass") == ("A", "P", "S", "L", "H")
+        for call in transport.calls
+    )
+
+
+def test_numbered_address_resolves_to_a_verified_street_vicinity() -> None:
+    def search(
+        params: Mapping[str, str | tuple[str, ...]],
+    ) -> Mapping[str, object]:
+        if (
+            params.get("q") != "Baker Street"
+            or params.get("featureClass") != "R"
+            or params.get("featureCode") != "ST"
+        ):
+            return {"geonames": []}
+        return {
+            "geonames": [
+                {
+                    "geonameId": 300,
+                    "name": "Baker Street",
+                    "toponymName": "Baker Street",
+                    "countryCode": "RU",
+                    "fcl": "R",
+                    "fcode": "ST",
+                }
+            ]
+        }
+
+    transport = ScriptedGeoNamesTransport(
+        {
+            "getJSON": {
+                "geonameId": 100,
+                "name": "Russia",
+                "toponymName": "Russia",
+                "countryCode": "RU",
+                "fcl": "A",
+                "fcode": "PCLI",
+            },
+            "searchJSON": search,
+            "hierarchyJSON": {
+                "geonames": [
+                    {"geonameId": 999, "name": "Earth", "fcode": "AREA"},
+                    {"geonameId": 998, "name": "Europe", "fcode": "CONT"},
+                    {"geonameId": 100, "name": "Russia", "fcode": "PCLI"},
+                    {"geonameId": 101, "name": "Northwestern", "fcode": "ADM1"},
+                    {
+                        "geonameId": 200,
+                        "name": "Saint Petersburg",
+                        "fcode": "PPLA",
+                    },
+                ]
+            },
+        }
+    )
+    adapter = GeoNamesLocationResolverAdapter(
+        username="controlled-user",
+        transport=transport,
+    )
+
+    interpretations = adapter.resolve_search_area(
+        LocationResolutionQuery(
+            text="221B Baker Street",
+            locale="en",
+            stage=ConversationStage.SEARCH_AREA,
+            country_id="geonames:100",
+            city_id="geonames:200",
+        )
+    )
+
+    assert len(interpretations) == 1
+    candidate = interpretations[0].candidates[0]
+    assert type(candidate) is domain.SearchAreaCandidate
+    assert candidate.place_id == "geonames:300"
+    assert candidate.geographic_type is GeographicType.ADDRESS
+    assert candidate.localized_display_names == tuple(
+        (locale, "Baker Street") for locale in ("en", "es", "fr", "ru")
+    )
+    assert candidate.verified_parent_ids[-2:] == (
+        "geonames:200",
+        "geonames:100",
+    )
+    assert candidate.parent_display_names[-2:] == ("Saint Petersburg", "Russia")
+    assert not any("221B" in str(call[1]) for call in transport.calls)
+    assert any(
+        call[1].get("q") == "Baker Street"
+        and call[1].get("featureClass") == "R"
+        and call[1].get("featureCode") == "ST"
         for call in transport.calls
     )
 

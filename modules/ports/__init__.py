@@ -53,6 +53,7 @@ from modules.domain import (
     RequiredDateConfirmationEvent,
     ResultConversation,
     ResultConversationMessage,
+    SearchAreaInterpretation,
     SearchResult,
     SourceChatAdmissionProvenance,
     SourceChatAdmissionResolution,
@@ -539,6 +540,12 @@ class LocationResolverAdapter(Protocol):
 
     def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
         """Return non-authoritative interpretations for application validation."""
+        ...
+
+    def resolve_search_area(
+        self, query: LocationResolutionQuery
+    ) -> tuple[SearchAreaInterpretation, ...]:
+        """Return candidates for the Bot User's Search Area input."""
         ...
 
 

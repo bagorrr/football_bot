@@ -1331,6 +1331,24 @@ class LocationCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class SearchAreaCandidate:
+    """One unaccepted resolver proposal for a Sub-city Area."""
+
+    place_id: str
+    display_name: str
+    geographic_type: GeographicType
+    country_id: str
+    city_id: str | None
+    verified_parent_ids: tuple[str, ...]
+    parent_display_names: tuple[str, ...]
+    iana_timezone: str | None
+    resolver_version: str
+    glossary_version: str
+    localized_display_names: tuple[tuple[str, str], ...] = ()
+    verified_disjoint_place_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class AcceptedLocation:
     """Application-validated stable geography accepted into a Discovery Draft."""
 
@@ -1353,6 +1371,15 @@ class LocationInterpretation:
     """One complete resolver interpretation of a Bot User answer."""
 
     places: tuple[LocationCandidate, ...]
+    glossary_version: str
+    whole_city: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SearchAreaInterpretation:
+    """One complete interpretation of the Bot User's Search Area input."""
+
+    candidates: tuple[SearchAreaCandidate, ...]
     glossary_version: str
     whole_city: bool = False
 

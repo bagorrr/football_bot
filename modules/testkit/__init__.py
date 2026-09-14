@@ -76,6 +76,8 @@ from modules.domain import (
     RequiredDate,
     RequiredDateConfirmationEvent,
     ResultConversation,
+    SearchAreaCandidate,
+    SearchAreaInterpretation,
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionResolution,
@@ -2338,6 +2340,42 @@ class ControlledLocationResolverAdapter:
                 )
             )
         return LocationResolution(interpretations=())
+
+    def resolve_search_area(
+        self, query: LocationResolutionQuery
+    ) -> tuple[SearchAreaInterpretation, ...]:
+        """Adapt controlled Location fixtures to the Search Area boundary."""
+        resolution = self.resolve(query)
+        return tuple(
+            SearchAreaInterpretation(
+                candidates=(
+                    ()
+                    if interpretation.whole_city
+                    else tuple(
+                        SearchAreaCandidate(
+                            place_id=candidate.place_id,
+                            display_name=candidate.display_name,
+                            geographic_type=candidate.geographic_type,
+                            country_id=candidate.country_id,
+                            city_id=candidate.city_id,
+                            verified_parent_ids=candidate.verified_parent_ids,
+                            parent_display_names=candidate.parent_display_names,
+                            iana_timezone=candidate.iana_timezone,
+                            resolver_version=candidate.resolver_version,
+                            glossary_version=candidate.glossary_version,
+                            localized_display_names=candidate.localized_display_names,
+                            verified_disjoint_place_ids=(
+                                candidate.verified_disjoint_place_ids
+                            ),
+                        )
+                        for candidate in interpretation.places
+                    )
+                ),
+                glossary_version=interpretation.glossary_version,
+                whole_city=interpretation.whole_city,
+            )
+            for interpretation in resolution.interpretations
+        )
 
 
 class ControlledConversationLanguageAdapter:

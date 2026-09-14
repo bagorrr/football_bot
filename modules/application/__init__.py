@@ -86,12 +86,13 @@ from modules.domain import (
     LanguageSelection,
     LocaleSource,
     LocationCandidate,
-    LocationInterpretation,
     LocationResolutionQuery,
     ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
     ResultConversation,
+    SearchAreaCandidate,
+    SearchAreaInterpretation,
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionProvenance,
@@ -9200,7 +9201,7 @@ class ConversationOnboarding:
         if draft.user_intent is None:
             raise RuntimeError("Search Area stage has no confirmed User Intent")
         try:
-            resolution = self._location_resolver.resolve(
+            interpretations = self._location_resolver.resolve_search_area(
                 LocationResolutionQuery(
                     text=text,
                     locale=locale,
@@ -9219,7 +9220,7 @@ class ConversationOnboarding:
             return
         raw_validated = tuple(
             (interpretation, accepted_areas)
-            for interpretation in resolution.interpretations
+            for interpretation in interpretations
             if (
                 accepted_areas := _validated_search_area(
                     interpretation,
@@ -9253,7 +9254,7 @@ class ConversationOnboarding:
                 city=draft.city,
                 outcome=(
                     _ResolutionOutcome.INVALID
-                    if resolution.interpretations
+                    if interpretations
                     else _ResolutionOutcome.UNKNOWN
                 ),
             )
@@ -9319,9 +9320,10 @@ class ConversationOnboarding:
                 whole_city=interpretation.whole_city,
                 resolver_versions=tuple(
                     dict.fromkeys(
-                        place.resolver_version for place in interpretation.places
+                        place.resolver_version for place in interpretation.candidates
                     )
-                ),
+                )
+                or (draft.city.resolver_version,),
                 glossary_version=interpretation.glossary_version,
             ),
         )
@@ -11000,6 +11002,25 @@ def _accept_location(
     )
 
 
+def _accept_search_area_candidate(
+    candidate: SearchAreaCandidate,
+) -> AcceptedLocation:
+    return AcceptedLocation(
+        place_id=candidate.place_id,
+        display_name=candidate.display_name,
+        geographic_type=candidate.geographic_type,
+        country_id=candidate.country_id,
+        city_id=candidate.city_id,
+        verified_parent_ids=candidate.verified_parent_ids,
+        parent_display_names=candidate.parent_display_names,
+        iana_timezone=None,
+        resolver_version=candidate.resolver_version,
+        glossary_version=candidate.glossary_version,
+        localized_display_names=candidate.localized_display_names,
+        verified_disjoint_place_ids=candidate.verified_disjoint_place_ids,
+    )
+
+
 def _location_label(
     location: LocationCandidate | AcceptedLocation,
     locale: str,
@@ -11053,6 +11074,36 @@ def _merge_location_candidates(
     )
 
 
+def _merge_search_area_candidates(
+    first: SearchAreaCandidate,
+    second: SearchAreaCandidate,
+) -> SearchAreaCandidate | None:
+    if (
+        first.place_id != second.place_id
+        or first.display_name != second.display_name
+        or first.geographic_type is not second.geographic_type
+        or first.country_id != second.country_id
+        or first.city_id != second.city_id
+        or first.verified_parent_ids != second.verified_parent_ids
+        or first.verified_disjoint_place_ids != second.verified_disjoint_place_ids
+        or first.parent_display_names != second.parent_display_names
+        or first.iana_timezone != second.iana_timezone
+        or first.resolver_version != second.resolver_version
+        or first.glossary_version != second.glossary_version
+    ):
+        return None
+    localized_display_names = dict(first.localized_display_names)
+    for locale, label in second.localized_display_names:
+        existing = localized_display_names.get(locale)
+        if existing is not None and existing != label:
+            return None
+        localized_display_names[locale] = label
+    return replace(
+        first,
+        localized_display_names=tuple(localized_display_names.items()),
+    )
+
+
 def _deduplicate_location_candidates(
     candidates: tuple[LocationCandidate, ...],
 ) -> tuple[LocationCandidate, ...] | None:
@@ -11072,14 +11123,18 @@ def _deduplicate_location_candidates(
 
 
 def _deduplicate_search_areas(
-    validated: tuple[tuple[LocationInterpretation, tuple[AcceptedLocation, ...]], ...],
-) -> tuple[tuple[LocationInterpretation, tuple[AcceptedLocation, ...]], ...] | None:
-    deduplicated: list[tuple[LocationInterpretation, tuple[AcceptedLocation, ...]]] = []
+    validated: tuple[
+        tuple[SearchAreaInterpretation, tuple[AcceptedLocation, ...]], ...
+    ],
+) -> tuple[tuple[SearchAreaInterpretation, tuple[AcceptedLocation, ...]], ...] | None:
+    deduplicated: list[
+        tuple[SearchAreaInterpretation, tuple[AcceptedLocation, ...]]
+    ] = []
     indexes: dict[tuple[bool, frozenset[str]], int] = {}
     for interpretation, accepted_areas in validated:
         identity = (
             interpretation.whole_city,
-            frozenset(candidate.place_id for candidate in interpretation.places),
+            frozenset(candidate.place_id for candidate in interpretation.candidates),
         )
         index = indexes.get(identity)
         if index is None:
@@ -11090,11 +11145,11 @@ def _deduplicate_search_areas(
         if first_interpretation.glossary_version != interpretation.glossary_version:
             return None
         candidates_by_id = {
-            candidate.place_id: candidate for candidate in interpretation.places
+            candidate.place_id: candidate for candidate in interpretation.candidates
         }
-        merged_candidates: list[LocationCandidate] = []
-        for first_candidate in first_interpretation.places:
-            merged = _merge_location_candidates(
+        merged_candidates: list[SearchAreaCandidate] = []
+        for first_candidate in first_interpretation.candidates:
+            merged = _merge_search_area_candidates(
                 first_candidate,
                 candidates_by_id[first_candidate.place_id],
             )
@@ -11103,7 +11158,7 @@ def _deduplicate_search_areas(
             merged_candidates.append(merged)
         merged_interpretation = replace(
             first_interpretation,
-            places=tuple(merged_candidates),
+            candidates=tuple(merged_candidates),
         )
         deduplicated[index] = (
             merged_interpretation,
@@ -11111,7 +11166,8 @@ def _deduplicate_search_areas(
                 ()
                 if merged_interpretation.whole_city
                 else tuple(
-                    _accept_location(candidate) for candidate in merged_candidates
+                    _accept_search_area_candidate(candidate)
+                    for candidate in merged_candidates
                 )
             ),
         )
@@ -11119,7 +11175,7 @@ def _deduplicate_search_areas(
 
 
 def _valid_location_presentation(
-    candidate: LocationCandidate | AcceptedLocation,
+    candidate: LocationCandidate | SearchAreaCandidate | AcceptedLocation,
 ) -> bool:
     if isinstance(candidate, AcceptedLocation):
         return True
@@ -11132,7 +11188,7 @@ def _valid_location_presentation(
 
 
 def _valid_location_disjointness(
-    candidate: LocationCandidate | AcceptedLocation,
+    candidate: LocationCandidate | SearchAreaCandidate | AcceptedLocation,
 ) -> bool:
     disjoint_ids = candidate.verified_disjoint_place_ids
     return (
@@ -11192,7 +11248,7 @@ def _valid_city(
 
 
 def _valid_sub_city_areas(
-    candidates: tuple[LocationCandidate, ...],
+    candidates: tuple[SearchAreaCandidate, ...],
     *,
     country: AcceptedLocation,
     city: AcceptedLocation,
@@ -11226,7 +11282,7 @@ def _valid_sub_city_areas(
 
 
 def _validated_search_area(
-    interpretation: LocationInterpretation,
+    interpretation: SearchAreaInterpretation,
     *,
     country: AcceptedLocation,
     city: AcceptedLocation,
@@ -11234,20 +11290,17 @@ def _validated_search_area(
     if not interpretation.glossary_version:
         return None
     if interpretation.whole_city:
-        if not (
-            len(interpretation.places) == 1
-            and interpretation.places[0].place_id == city.place_id
-            and _valid_city(interpretation.places[0], country)
-        ):
-            return None
-        return ()
+        return () if not interpretation.candidates else None
     if not _valid_sub_city_areas(
-        interpretation.places,
+        interpretation.candidates,
         country=country,
         city=city,
     ):
         return None
-    return tuple(_accept_location(candidate) for candidate in interpretation.places)
+    return tuple(
+        _accept_search_area_candidate(candidate)
+        for candidate in interpretation.candidates
+    )
 
 
 def _language_selection_message(

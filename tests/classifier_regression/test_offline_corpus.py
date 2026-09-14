@@ -68,6 +68,7 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    SearchAreaInterpretation,
 )
 from modules.ports import (
     ClassifierAdapterResult,
@@ -1065,6 +1066,11 @@ class _RecordedTournamentResolver:
                 ),
             )
         )
+
+    def resolve_search_area(
+        self, query: LocationResolutionQuery
+    ) -> tuple[SearchAreaInterpretation, ...]:
+        return ()
 
 
 def _tournament_promotion_payload(

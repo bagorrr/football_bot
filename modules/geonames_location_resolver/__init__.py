@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from time import monotonic
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -22,6 +22,8 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    SearchAreaCandidate,
+    SearchAreaInterpretation,
 )
 from modules.ports import LocationResolverError
 
@@ -35,6 +37,20 @@ _MAX_CACHE_TTL_SECONDS = 86_400.0
 _MAX_QUERY_LENGTH = 240
 _MAX_SEARCH_AREA_PARTS = 8
 _SUPPORTED_LOCALES = ("en", "es", "fr", "ru")
+_HOUSE_NUMBER = r"\d+[A-Za-zА-Яа-я]?(?:[-/]\d+[A-Za-zА-Яа-я]?)?"  # noqa: RUF001
+_HOUSE_NUMBER_PATTERN = re.compile(rf"^{_HOUSE_NUMBER}$", re.IGNORECASE)
+_LEADING_HOUSE_NUMBER_PATTERN = re.compile(
+    rf"^({_HOUSE_NUMBER})\s+(.+)$", re.IGNORECASE
+)
+_TRAILING_HOUSE_NUMBER_PATTERN = re.compile(
+    rf"^(.+?)\s+({_HOUSE_NUMBER})$", re.IGNORECASE
+)
+_STREET_DESIGNATOR_PATTERN = re.compile(
+    r"\b(?:street|st|road|rd|avenue|ave|boulevard|blvd|lane|ln|drive|dr|way|"
+    r"place|pl|court|ct|calle|avenida|carretera|paseo|rue|route|chemin|"
+    r"улица|ул|проспект|пр-?т|шоссе|дорога|переулок|пер|бульвар|б-р)\b",  # noqa: RUF001
+    re.IGNORECASE,
+)
 _LOCALE_PATTERN = re.compile(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*")
 _ID_PATTERN = re.compile(r"geonames:([1-9][0-9]{0,11})")
 _CITY_CODES = frozenset({"PPLC", "PPLA", "PPLA2", "PPLA3", "PPLA4", "PPLA5"})
@@ -55,6 +71,7 @@ _WHOLE_CITY_PHRASES = {
     "fr": frozenset({"toute la ville", "toute la ville convient"}),
     "ru": frozenset({"весь город", "вся территория города"}),
 }
+_CandidateT = TypeVar("_CandidateT", LocationCandidate, SearchAreaCandidate)
 
 
 class GeoNamesTransport(Protocol):
@@ -195,6 +212,42 @@ class GeoNamesLocationResolverAdapter:
             return self._resolve_search_area(normalized, country_code)
         raise LocationResolverError("location stage is unsupported")
 
+    def resolve_search_area(
+        self, query: LocationResolutionQuery
+    ) -> tuple[SearchAreaInterpretation, ...]:
+        """Resolve a Bot User's Search Area without Location Candidates."""
+        normalized = _validated_query(query)
+        if normalized.stage is not ConversationStage.SEARCH_AREA:
+            raise LocationResolverError("location stage is unsupported")
+        country_code = self._country_code(
+            normalized.country_id or "", normalized.locale
+        )
+        if country_code is None:
+            return ()
+        if _whole_city(normalized.text, normalized.locale):
+            return (
+                SearchAreaInterpretation(
+                    candidates=(),
+                    glossary_version=GEONAMES_GLOSSARY_VERSION,
+                    whole_city=True,
+                ),
+            )
+        candidate_sets = self._search_area_candidate_sets(
+            normalized,
+            country_code,
+            candidate_type=SearchAreaCandidate,
+            include_street_vicinities=True,
+        )
+        if candidate_sets is None:
+            return ()
+        return tuple(
+            SearchAreaInterpretation(
+                candidates=candidates,
+                glossary_version=GEONAMES_GLOSSARY_VERSION,
+            )
+            for candidates in _candidate_combinations(candidate_sets)
+        )
+
     def _resolve_country(self, query: LocationResolutionQuery) -> LocationResolution:
         records = self._search(
             query,
@@ -250,6 +303,7 @@ class GeoNamesLocationResolverAdapter:
                 country_id=query.country_id or "",
                 geographic_type=GeographicType.CITY,
                 city_id=None,
+                candidate_type=LocationCandidate,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -276,6 +330,7 @@ class GeoNamesLocationResolverAdapter:
                 country_id=query.country_id or "",
                 geographic_type=GeographicType.CITY,
                 city_id=None,
+                candidate_type=LocationCandidate,
             )
             if city is None:
                 return LocationResolution(interpretations=())
@@ -289,22 +344,59 @@ class GeoNamesLocationResolverAdapter:
                 )
             )
 
-        results: list[tuple[LocationCandidate, ...]] = []
-        for phrase in _area_phrases(query.text):
-            records = self._search(
-                LocationResolutionQuery(
-                    text=phrase,
-                    locale=query.locale,
-                    stage=query.stage,
-                    country_id=query.country_id,
-                    city_id=query.city_id,
-                ),
-                country_code=country_code,
-                feature_class=("A", "P", "S", "L", "H"),
+        results = self._search_area_candidate_sets(
+            query,
+            country_code,
+            candidate_type=LocationCandidate,
+        )
+        if results is None:
+            return LocationResolution(interpretations=())
+        return LocationResolution(
+            interpretations=tuple(
+                LocationInterpretation(
+                    places=candidates,
+                    glossary_version=GEONAMES_GLOSSARY_VERSION,
+                )
+                for candidates in _candidate_combinations(results)
             )
-            matches: list[LocationCandidate] = []
+        )
+
+    def _search_area_candidate_sets(
+        self,
+        query: LocationResolutionQuery,
+        country_code: str,
+        *,
+        candidate_type: type[_CandidateT],
+        include_street_vicinities: bool = False,
+    ) -> list[tuple[_CandidateT, ...]] | None:
+        candidate_sets: list[tuple[_CandidateT, ...]] = []
+        phrases = (
+            _search_area_phrases(query.text)
+            if include_street_vicinities
+            else tuple((phrase, False) for phrase in _area_phrases(query.text))
+        )
+        for phrase, is_street_vicinity in phrases:
+            phrase_query = LocationResolutionQuery(
+                text=phrase,
+                locale=query.locale,
+                stage=query.stage,
+                country_id=query.country_id,
+                city_id=query.city_id,
+            )
+            records = self._search(
+                phrase_query,
+                country_code=country_code,
+                feature_class="R" if is_street_vicinity else ("A", "P", "S", "L", "H"),
+                feature_code="ST" if is_street_vicinity else None,
+            )
+            matches: list[_CandidateT] = []
             for record in records:
-                geographic_type = _sub_city_type(record)
+                if is_street_vicinity:
+                    geographic_type = (
+                        GeographicType.ADDRESS if _is_street_record(record) else None
+                    )
+                else:
+                    geographic_type = _sub_city_type(record)
                 if geographic_type is None:
                     continue
                 candidate = self._build_candidate(
@@ -312,24 +404,16 @@ class GeoNamesLocationResolverAdapter:
                     query,
                     country_id=query.country_id or "",
                     geographic_type=geographic_type,
-                    city_id=city_id,
+                    city_id=query.city_id,
+                    candidate_type=candidate_type,
                 )
                 if candidate is not None:
                     matches.append(candidate)
             unique = _unique_candidates(matches)
             if not unique:
-                return LocationResolution(interpretations=())
-            results.append(unique)
-        combinations = _candidate_combinations(results)
-        return LocationResolution(
-            interpretations=tuple(
-                LocationInterpretation(
-                    places=places,
-                    glossary_version=GEONAMES_GLOSSARY_VERSION,
-                )
-                for places in combinations
-            )
-        )
+                return None
+            candidate_sets.append(unique)
+        return candidate_sets
 
     def _build_candidate(
         self,
@@ -339,7 +423,8 @@ class GeoNamesLocationResolverAdapter:
         country_id: str,
         geographic_type: GeographicType,
         city_id: str | None,
-    ) -> LocationCandidate | None:
+        candidate_type: type[_CandidateT],
+    ) -> _CandidateT | None:
         place_id = _place_id(record)
         name = _localized_name(record)
         if place_id is None or name is None or place_id == country_id:
@@ -347,23 +432,26 @@ class GeoNamesLocationResolverAdapter:
         ancestors = self._ancestors(place_id, query.locale)
         if ancestors is None:
             return None
-        parents = _parents_through_country(ancestors, country_id)
-        if parents is None:
+        verified_parents = _parents_through_country(ancestors, country_id)
+        if verified_parents is None:
             return None
+        parents: tuple[_Parent, ...] = verified_parents
         resolved_city_id: str | None
         if geographic_type is GeographicType.CITY:
             resolved_city_id = place_id
         else:
             resolved_city_id = city_id
-            city_index = next(
+            if resolved_city_id is None:
+                return None
+            city_index: int = next(
                 (
                     index
                     for index, parent in enumerate(parents)
                     if parent.place_id == resolved_city_id
                 ),
-                None,
+                -1,
             )
-            if resolved_city_id is None or city_index is None:
+            if city_index < 0:
                 return None
             parents = (*parents[: city_index + 1], parents[-1])
         timezone = (
@@ -371,7 +459,7 @@ class GeoNamesLocationResolverAdapter:
         )
         if geographic_type is GeographicType.CITY and not _installed_timezone(timezone):
             return None
-        return LocationCandidate(
+        return candidate_type(
             place_id=place_id,
             display_name=name,
             geographic_type=geographic_type,
@@ -630,6 +718,10 @@ def _sub_city_type(record: Mapping[str, object]) -> GeographicType | None:
     return None
 
 
+def _is_street_record(record: Mapping[str, object]) -> bool:
+    return record.get("fcl") == "R" and record.get("fcode") == "ST"
+
+
 def _whole_city(text: str, locale: str) -> bool:
     normalized = " ".join(text.casefold().split())
     language = _language_tag(locale)
@@ -652,26 +744,74 @@ def _area_phrases(text: str) -> tuple[str, ...]:
     return parts
 
 
+def _search_area_phrases(text: str) -> tuple[tuple[str, bool], ...]:
+    parts = _area_phrases(text)
+    phrases: list[tuple[str, bool]] = []
+    index = 0
+    while index < len(parts):
+        phrase = parts[index]
+        if _is_house_number(phrase) and index + 1 < len(parts):
+            street, is_address = _street_vicinity_phrase(f"{phrase} {parts[index + 1]}")
+            if is_address:
+                phrases.append((street, True))
+                index += 2
+                continue
+        if index + 1 < len(parts) and _is_house_number(parts[index + 1]):
+            street, is_address = _street_vicinity_phrase(f"{phrase} {parts[index + 1]}")
+            if is_address:
+                phrases.append((street, True))
+                index += 2
+                continue
+        street, is_address = _street_vicinity_phrase(phrase)
+        phrases.append((street, is_address))
+        index += 1
+    return tuple(phrases)
+
+
+def _street_vicinity_phrase(text: str) -> tuple[str, bool]:
+    leading = _LEADING_HOUSE_NUMBER_PATTERN.fullmatch(text)
+    if leading is not None and _has_street_designator(leading.group(2)):
+        return leading.group(2), True
+    trailing = _TRAILING_HOUSE_NUMBER_PATTERN.fullmatch(text)
+    if trailing is not None and _has_street_designator(trailing.group(1)):
+        return trailing.group(1), True
+    return text, False
+
+
+def _has_street_designator(text: str) -> bool:
+    return _STREET_DESIGNATOR_PATTERN.search(text) is not None
+
+
+def _is_house_number(text: str) -> bool:
+    return _HOUSE_NUMBER_PATTERN.fullmatch(text) is not None
+
+
 def _unique_candidates(
-    candidates: list[LocationCandidate],
-) -> tuple[LocationCandidate, ...]:
-    unique: dict[str, LocationCandidate] = {}
+    candidates: list[_CandidateT],
+) -> tuple[_CandidateT, ...]:
+    unique: dict[str, _CandidateT] = {}
     for candidate in candidates:
         unique.setdefault(candidate.place_id, candidate)
     return tuple(unique.values())
 
 
 def _candidate_combinations(
-    candidate_sets: list[tuple[LocationCandidate, ...]],
-) -> tuple[tuple[LocationCandidate, ...], ...]:
-    combinations: list[tuple[LocationCandidate, ...]] = [()]
+    candidate_sets: list[tuple[_CandidateT, ...]],
+) -> tuple[tuple[_CandidateT, ...], ...]:
+    empty_combination: tuple[_CandidateT, ...] = ()
+    combinations: list[tuple[_CandidateT, ...]] = [empty_combination]
     for candidate_set in candidate_sets:
-        next_combinations = [
-            (*prefix, candidate)
-            for prefix in combinations
-            for candidate in candidate_set
-            if all(existing.place_id != candidate.place_id for existing in prefix)
-        ]
+        next_combinations: list[tuple[_CandidateT, ...]] = []
+        for prefix in combinations:
+            candidates_so_far: tuple[_CandidateT, ...] = prefix
+            for candidate in candidate_set:
+                if all(
+                    existing.place_id != candidate.place_id
+                    for existing in candidates_so_far
+                ):
+                    candidate_tuple: tuple[_CandidateT, ...] = (candidate,)
+                    next_combination = candidates_so_far + candidate_tuple
+                    next_combinations.append(next_combination)
         combinations = next_combinations[:GEONAMES_MAX_ROWS]
         if not combinations:
             return ()
