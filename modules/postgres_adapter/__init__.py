@@ -213,6 +213,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0059_telethon_history_progress.sql",
     "0060_telethon_ingestion_scope_lookup.sql",
     "0061_telethon_event_identity_and_progress_retention.sql",
+    "0062_telethon_active_ingestion_scope.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -278,6 +279,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "f4f7e4fef466817d37c5c271c7f978b06d51f9a0bcda16a2812a7d9b5969149d",
     "96788c3cf2a25f912e068517a1b2f15736d1b2ab9ee64132c96c6eda05da7247",
     "ae782f526807bf08c2daee9fe523ef72f0d17c8b6f335061597147af659db559",
+    "bf3dbc633756c1d7264d7a447eea530c4daefb0f81b57ab08880ae44fd46699b",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
