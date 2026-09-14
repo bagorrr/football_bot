@@ -1377,9 +1377,10 @@ class LocationInterpretation:
 
 @dataclass(frozen=True, slots=True)
 class SearchAreaInterpretation:
-    """One complete interpretation of the Bot User's Search Area input."""
+    """One Search Area interpretation with provenance and zero or more candidates."""
 
     candidates: tuple[SearchAreaCandidate, ...]
+    resolver_version: str
     glossary_version: str
     whole_city: bool = False
 

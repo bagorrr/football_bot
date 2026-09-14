@@ -228,6 +228,7 @@ class GeoNamesLocationResolverAdapter:
             return (
                 SearchAreaInterpretation(
                     candidates=(),
+                    resolver_version=GEONAMES_RESOLVER_VERSION,
                     glossary_version=GEONAMES_GLOSSARY_VERSION,
                     whole_city=True,
                 ),
@@ -243,6 +244,7 @@ class GeoNamesLocationResolverAdapter:
         return tuple(
             SearchAreaInterpretation(
                 candidates=candidates,
+                resolver_version=GEONAMES_RESOLVER_VERSION,
                 glossary_version=GEONAMES_GLOSSARY_VERSION,
             )
             for candidates in _candidate_combinations(candidate_sets)

@@ -9323,7 +9323,7 @@ class ConversationOnboarding:
                         place.resolver_version for place in interpretation.candidates
                     )
                 )
-                or (draft.city.resolver_version,),
+                or (interpretation.resolver_version,),
                 glossary_version=interpretation.glossary_version,
             ),
         )
@@ -11287,7 +11287,7 @@ def _validated_search_area(
     country: AcceptedLocation,
     city: AcceptedLocation,
 ) -> tuple[AcceptedLocation, ...] | None:
-    if not interpretation.glossary_version:
+    if not interpretation.resolver_version or not interpretation.glossary_version:
         return None
     if interpretation.whole_city:
         return () if not interpretation.candidates else None

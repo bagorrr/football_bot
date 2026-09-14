@@ -2371,6 +2371,10 @@ class ControlledLocationResolverAdapter:
                         for candidate in interpretation.places
                     )
                 ),
+                resolver_version=next(
+                    (candidate.resolver_version for candidate in interpretation.places),
+                    "controlled-resolver-v1",
+                ),
                 glossary_version=interpretation.glossary_version,
                 whole_city=interpretation.whole_city,
             )

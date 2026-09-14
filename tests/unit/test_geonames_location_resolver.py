@@ -419,21 +419,25 @@ def test_whole_city_phrase_uses_confirmed_city_without_searching_its_name() -> N
         transport=transport,
     )
 
-    resolution = adapter.resolve(
-        LocationResolutionQuery(
-            text="Anywhere in the whole city works",
-            locale="en",
-            stage=ConversationStage.SEARCH_AREA,
-            country_id="geonames:100",
-            city_id="geonames:200",
-        )
+    query = LocationResolutionQuery(
+        text="Anywhere in the whole city works",
+        locale="en",
+        stage=ConversationStage.SEARCH_AREA,
+        country_id="geonames:100",
+        city_id="geonames:200",
     )
+    resolution = adapter.resolve(query)
 
     assert len(resolution.interpretations) == 1
     interpretation = resolution.interpretations[0]
     assert interpretation.whole_city is True
     assert len(interpretation.places) == 1
     assert interpretation.places[0].place_id == "geonames:200"
+    search_area_interpretations = adapter.resolve_search_area(query)
+    assert len(search_area_interpretations) == 1
+    assert search_area_interpretations[0].candidates == ()
+    assert search_area_interpretations[0].whole_city is True
+    assert search_area_interpretations[0].resolver_version == "geonames-ws-v1"
     assert [call[0] for call in transport.calls] == [
         "getJSON",
         "getJSON",
