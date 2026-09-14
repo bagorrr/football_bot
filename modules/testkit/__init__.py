@@ -2095,8 +2095,10 @@ class ControlledLocationResolverAdapter:
         """Return a stable accepted Opportunity revision identity."""
         return f"opportunity-revision:{proposal_id}"
 
-    def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
-        """Resolve deterministic acceptance phrases without provider access."""
+    def _resolve_location_mention(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution:
+        """Resolve deterministic fixtures using Location Mention candidates."""
         self.queries.append(query)
         country_label = {
             "en": "Russia",
@@ -2341,10 +2343,32 @@ class ControlledLocationResolverAdapter:
             )
         return LocationResolution(interpretations=())
 
+    def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
+        """Return the legacy Search Area shape with Search Area candidates."""
+        resolution = self._resolve_location_mention(query)
+        return LocationResolution(
+            interpretations=tuple(
+                replace(
+                    interpretation,
+                    places=tuple(
+                        _as_search_area_candidate(candidate)
+                        for candidate in interpretation.places
+                    ),
+                )
+                for interpretation in resolution.interpretations
+            )
+        )
+
+    def resolve_location_mention(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution:
+        """Return Location Candidates for a Source Message Location Mention."""
+        return self._resolve_location_mention(query)
+
     def resolve_search_area(
         self, query: LocationResolutionQuery
     ) -> tuple[SearchAreaInterpretation, ...]:
-        """Adapt controlled Location fixtures to the Search Area boundary."""
+        """Adapt controlled fixtures to any Bot User geography stage."""
         resolution = self.resolve(query)
         return tuple(
             SearchAreaInterpretation(
@@ -2352,22 +2376,7 @@ class ControlledLocationResolverAdapter:
                     ()
                     if interpretation.whole_city
                     else tuple(
-                        SearchAreaCandidate(
-                            place_id=candidate.place_id,
-                            display_name=candidate.display_name,
-                            geographic_type=candidate.geographic_type,
-                            country_id=candidate.country_id,
-                            city_id=candidate.city_id,
-                            verified_parent_ids=candidate.verified_parent_ids,
-                            parent_display_names=candidate.parent_display_names,
-                            iana_timezone=candidate.iana_timezone,
-                            resolver_version=candidate.resolver_version,
-                            glossary_version=candidate.glossary_version,
-                            localized_display_names=candidate.localized_display_names,
-                            verified_disjoint_place_ids=(
-                                candidate.verified_disjoint_place_ids
-                            ),
-                        )
+                        _as_search_area_candidate(candidate)
                         for candidate in interpretation.places
                     )
                 ),
@@ -2380,6 +2389,27 @@ class ControlledLocationResolverAdapter:
             )
             for interpretation in resolution.interpretations
         )
+
+
+def _as_search_area_candidate(
+    candidate: LocationCandidate | SearchAreaCandidate,
+) -> SearchAreaCandidate:
+    if isinstance(candidate, SearchAreaCandidate):
+        return candidate
+    return SearchAreaCandidate(
+        place_id=candidate.place_id,
+        display_name=candidate.display_name,
+        geographic_type=candidate.geographic_type,
+        country_id=candidate.country_id,
+        city_id=candidate.city_id,
+        verified_parent_ids=candidate.verified_parent_ids,
+        parent_display_names=candidate.parent_display_names,
+        iana_timezone=candidate.iana_timezone,
+        resolver_version=candidate.resolver_version,
+        glossary_version=candidate.glossary_version,
+        localized_display_names=candidate.localized_display_names,
+        verified_disjoint_place_ids=candidate.verified_disjoint_place_ids,
+    )
 
 
 class ControlledConversationLanguageAdapter:

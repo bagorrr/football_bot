@@ -60,6 +60,7 @@ class GeographicType(StrEnum):
     STATION = "station"
     TRANSPORT_HUB = "transport_hub"
     LANDMARK = "landmark"
+    STREET = "street"
     ADDRESS = "address"
 
 
@@ -207,7 +208,8 @@ _LOCATION_SPECIFICITY = {
     "station": 5,
     "transport_hub": 6,
     "landmark": 7,
-    "address": 8,
+    "street": 8,
+    "address": 9,
 }
 
 
@@ -1314,7 +1316,7 @@ class RequiredDateConfirmationEvent:
 
 @dataclass(frozen=True, slots=True)
 class LocationCandidate:
-    """One non-authoritative place proposed by the Location Resolver."""
+    """One unaccepted interpretation of a Source Message Location Mention."""
 
     place_id: str
     display_name: str
@@ -1332,7 +1334,7 @@ class LocationCandidate:
 
 @dataclass(frozen=True, slots=True)
 class SearchAreaCandidate:
-    """One unaccepted resolver proposal for a Sub-city Area."""
+    """One unaccepted country, city, or Sub-city Area proposed by a Bot User."""
 
     place_id: str
     display_name: str
@@ -1368,9 +1370,9 @@ class AcceptedLocation:
 
 @dataclass(frozen=True, slots=True)
 class LocationInterpretation:
-    """One complete resolver interpretation of a Bot User answer."""
+    """One legacy resolver interpretation of a location query."""
 
-    places: tuple[LocationCandidate, ...]
+    places: tuple[LocationCandidate | SearchAreaCandidate, ...]
     glossary_version: str
     whole_city: bool = False
 

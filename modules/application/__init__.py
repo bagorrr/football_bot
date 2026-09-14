@@ -14,7 +14,7 @@ from enum import IntEnum
 from hashlib import sha256
 from threading import Event, Thread
 from time import monotonic
-from typing import TypedDict, cast
+from typing import TypedDict, TypeVar, cast
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -2261,8 +2261,12 @@ _SUB_CITY_TYPES = frozenset(
         GeographicType.STATION,
         GeographicType.TRANSPORT_HUB,
         GeographicType.LANDMARK,
+        GeographicType.STREET,
         GeographicType.ADDRESS,
     }
+)
+_GeographicCandidateT = TypeVar(
+    "_GeographicCandidateT", LocationCandidate, SearchAreaCandidate
 )
 
 _DATE_REQUIRED_INTENTS = frozenset(
@@ -8821,7 +8825,7 @@ class ConversationOnboarding:
         if locale is None:
             raise RuntimeError("Conversation Language is missing")
         try:
-            resolution = self._location_resolver.resolve(
+            interpretations = self._location_resolver.resolve_search_area(
                 LocationResolutionQuery(
                     text=text,
                     locale=locale,
@@ -8836,10 +8840,10 @@ class ConversationOnboarding:
             )
             return
         raw_candidates = tuple(
-            interpretation.places[0]
-            for interpretation in resolution.interpretations
-            if len(interpretation.places) == 1
-            and _valid_country(interpretation.places[0])
+            interpretation.candidates[0]
+            for interpretation in interpretations
+            if len(interpretation.candidates) == 1
+            and _valid_country(interpretation.candidates[0])
         )
         candidates = _deduplicate_location_candidates(raw_candidates)
         if candidates is None:
@@ -8862,7 +8866,7 @@ class ConversationOnboarding:
                 current=current,
                 outcome=(
                     _ResolutionOutcome.INVALID
-                    if resolution.interpretations
+                    if interpretations
                     else _ResolutionOutcome.UNKNOWN
                 ),
             )
@@ -8908,7 +8912,7 @@ class ConversationOnboarding:
         update_id: str,
         current: ConversationState,
         draft: DiscoveryDraft,
-        country: LocationCandidate | AcceptedLocation,
+        country: SearchAreaCandidate | AcceptedLocation,
     ) -> None:
         locale = current.locale
         if locale is None:
@@ -8973,7 +8977,7 @@ class ConversationOnboarding:
         *,
         update_id: str,
         current: ConversationState,
-        candidates: tuple[LocationCandidate, ...],
+        candidates: tuple[SearchAreaCandidate, ...],
     ) -> None:
         locale = current.locale
         if locale is None:
@@ -9026,7 +9030,7 @@ class ConversationOnboarding:
         if draft.country is None:
             raise RuntimeError("city stage has no confirmed country")
         try:
-            resolution = self._location_resolver.resolve(
+            interpretations = self._location_resolver.resolve_search_area(
                 LocationResolutionQuery(
                     text=text,
                     locale=locale,
@@ -9043,10 +9047,10 @@ class ConversationOnboarding:
             )
             return
         raw_candidates = tuple(
-            interpretation.places[0]
-            for interpretation in resolution.interpretations
-            if len(interpretation.places) == 1
-            and _valid_city(interpretation.places[0], draft.country)
+            interpretation.candidates[0]
+            for interpretation in interpretations
+            if len(interpretation.candidates) == 1
+            and _valid_city(interpretation.candidates[0], draft.country)
         )
         candidates = _deduplicate_location_candidates(raw_candidates)
         if candidates is None:
@@ -9073,7 +9077,7 @@ class ConversationOnboarding:
                 country=draft.country,
                 outcome=(
                     _ResolutionOutcome.INVALID
-                    if resolution.interpretations
+                    if interpretations
                     else _ResolutionOutcome.UNKNOWN
                 ),
             )
@@ -9092,7 +9096,7 @@ class ConversationOnboarding:
         current: ConversationState,
         country: AcceptedLocation,
         outcome: _ResolutionOutcome,
-        candidates: tuple[LocationCandidate, ...] = (),
+        candidates: tuple[SearchAreaCandidate, ...] = (),
     ) -> None:
         locale = current.locale
         if locale is None:
@@ -9130,7 +9134,7 @@ class ConversationOnboarding:
         update_id: str,
         current: ConversationState,
         draft: DiscoveryDraft,
-        city: LocationCandidate | AcceptedLocation,
+        city: SearchAreaCandidate | AcceptedLocation,
     ) -> None:
         locale = current.locale
         if locale is None:
@@ -10971,7 +10975,7 @@ def _format_list(locale: str, values: tuple[str, ...]) -> str:
 
 
 def _format_city_candidates(
-    locale: str, candidates: tuple[LocationCandidate, ...]
+    locale: str, candidates: tuple[SearchAreaCandidate, ...]
 ) -> str:
     labels = tuple(
         f"{_location_label(candidate, locale)} "
@@ -10982,7 +10986,7 @@ def _format_city_candidates(
 
 
 def _accept_location(
-    location: LocationCandidate | AcceptedLocation,
+    location: LocationCandidate | SearchAreaCandidate | AcceptedLocation,
 ) -> AcceptedLocation:
     if isinstance(location, AcceptedLocation):
         return location
@@ -11022,7 +11026,7 @@ def _accept_search_area_candidate(
 
 
 def _location_label(
-    location: LocationCandidate | AcceptedLocation,
+    location: LocationCandidate | SearchAreaCandidate | AcceptedLocation,
     locale: str,
 ) -> str:
     labels = dict(location.localized_display_names)
@@ -11045,41 +11049,12 @@ def _with_geonames_attribution(
 
 
 def _merge_location_candidates(
-    first: LocationCandidate,
-    second: LocationCandidate,
-) -> LocationCandidate | None:
+    first: _GeographicCandidateT,
+    second: _GeographicCandidateT,
+) -> _GeographicCandidateT | None:
     if (
-        first.place_id != second.place_id
-        or first.display_name != second.display_name
-        or first.geographic_type is not second.geographic_type
-        or first.country_id != second.country_id
-        or first.city_id != second.city_id
-        or first.verified_parent_ids != second.verified_parent_ids
-        or first.verified_disjoint_place_ids != second.verified_disjoint_place_ids
-        or first.parent_display_names != second.parent_display_names
-        or first.iana_timezone != second.iana_timezone
-        or first.resolver_version != second.resolver_version
-        or first.glossary_version != second.glossary_version
-    ):
-        return None
-    localized_display_names = dict(first.localized_display_names)
-    for locale, label in second.localized_display_names:
-        existing = localized_display_names.get(locale)
-        if existing is not None and existing != label:
-            return None
-        localized_display_names[locale] = label
-    return replace(
-        first,
-        localized_display_names=tuple(localized_display_names.items()),
-    )
-
-
-def _merge_search_area_candidates(
-    first: SearchAreaCandidate,
-    second: SearchAreaCandidate,
-) -> SearchAreaCandidate | None:
-    if (
-        first.place_id != second.place_id
+        type(first) is not type(second)
+        or first.place_id != second.place_id
         or first.display_name != second.display_name
         or first.geographic_type is not second.geographic_type
         or first.country_id != second.country_id
@@ -11105,9 +11080,9 @@ def _merge_search_area_candidates(
 
 
 def _deduplicate_location_candidates(
-    candidates: tuple[LocationCandidate, ...],
-) -> tuple[LocationCandidate, ...] | None:
-    deduplicated: list[LocationCandidate] = []
+    candidates: tuple[_GeographicCandidateT, ...],
+) -> tuple[_GeographicCandidateT, ...] | None:
+    deduplicated: list[_GeographicCandidateT] = []
     indexes: dict[str, int] = {}
     for candidate in candidates:
         index = indexes.get(candidate.place_id)
@@ -11149,7 +11124,7 @@ def _deduplicate_search_areas(
         }
         merged_candidates: list[SearchAreaCandidate] = []
         for first_candidate in first_interpretation.candidates:
-            merged = _merge_search_area_candidates(
+            merged = _merge_location_candidates(
                 first_candidate,
                 candidates_by_id[first_candidate.place_id],
             )
@@ -11200,7 +11175,7 @@ def _valid_location_disjointness(
     )
 
 
-def _valid_country(candidate: LocationCandidate | AcceptedLocation) -> bool:
+def _valid_country(candidate: SearchAreaCandidate | AcceptedLocation) -> bool:
     return (
         bool(candidate.place_id)
         and bool(candidate.display_name)
@@ -11218,7 +11193,7 @@ def _valid_country(candidate: LocationCandidate | AcceptedLocation) -> bool:
 
 
 def _valid_city(
-    candidate: LocationCandidate | AcceptedLocation,
+    candidate: SearchAreaCandidate | AcceptedLocation,
     country: AcceptedLocation,
 ) -> bool:
     if candidate.iana_timezone is None:
@@ -25347,7 +25322,7 @@ def _resolve_source_location_across_supported_locales(
     city_display_labels: dict[str, str] = {}
     for locale in ("en", "es", "fr", "ru"):
         try:
-            resolution = resolver.resolve(
+            resolution = resolver.resolve_location_mention(
                 LocationResolutionQuery(
                     text=mention,
                     locale=locale,
@@ -25371,6 +25346,8 @@ def _resolve_source_location_across_supported_locales(
         ):
             return None
         proposed = interpretation.places[0]
+        if not isinstance(proposed, LocationCandidate):
+            return None
         city_label: str | None
         if proposed.geographic_type is GeographicType.CITY:
             city_label = dict(proposed.localized_display_names).get(

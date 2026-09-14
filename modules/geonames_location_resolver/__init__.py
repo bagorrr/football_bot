@@ -199,23 +199,94 @@ class GeoNamesLocationResolverAdapter:
         return f"opportunity-revision:{proposal_id}"
 
     def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
-        """Return one or more provider-backed interpretations, or fail closed."""
+        """Return the legacy Search Area interpretation shape, or fail closed."""
         normalized = _validated_query(query)
         if normalized.stage is ConversationStage.COUNTRY:
-            return self._resolve_country(normalized)
+            return self._resolve_country(
+                normalized,
+                candidate_type=SearchAreaCandidate,
+            )
         country_code = self._country_code(normalized.country_id, normalized.locale)
         if country_code is None:
             return LocationResolution(interpretations=())
         if normalized.stage is ConversationStage.CITY:
-            return self._resolve_city(normalized, country_code)
+            return self._resolve_city(
+                normalized,
+                country_code,
+                candidate_type=SearchAreaCandidate,
+            )
         if normalized.stage is ConversationStage.SEARCH_AREA:
-            return self._resolve_search_area(normalized, country_code)
+            return self._resolve_search_area(
+                normalized,
+                country_code,
+                candidate_type=SearchAreaCandidate,
+                include_street_candidates=True,
+            )
         raise LocationResolverError("location stage is unsupported")
 
     def resolve_search_area(
         self, query: LocationResolutionQuery
     ) -> tuple[SearchAreaInterpretation, ...]:
-        """Resolve a Bot User's Search Area without Location Candidates."""
+        """Resolve one Bot User country, city, or Sub-city Area selection."""
+        normalized = _validated_query(query)
+        if normalized.stage is ConversationStage.COUNTRY:
+            resolution = self._resolve_country(
+                normalized,
+                candidate_type=SearchAreaCandidate,
+            )
+        elif normalized.stage in {
+            ConversationStage.CITY,
+            ConversationStage.SEARCH_AREA,
+        }:
+            country_code = self._country_code(
+                normalized.country_id or "", normalized.locale
+            )
+            if country_code is None:
+                return ()
+            if normalized.stage is ConversationStage.CITY:
+                resolution = self._resolve_city(
+                    normalized,
+                    country_code,
+                    candidate_type=SearchAreaCandidate,
+                )
+            else:
+                resolution = self._resolve_search_area(
+                    normalized,
+                    country_code,
+                    candidate_type=SearchAreaCandidate,
+                    include_street_candidates=True,
+                )
+        else:
+            raise LocationResolverError("location stage is unsupported")
+        return tuple(
+            SearchAreaInterpretation(
+                candidates=(
+                    ()
+                    if interpretation.whole_city
+                    else tuple(
+                        candidate
+                        for candidate in interpretation.places
+                        if isinstance(candidate, SearchAreaCandidate)
+                    )
+                ),
+                resolver_version=next(
+                    (
+                        candidate.resolver_version
+                        for candidate in interpretation.places
+                        if isinstance(candidate, SearchAreaCandidate)
+                    ),
+                    GEONAMES_RESOLVER_VERSION,
+                ),
+                glossary_version=interpretation.glossary_version,
+                whole_city=interpretation.whole_city,
+            )
+            for interpretation in resolution.interpretations
+        )
+
+    def resolve_location_mention(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution:
+        """Resolve a Source Message Location Mention to Location Candidates."""
         normalized = _validated_query(query)
         if normalized.stage is not ConversationStage.SEARCH_AREA:
             raise LocationResolverError("location stage is unsupported")
@@ -223,39 +294,25 @@ class GeoNamesLocationResolverAdapter:
             normalized.country_id or "", normalized.locale
         )
         if country_code is None:
-            return ()
-        if _whole_city(normalized.text, normalized.locale):
-            return (
-                SearchAreaInterpretation(
-                    candidates=(),
-                    resolver_version=GEONAMES_RESOLVER_VERSION,
-                    glossary_version=GEONAMES_GLOSSARY_VERSION,
-                    whole_city=True,
-                ),
-            )
-        candidate_sets = self._search_area_candidate_sets(
+            return LocationResolution(interpretations=())
+        return self._resolve_search_area(
             normalized,
             country_code,
-            candidate_type=SearchAreaCandidate,
-            include_street_vicinities=True,
-        )
-        if candidate_sets is None:
-            return ()
-        return tuple(
-            SearchAreaInterpretation(
-                candidates=candidates,
-                resolver_version=GEONAMES_RESOLVER_VERSION,
-                glossary_version=GEONAMES_GLOSSARY_VERSION,
-            )
-            for candidates in _candidate_combinations(candidate_sets)
+            candidate_type=LocationCandidate,
+            allow_whole_city=False,
         )
 
-    def _resolve_country(self, query: LocationResolutionQuery) -> LocationResolution:
+    def _resolve_country(
+        self,
+        query: LocationResolutionQuery,
+        *,
+        candidate_type: type[_CandidateT],
+    ) -> LocationResolution:
         records = self._search(
             query,
             feature_code="PCLI",
         )
-        candidates: list[LocationCandidate] = []
+        candidates: list[_CandidateT] = []
         for record in records:
             if record.get("fcode") != "PCLI":
                 continue
@@ -264,7 +321,7 @@ class GeoNamesLocationResolverAdapter:
             if place_id is None or name is None:
                 continue
             candidates.append(
-                LocationCandidate(
+                candidate_type(
                     place_id=place_id,
                     display_name=name,
                     geographic_type=GeographicType.COUNTRY,
@@ -288,14 +345,18 @@ class GeoNamesLocationResolverAdapter:
         )
 
     def _resolve_city(
-        self, query: LocationResolutionQuery, country_code: str
+        self,
+        query: LocationResolutionQuery,
+        country_code: str,
+        *,
+        candidate_type: type[_CandidateT],
     ) -> LocationResolution:
         records = self._search(
             query,
             country_code=country_code,
             feature_class="P",
         )
-        candidates: list[LocationCandidate] = []
+        candidates: list[_CandidateT] = []
         for record in records:
             if record.get("fcode") not in _CITY_CODES:
                 continue
@@ -305,7 +366,7 @@ class GeoNamesLocationResolverAdapter:
                 country_id=query.country_id or "",
                 geographic_type=GeographicType.CITY,
                 city_id=None,
-                candidate_type=LocationCandidate,
+                candidate_type=candidate_type,
             )
             if candidate is not None:
                 candidates.append(candidate)
@@ -319,10 +380,16 @@ class GeoNamesLocationResolverAdapter:
         )
 
     def _resolve_search_area(
-        self, query: LocationResolutionQuery, country_code: str
+        self,
+        query: LocationResolutionQuery,
+        country_code: str,
+        *,
+        candidate_type: type[_CandidateT],
+        include_street_candidates: bool = False,
+        allow_whole_city: bool = True,
     ) -> LocationResolution:
         city_id = query.city_id or ""
-        if _whole_city(query.text, query.locale):
+        if allow_whole_city and _whole_city(query.text, query.locale):
             record = self._get(city_id, query.locale)
             if record is None or record.get("fcode") not in _CITY_CODES:
                 return LocationResolution(interpretations=())
@@ -332,7 +399,7 @@ class GeoNamesLocationResolverAdapter:
                 country_id=query.country_id or "",
                 geographic_type=GeographicType.CITY,
                 city_id=None,
-                candidate_type=LocationCandidate,
+                candidate_type=candidate_type,
             )
             if city is None:
                 return LocationResolution(interpretations=())
@@ -349,7 +416,8 @@ class GeoNamesLocationResolverAdapter:
         results = self._search_area_candidate_sets(
             query,
             country_code,
-            candidate_type=LocationCandidate,
+            candidate_type=candidate_type,
+            include_street_candidates=include_street_candidates,
         )
         if results is None:
             return LocationResolution(interpretations=())
@@ -369,15 +437,15 @@ class GeoNamesLocationResolverAdapter:
         country_code: str,
         *,
         candidate_type: type[_CandidateT],
-        include_street_vicinities: bool = False,
+        include_street_candidates: bool = False,
     ) -> list[tuple[_CandidateT, ...]] | None:
         candidate_sets: list[tuple[_CandidateT, ...]] = []
         phrases = (
             _search_area_phrases(query.text)
-            if include_street_vicinities
-            else tuple((phrase, False) for phrase in _area_phrases(query.text))
+            if include_street_candidates
+            else tuple((phrase, False, False) for phrase in _area_phrases(query.text))
         )
-        for phrase, is_street_vicinity in phrases:
+        for phrase, is_street, has_house_number in phrases:
             phrase_query = LocationResolutionQuery(
                 text=phrase,
                 locale=query.locale,
@@ -388,14 +456,16 @@ class GeoNamesLocationResolverAdapter:
             records = self._search(
                 phrase_query,
                 country_code=country_code,
-                feature_class="R" if is_street_vicinity else ("A", "P", "S", "L", "H"),
-                feature_code="ST" if is_street_vicinity else None,
+                feature_class="R" if is_street else ("A", "P", "S", "L", "H"),
+                feature_code="ST" if is_street else None,
             )
             matches: list[_CandidateT] = []
             for record in records:
-                if is_street_vicinity:
+                if is_street:
                     geographic_type = (
-                        GeographicType.ADDRESS if _is_street_record(record) else None
+                        GeographicType.STREET
+                        if not has_house_number and _is_street_record(record)
+                        else None
                     )
                 else:
                     geographic_type = _sub_city_type(record)
@@ -746,38 +816,40 @@ def _area_phrases(text: str) -> tuple[str, ...]:
     return parts
 
 
-def _search_area_phrases(text: str) -> tuple[tuple[str, bool], ...]:
+def _search_area_phrases(text: str) -> tuple[tuple[str, bool, bool], ...]:
     parts = _area_phrases(text)
-    phrases: list[tuple[str, bool]] = []
+    phrases: list[tuple[str, bool, bool]] = []
     index = 0
     while index < len(parts):
         phrase = parts[index]
         if _is_house_number(phrase) and index + 1 < len(parts):
-            street, is_address = _street_vicinity_phrase(f"{phrase} {parts[index + 1]}")
-            if is_address:
-                phrases.append((street, True))
+            combined = f"{phrase} {parts[index + 1]}"
+            _, is_street, has_house_number = _street_search_phrase(combined)
+            if is_street and has_house_number:
+                phrases.append((combined, is_street, has_house_number))
                 index += 2
                 continue
         if index + 1 < len(parts) and _is_house_number(parts[index + 1]):
-            street, is_address = _street_vicinity_phrase(f"{phrase} {parts[index + 1]}")
-            if is_address:
-                phrases.append((street, True))
+            combined = f"{phrase} {parts[index + 1]}"
+            _, is_street, has_house_number = _street_search_phrase(combined)
+            if is_street and has_house_number:
+                phrases.append((combined, is_street, has_house_number))
                 index += 2
                 continue
-        street, is_address = _street_vicinity_phrase(phrase)
-        phrases.append((street, is_address))
+        normalized, is_street, has_house_number = _street_search_phrase(phrase)
+        phrases.append((normalized, is_street, has_house_number))
         index += 1
     return tuple(phrases)
 
 
-def _street_vicinity_phrase(text: str) -> tuple[str, bool]:
+def _street_search_phrase(text: str) -> tuple[str, bool, bool]:
     leading = _LEADING_HOUSE_NUMBER_PATTERN.fullmatch(text)
     if leading is not None and _has_street_designator(leading.group(2)):
-        return leading.group(2), True
+        return text, True, True
     trailing = _TRAILING_HOUSE_NUMBER_PATTERN.fullmatch(text)
     if trailing is not None and _has_street_designator(trailing.group(1)):
-        return trailing.group(1), True
-    return text, False
+        return text, True, True
+    return text, _has_street_designator(text), False
 
 
 def _has_street_designator(text: str) -> bool:

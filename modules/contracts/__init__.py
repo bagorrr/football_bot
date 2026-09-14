@@ -924,6 +924,7 @@ SUB_CITY_GEOGRAPHIC_TYPES = frozenset(
         "station",
         "transport_hub",
         "landmark",
+        "street",
         "address",
     }
 )

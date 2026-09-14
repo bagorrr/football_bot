@@ -532,20 +532,26 @@ class ClassificationProofWork:
 
 
 class LocationResolverAdapter(Protocol):
-    """Controlled location boundary for accepted publication facts."""
+    """Controlled boundaries for Bot User geography and source mentions."""
 
     def opportunity_revision_id(self, proposal_id: str) -> str:
         """Return one synthetic accepted Opportunity revision identity."""
         ...
 
     def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
-        """Return non-authoritative interpretations for application validation."""
+        """Return the legacy Search Area interpretation shape."""
         ...
 
     def resolve_search_area(
         self, query: LocationResolutionQuery
     ) -> tuple[SearchAreaInterpretation, ...]:
-        """Return candidates for the Bot User's Search Area input."""
+        """Return typed candidates for country, city, or Sub-city Area input."""
+        ...
+
+    def resolve_location_mention(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution:
+        """Return Location Candidates only for a Source Message Location Mention."""
         ...
 
 

@@ -129,16 +129,16 @@ def test_country_candidate_uses_stable_geonames_identity_and_locale() -> None:
         transport=transport,
     )
 
-    resolution = adapter.resolve(
-        LocationResolutionQuery(
-            text="España",
-            locale="es",
-            stage=ConversationStage.COUNTRY,
-        )
+    query = LocationResolutionQuery(
+        text="España",
+        locale="es",
+        stage=ConversationStage.COUNTRY,
     )
+    resolution = adapter.resolve(query)
 
     assert len(resolution.interpretations) == 1
     candidate = resolution.interpretations[0].places[0]
+    assert type(candidate) is domain.SearchAreaCandidate
     assert candidate.place_id == "geonames:2510769"
     assert candidate.country_id == candidate.place_id
     assert candidate.city_id is None
@@ -149,6 +149,9 @@ def test_country_candidate_uses_stable_geonames_identity_and_locale() -> None:
         "fr": "Spain",
         "ru": "Spain",
     }
+    search_area_interpretations = adapter.resolve_search_area(query)
+    assert len(search_area_interpretations) == 1
+    assert search_area_interpretations[0].candidates == (candidate,)
     assert transport.calls == [
         (
             "searchJSON",
@@ -203,17 +206,17 @@ def test_city_candidate_requires_geonames_ancestry_and_installed_timezone() -> N
         transport=transport,
     )
 
-    resolution = adapter.resolve(
-        LocationResolutionQuery(
-            text="Санкт-Петербург",
-            locale="ru",
-            stage=ConversationStage.CITY,
-            country_id="geonames:100",
-        )
+    query = LocationResolutionQuery(
+        text="Санкт-Петербург",
+        locale="ru",
+        stage=ConversationStage.CITY,
+        country_id="geonames:100",
     )
+    resolution = adapter.resolve(query)
 
     assert len(resolution.interpretations) == 1
     candidate = resolution.interpretations[0].places[0]
+    assert type(candidate) is domain.SearchAreaCandidate
     assert candidate.place_id == "geonames:200"
     assert candidate.city_id == candidate.place_id
     assert candidate.country_id == "geonames:100"
@@ -221,6 +224,9 @@ def test_city_candidate_requires_geonames_ancestry_and_installed_timezone() -> N
     assert candidate.verified_parent_ids == ("geonames:101", "geonames:100")
     assert candidate.parent_display_names == ("Северо-Запад", "Россия")
     assert candidate.iana_timezone == "Europe/Moscow"
+    search_area_interpretations = adapter.resolve_search_area(query)
+    assert len(search_area_interpretations) == 1
+    assert search_area_interpretations[0].candidates == (candidate,)
     assert [call[0] for call in transport.calls] == [
         "getJSON",
         "searchJSON",
@@ -297,12 +303,12 @@ def test_search_area_uses_its_own_candidate_model_and_verified_parents() -> None
     )
 
 
-def test_numbered_address_resolves_to_a_verified_street_vicinity() -> None:
+def test_bare_street_resolves_as_street_without_widening_numbered_address() -> None:
     def search(
         params: Mapping[str, str | tuple[str, ...]],
     ) -> Mapping[str, object]:
         if (
-            params.get("q") != "Baker Street"
+            params.get("q") not in {"Baker Street", "221B Baker Street"}
             or params.get("featureClass") != "R"
             or params.get("featureCode") != "ST"
         ):
@@ -351,9 +357,9 @@ def test_numbered_address_resolves_to_a_verified_street_vicinity() -> None:
         transport=transport,
     )
 
-    interpretations = adapter.resolve_search_area(
+    bare_interpretations = adapter.resolve_search_area(
         LocationResolutionQuery(
-            text="221B Baker Street",
+            text="Baker Street",
             locale="en",
             stage=ConversationStage.SEARCH_AREA,
             country_id="geonames:100",
@@ -361,11 +367,11 @@ def test_numbered_address_resolves_to_a_verified_street_vicinity() -> None:
         )
     )
 
-    assert len(interpretations) == 1
-    candidate = interpretations[0].candidates[0]
+    assert len(bare_interpretations) == 1
+    candidate = bare_interpretations[0].candidates[0]
     assert type(candidate) is domain.SearchAreaCandidate
     assert candidate.place_id == "geonames:300"
-    assert candidate.geographic_type is GeographicType.ADDRESS
+    assert candidate.geographic_type.value == "street"
     assert candidate.localized_display_names == tuple(
         (locale, "Baker Street") for locale in ("en", "es", "fr", "ru")
     )
@@ -374,13 +380,46 @@ def test_numbered_address_resolves_to_a_verified_street_vicinity() -> None:
         "geonames:100",
     )
     assert candidate.parent_display_names[-2:] == ("Saint Petersburg", "Russia")
-    assert not any("221B" in str(call[1]) for call in transport.calls)
+    legacy_bare = adapter.resolve(
+        LocationResolutionQuery(
+            text="Baker Street",
+            locale="en",
+            stage=ConversationStage.SEARCH_AREA,
+            country_id="geonames:100",
+            city_id="geonames:200",
+        )
+    )
+    assert type(legacy_bare.interpretations[0].places[0]) is domain.SearchAreaCandidate
+    assert legacy_bare.interpretations[0].places[0].geographic_type.value == "street"
+    calls_before_numbered_query = len(transport.calls)
+    numbered_interpretations = adapter.resolve_search_area(
+        LocationResolutionQuery(
+            text="221B Baker Street",
+            locale="en",
+            stage=ConversationStage.SEARCH_AREA,
+            country_id="geonames:100",
+            city_id="geonames:200",
+        )
+    )
+    assert numbered_interpretations == ()
+    numbered_search_calls = transport.calls[calls_before_numbered_query:]
     assert any(
-        call[1].get("q") == "Baker Street"
+        call[1].get("q") == "221B Baker Street"
         and call[1].get("featureClass") == "R"
         and call[1].get("featureCode") == "ST"
-        for call in transport.calls
+        for call in numbered_search_calls
     )
+    assert not any(call[1].get("q") == "Baker Street" for call in numbered_search_calls)
+    legacy_numbered = adapter.resolve(
+        LocationResolutionQuery(
+            text="221B Baker Street",
+            locale="en",
+            stage=ConversationStage.SEARCH_AREA,
+            country_id="geonames:100",
+            city_id="geonames:200",
+        )
+    )
+    assert legacy_numbered.interpretations == ()
 
 
 def test_whole_city_phrase_uses_confirmed_city_without_searching_its_name() -> None:
@@ -430,6 +469,7 @@ def test_whole_city_phrase_uses_confirmed_city_without_searching_its_name() -> N
 
     assert len(resolution.interpretations) == 1
     interpretation = resolution.interpretations[0]
+    assert type(interpretation.places[0]) is domain.SearchAreaCandidate
     assert interpretation.whole_city is True
     assert len(interpretation.places) == 1
     assert interpretation.places[0].place_id == "geonames:200"
@@ -498,6 +538,7 @@ def test_nonempty_geonames_result_passes_application_location_contract() -> None
     assert accepted is not None
     candidate, city_labels = accepted
     assert candidate.place_id == place_id
+    assert type(candidate) is LocationCandidate
     assert candidate.geographic_type is GeographicType.STATION
     assert candidate.glossary_version == "location-glossary-v1"
     assert candidate.verified_parent_ids == (city_id, country_id)

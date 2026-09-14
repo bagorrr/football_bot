@@ -207,6 +207,11 @@ class _LocalizedLocationResolver:
     def opportunity_revision_id(self, proposal_id: str) -> str:
         return f"revision:{proposal_id}"
 
+    def resolve_location_mention(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution:
+        return self.resolve(query)
+
     def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
         place_labels = {
             "en": "Central Station",
