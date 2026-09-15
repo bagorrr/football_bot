@@ -144,6 +144,8 @@ ROLE_REQUIRED_KEYS: dict[str, frozenset[str]] = {
             LOCATIONIQ_ACCESS_TOKEN,
             TELEGRAM_BOT_TOKEN,
             TELEGRAM_ADMIN_USER_ID,
+            BOT_ASSISTANT_MODEL,
+            BOT_ASSISTANT_REASONING_EFFORT,
             BOT_ASSISTANT_CODEX_HOME,
         }
     ),
@@ -423,14 +425,14 @@ def _validate_t3_settings(
         DEFAULT_BOT_ASSISTANT_REASONING_EFFORT,
     )
 
-    for key, default in (
+    for key, supported in (
         (BOT_ASSISTANT_MODEL, DEFAULT_BOT_ASSISTANT_MODEL),
         (BOT_ASSISTANT_REASONING_EFFORT_KEY, DEFAULT_BOT_ASSISTANT_REASONING_EFFORT),
     ):
         value = projection.get(key)
-        if value is None and key not in statuses:
-            statuses[key] = "defaulted"
-        elif statuses.get(key) in {"ready", "missing"} and value != default:
+        if value is None:
+            statuses.setdefault(key, "missing")
+        elif statuses.get(key) in {"ready", "missing"} and value != supported:
             statuses[key] = "unsupported"
     slots = projection.get(BOT_ASSISTANT_SDK_SLOTS_KEY)
     if slots is None and BOT_ASSISTANT_SDK_SLOTS_KEY not in statuses:

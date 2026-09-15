@@ -140,6 +140,42 @@ def test_role_preflight_checks_required_values_and_database_role_identity() -> N
     assert "local" not in repr(public)
 
 
+@pytest.mark.parametrize(
+    ("key", "value", "expected_status"),
+    [
+        ("BOT_ASSISTANT_MODEL", None, "missing"),
+        ("BOT_ASSISTANT_MODEL", "", "empty"),
+        ("BOT_ASSISTANT_MODEL", 123, "malformed"),
+        ("BOT_ASSISTANT_MODEL", "gpt-5.6-sol", "unsupported"),
+        ("BOT_ASSISTANT_REASONING_EFFORT", None, "missing"),
+        ("BOT_ASSISTANT_REASONING_EFFORT", "", "empty"),
+        ("BOT_ASSISTANT_REASONING_EFFORT", 123, "malformed"),
+        ("BOT_ASSISTANT_REASONING_EFFORT", "max", "unsupported"),
+    ],
+)
+def test_bot_assistant_policy_must_be_explicit_and_validated(
+    key: str, value: object, expected_status: str
+) -> None:
+    projection: dict[str, object] = {
+        "DATABASE_URL_BOT_ASSISTANT": (
+            "postgresql://football_bot_assistant:local@localhost/football"
+        ),
+        "GEONAMES_USERNAME": "controlled-user",
+        "LOCATIONIQ_ACCESS_TOKEN": "controlled-locationiq-token",
+        "TELEGRAM_BOT_TOKEN": "123456:controlled-token",
+        "TELEGRAM_ADMIN_USER_ID": "123456",
+        "BOT_ASSISTANT_CODEX_HOME": "/var/lib/football-bot/bot_assistant/codex",
+        "BOT_ASSISTANT_SDK_SLOTS": "1",
+    }
+    if value is not None:
+        projection[key] = value
+
+    report = preflight_role("bot_assistant", projection, check_protected_paths=False)
+
+    assert report.key_statuses[key] == expected_status
+    assert not report.configuration_ready
+
+
 def test_project_role_rejects_unknown_role_without_exposing_values() -> None:
     with pytest.raises(T5ConfigurationError) as error:
         project_role({"TELEGRAM_BOT_TOKEN": "secret-token"}, "unknown")

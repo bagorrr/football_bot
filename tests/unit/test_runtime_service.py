@@ -103,6 +103,8 @@ def test_bot_assistant_production_composition_uses_real_adapters_and_t1_boundary
             "LOCATIONIQ_ACCESS_TOKEN": "controlled-locationiq-token",
             "TELEGRAM_BOT_TOKEN": "123456:controlled-token",
             "TELEGRAM_ADMIN_USER_ID": "123456",
+            "BOT_ASSISTANT_MODEL": "gpt-5.6-luna",
+            "BOT_ASSISTANT_REASONING_EFFORT": "high",
             "BOT_ASSISTANT_CODEX_HOME": "/var/lib/football-bot/bot_assistant/codex",
         },
         repository_root=Path("/srv/football-bot/current"),

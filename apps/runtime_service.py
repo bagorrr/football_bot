@@ -248,7 +248,9 @@ def build_runtime_service(
             T1BotApiProjection,
         )
         from modules.codex_bot_assistant_adapter import (
-            T3_BOT_ASSISTANT_CONFIG_KEYS,
+            BOT_ASSISTANT_MODEL_KEY,
+            BOT_ASSISTANT_REASONING_EFFORT_KEY,
+            BOT_ASSISTANT_SDK_SLOTS_KEY,
             BotAssistantSdkSettings,
             CodexSdkBotAssistantAdapter,
         )
@@ -275,9 +277,17 @@ def build_runtime_service(
             ),
         )
         delivery = BotApiDeliveryAdapter(cast(Any, bot_api.transport))
-        settings = BotAssistantSdkSettings.from_t3_projection(
-            {key: values[key] for key in T3_BOT_ASSISTANT_CONFIG_KEYS if key in values}
-        )
+        t3_projection = {
+            BOT_ASSISTANT_MODEL_KEY: _required(values, BOT_ASSISTANT_MODEL_KEY),
+            BOT_ASSISTANT_REASONING_EFFORT_KEY: _required(
+                values, BOT_ASSISTANT_REASONING_EFFORT_KEY
+            ),
+        }
+        if BOT_ASSISTANT_SDK_SLOTS_KEY in values:
+            t3_projection[BOT_ASSISTANT_SDK_SLOTS_KEY] = values[
+                BOT_ASSISTANT_SDK_SLOTS_KEY
+            ]
+        settings = BotAssistantSdkSettings.from_t3_projection(t3_projection)
         assistant_model = CodexSdkBotAssistantAdapter(
             settings=settings,
             codex_home=Path(_required(values, "BOT_ASSISTANT_CODEX_HOME")),

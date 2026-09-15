@@ -254,7 +254,12 @@ _RESULT_CONVERSATION_V3_FIXTURES = (
 
 
 def test_t3_settings_are_explicit_and_fail_closed() -> None:
-    settings = BotAssistantSdkSettings.from_t3_projection({})
+    settings = BotAssistantSdkSettings.from_t3_projection(
+        {
+            BOT_ASSISTANT_MODEL_KEY: "gpt-5.6-luna",
+            BOT_ASSISTANT_REASONING_EFFORT_KEY: "high",
+        }
+    )
 
     assert settings.model == "gpt-5.6-luna"
     assert settings.reasoning_effort == "high"
@@ -265,12 +270,37 @@ def test_t3_settings_are_explicit_and_fail_closed() -> None:
         BOT_ASSISTANT_SDK_SLOTS_KEY: "1",
     }
     for projection in (
-        {BOT_ASSISTANT_MODEL_KEY: "gpt-5.6-sol"},
-        {BOT_ASSISTANT_REASONING_EFFORT_KEY: "max"},
-        {BOT_ASSISTANT_SDK_SLOTS_KEY: "0"},
-        {BOT_ASSISTANT_SDK_SLOTS_KEY: "5"},
-        {BOT_ASSISTANT_SDK_SLOTS_KEY: "02"},
-        {BOT_ASSISTANT_SDK_SLOTS_KEY: " 2"},
+        {},
+        {BOT_ASSISTANT_MODEL_KEY: "gpt-5.6-luna"},
+        {BOT_ASSISTANT_REASONING_EFFORT_KEY: "high"},
+        {
+            BOT_ASSISTANT_MODEL_KEY: "gpt-5.6-sol",
+            BOT_ASSISTANT_REASONING_EFFORT_KEY: "high",
+        },
+        {
+            BOT_ASSISTANT_MODEL_KEY: "gpt-5.6-luna",
+            BOT_ASSISTANT_REASONING_EFFORT_KEY: "max",
+        },
+        {
+            BOT_ASSISTANT_MODEL_KEY: "gpt-5.6-luna",
+            BOT_ASSISTANT_REASONING_EFFORT_KEY: "high",
+            BOT_ASSISTANT_SDK_SLOTS_KEY: "0",
+        },
+        {
+            BOT_ASSISTANT_MODEL_KEY: "gpt-5.6-luna",
+            BOT_ASSISTANT_REASONING_EFFORT_KEY: "high",
+            BOT_ASSISTANT_SDK_SLOTS_KEY: "5",
+        },
+        {
+            BOT_ASSISTANT_MODEL_KEY: "gpt-5.6-luna",
+            BOT_ASSISTANT_REASONING_EFFORT_KEY: "high",
+            BOT_ASSISTANT_SDK_SLOTS_KEY: "02",
+        },
+        {
+            BOT_ASSISTANT_MODEL_KEY: "gpt-5.6-luna",
+            BOT_ASSISTANT_REASONING_EFFORT_KEY: "high",
+            BOT_ASSISTANT_SDK_SLOTS_KEY: " 2",
+        },
         {"TELEGRAM_BOT_TOKEN": "controlled-test-only"},
     ):
         with pytest.raises(ValueError):
@@ -282,7 +312,11 @@ def test_adapter_sends_versioned_bounded_input_and_sanitized_environment() -> No
     runner = _RecordingRunner(_success_output(request))
     adapter = CodexSdkBotAssistantAdapter(
         settings=BotAssistantSdkSettings.from_t3_projection(
-            {BOT_ASSISTANT_SDK_SLOTS_KEY: "2"}
+            {
+                BOT_ASSISTANT_MODEL_KEY: "gpt-5.6-luna",
+                BOT_ASSISTANT_REASONING_EFFORT_KEY: "high",
+                BOT_ASSISTANT_SDK_SLOTS_KEY: "2",
+            }
         ),
         codex_home=Path("/protected/codex-subscription-store"),
         runner=runner,
