@@ -306,6 +306,84 @@ ALTER TABLE football_runtime.bot_message_outbox
 
 _RUNTIME_DATABASE_ROLES = tuple(role.database_role for role in RuntimeRole)
 
+_REQUIRED_RUNTIME_TABLES = (
+    "acceptance_state",
+    "application_classifier_promotion_attestations",
+    "application_classifier_promotion_gate_runs",
+    "application_classifier_promotion_replays",
+    "application_exact_repost_cluster_members",
+    "application_exact_repost_clusters",
+    "application_legacy_proposition_identity_compatibility",
+    "application_moderation_events",
+    "application_opportunities",
+    "application_proposition_identities",
+    "application_source_chat_lifecycle_events",
+    "application_source_data_audit",
+    "application_source_data_deletion_owner_acks",
+    "application_source_data_deletion_replay_barriers",
+    "application_source_data_deletion_requests",
+    "application_source_message_replay_barriers",
+    "application_source_message_retention",
+    "application_source_message_tombstones",
+    "bot_active_chat_views",
+    "bot_active_result_contexts",
+    "bot_api_checkpoints",
+    "bot_api_delivery_reconciliation",
+    "bot_api_retention_alerts",
+    "bot_api_updates",
+    "bot_assistant_failure_alarms",
+    "bot_assistant_failure_records",
+    "bot_assistant_operational_alerts",
+    "bot_callback_outbox",
+    "bot_delivery_alerts",
+    "bot_discovery_drafts",
+    "bot_geography_confirmation_events",
+    "bot_message_outbox",
+    "bot_old_chat_views",
+    "bot_required_date_confirmation_events",
+    "bot_result_conversation_messages",
+    "bot_search_presentations",
+    "bot_updates",
+    "bot_users",
+    "classification_attempts",
+    "classification_proof_work",
+    "classification_routing_outcomes",
+    "classifier_adapter_circuits",
+    "contract_inbox",
+    "contract_outbox",
+    "ingestion_failures",
+    "operator_alerts",
+    "protected_content_skips",
+    "recommendation_completed_searches",
+    "recommendation_opportunities",
+    "recommendation_results",
+    "source_chat_admission_requests",
+    "source_chat_lifecycle_origins",
+    "source_chat_registration_origins",
+    "source_chat_registry",
+    "source_event_records",
+    "source_message_revisions",
+    "source_messages",
+    "telegram_account_difference_checkpoints",
+    "telegram_channel_difference_checkpoints",
+    "telegram_presentations",
+    "telegram_source_chat_history_progress",
+)
+_MIGRATION_LEDGER_COLUMNS = (
+    ("migration_name", "text", True),
+    ("checksum", "text", True),
+    ("applied_at", "timestamp with time zone", True),
+)
+_CURRENT_SCHEMA_COLUMNS = (
+    ("source_event_records", "transport_event_id", "text"),
+    ("source_event_records", "transport_order", "bigint"),
+    ("source_message_revisions", "transport_event_id", "text"),
+    ("source_message_revisions", "transport_order", "bigint"),
+    ("bot_message_outbox", "originating_update_id", "text"),
+    ("source_chat_registration_origins", "originating_update_id", "text"),
+    ("source_chat_lifecycle_origins", "originating_update_id", "text"),
+)
+
 
 def _uuid_or_none(value: str) -> UUID | None:
     """Parse a persisted UUID without allowing malformed attestations through."""
@@ -329,6 +407,91 @@ _UNAVAILABLE_RESPONSE_ROUTE: dict[str, JsonValue] = {
     "kind": "unavailable",
     "value": "",
 }
+
+
+_READINESS_QUERY = """
+WITH required_runtime_tables(table_name) AS (
+    SELECT unnest(%s::text[])
+), required_ledger_columns(column_name, type_name, required_not_null) AS (
+    SELECT * FROM unnest(%s::text[], %s::text[], %s::boolean[])
+), required_current_columns(table_name, column_name, type_name) AS (
+    SELECT * FROM unnest(%s::text[], %s::text[], %s::text[])
+)
+SELECT
+    SESSION_USER = %s,
+    EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_namespace
+        WHERE nspname = 'football_runtime'
+    ),
+    EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_namespace
+        WHERE nspname = 'football_migrations'
+    ),
+    EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class AS relation
+        JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'football_migrations'
+          AND relation.relname = 'applied_migrations'
+          AND relation.relkind = 'r'
+    ),
+    (
+        SELECT count(*) = %s
+        FROM required_runtime_tables AS required
+        JOIN pg_catalog.pg_class AS relation
+          ON relation.relname = required.table_name
+         AND relation.relkind IN ('r', 'p')
+        JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+         AND namespace.nspname = 'football_runtime'
+    ),
+    (
+        SELECT count(*) = %s
+        FROM required_ledger_columns AS required
+        WHERE EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class AS relation
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = relation.oid
+            WHERE namespace.nspname = 'football_migrations'
+              AND relation.relname = 'applied_migrations'
+              AND relation.relkind = 'r'
+              AND attribute.attname = required.column_name
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+              AND attribute.attnotnull = required.required_not_null
+              AND pg_catalog.format_type(
+                      attribute.atttypid, attribute.atttypmod
+                  ) = required.type_name
+        )
+    ),
+    (
+        SELECT count(*) = %s
+        FROM required_current_columns AS required
+        WHERE EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class AS relation
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = relation.oid
+            WHERE namespace.nspname = 'football_runtime'
+              AND relation.relname = required.table_name
+              AND relation.relkind IN ('r', 'p')
+              AND attribute.attname = required.column_name
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+              AND pg_catalog.format_type(
+                      attribute.atttypid, attribute.atttypmod
+                  ) = required.type_name
+        )
+    )
+"""
 
 
 _MATERIAL_SCHEMA_QUERY = """
@@ -2806,15 +2969,31 @@ class PostgresRoleStore:
         try:
             with psycopg.connect(self._database_url) as connection:
                 row = connection.execute(
-                    """
-                    SELECT SESSION_USER,
-                           to_regnamespace('football_runtime') IS NOT NULL
-                    """
+                    _READINESS_QUERY,
+                    (
+                        list(_REQUIRED_RUNTIME_TABLES),
+                        [column[0] for column in _MIGRATION_LEDGER_COLUMNS],
+                        [column[1] for column in _MIGRATION_LEDGER_COLUMNS],
+                        [column[2] for column in _MIGRATION_LEDGER_COLUMNS],
+                        [column[0] for column in _CURRENT_SCHEMA_COLUMNS],
+                        [column[1] for column in _CURRENT_SCHEMA_COLUMNS],
+                        [column[2] for column in _CURRENT_SCHEMA_COLUMNS],
+                        self._role.database_role,
+                        len(_REQUIRED_RUNTIME_TABLES),
+                        len(_MIGRATION_LEDGER_COLUMNS),
+                        len(_CURRENT_SCHEMA_COLUMNS),
+                    ),
                 ).fetchone()
-        except Exception:
+        except (psycopg.OperationalError, psycopg.InterfaceError):
             raise PostgresRoleReadinessError(status="database_unavailable") from None
-        if row is None or row[0] != self._role.database_role or row[1] is not True:
-            raise PostgresRoleReadinessError(status="identity_or_schema_mismatch")
+        except Exception:
+            raise PostgresRoleReadinessError(status="schema_not_ready") from None
+        if row is None or len(row) != 7:
+            raise PostgresRoleReadinessError(status="schema_not_ready")
+        if row[0] is not True:
+            raise PostgresRoleReadinessError(status="identity_mismatch")
+        if any(value is not True for value in row[1:]):
+            raise PostgresRoleReadinessError(status="schema_not_ready")
 
     def commit_initial(
         self,

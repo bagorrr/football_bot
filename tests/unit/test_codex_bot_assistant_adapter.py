@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -429,6 +431,83 @@ def test_timeout_is_not_retried_and_malformed_output_fails_closed() -> None:
     malformed_adapter = _adapter(_RecordingRunner("not-json"))
     with pytest.raises(BotAssistantSdkAdapterError):
         malformed_adapter.respond(request)
+
+
+def test_invalid_configuration_worker_envelope_is_terminal_and_not_retried() -> None:
+    request = _request()
+    output = json.loads(_failure_output(request, "invalid_configuration"))
+    output["provenance"] = None
+    runner = _RecordingRunner(json.dumps(output))
+
+    with pytest.raises(BotAssistantSdkAdapterError):
+        _adapter(runner).respond(request)
+
+    assert runner.calls == 1
+
+
+def test_worker_main_returns_a_versioned_envelope_for_invalid_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, output = _run_worker_main(monkeypatch, b"not-json")
+
+    assert result == 0
+    assert set(output) == {
+        "version",
+        "turn_id",
+        "requested_model",
+        "effective_model",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+        "outcome",
+        "failure_code",
+        "response",
+        "provenance",
+    }
+    assert output["version"] == 1
+    assert output["outcome"] == "failure"
+    assert output["failure_code"] == "invalid_configuration"
+    assert output["response"] is None
+
+
+def test_worker_main_returns_a_versioned_envelope_for_configuration_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, output = _run_worker_main(
+        monkeypatch,
+        json.dumps(_input_envelope(_request())).encode("utf-8"),
+        environment={
+            "PATH": os.defpath,
+            "HOME": "/tmp/isolated-home",
+            "TMPDIR": "/tmp/isolated-tmp",
+            "CODEX_HOME": "/protected/codex-subscription-store",
+            BOT_ASSISTANT_REASONING_EFFORT_KEY: "high",
+            BOT_ASSISTANT_SDK_SLOTS_KEY: "1",
+        },
+    )
+
+    assert result == 0
+    assert output["outcome"] == "failure"
+    assert output["failure_code"] == "invalid_configuration"
+    assert output["turn_id"] == "result-turn:turn-1"
+
+
+def test_worker_main_returns_a_versioned_envelope_for_sdk_load_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_to_load_sdk() -> tuple[Any, Any, Any]:
+        raise ImportError("controlled SDK secret")
+
+    monkeypatch.setattr(codex_worker, "_load_sdk_bindings", fail_to_load_sdk)
+    result, output = _run_worker_main(
+        monkeypatch,
+        json.dumps(_input_envelope(_request())).encode("utf-8"),
+        environment=_worker_environment(),
+    )
+
+    assert result == 0
+    assert output["outcome"] == "failure"
+    assert output["failure_code"] == "provider"
+    assert "controlled SDK secret" not in repr(output)
 
 
 def test_one_quick_technical_failure_uses_the_existing_single_retry_seam() -> None:
@@ -905,6 +984,34 @@ def _input_envelope(request: BotAssistantTurnRequest) -> dict[str, object]:
         request,
         remaining_deadline_ms=request.remaining_deadline_ms,
     )
+
+
+def _worker_environment() -> dict[str, str]:
+    settings = BotAssistantSdkSettings()
+    return {
+        "PATH": os.defpath,
+        "HOME": "/tmp/isolated-home",
+        "TMPDIR": "/tmp/isolated-tmp",
+        "CODEX_HOME": "/protected/codex-subscription-store",
+        **settings.to_worker_projection(),
+    }
+
+
+def _run_worker_main(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_input: bytes,
+    *,
+    environment: dict[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
+    stdin = SimpleNamespace(buffer=io.BytesIO(raw_input))
+    stdout_buffer = io.BytesIO()
+    stdout = SimpleNamespace(buffer=stdout_buffer)
+    monkeypatch.setattr(sys, "stdin", stdin)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    if environment is not None:
+        monkeypatch.setattr(os, "environ", environment)
+    result = codex_worker.main()
+    return result, json.loads(stdout_buffer.getvalue())
 
 
 def _success_output(

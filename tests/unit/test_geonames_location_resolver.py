@@ -713,6 +713,27 @@ def test_explicit_address_requires_provider_verified_point_and_city_timezone() -
     assert source_candidate.geographic_type is GeographicType.ADDRESS
     assert source_candidate.iana_timezone == "Europe/Moscow"
 
+    mismatched_road = ScriptedLocationIQTransport(
+        [
+            {
+                **location_iq.response[0],
+                "address": {
+                    "house_number": "221B",
+                    "road": "Wrong Road",
+                    "city": "Saint Petersburg",
+                    "country_code": "ru",
+                },
+            }
+        ]
+    )
+    unresolved_mismatched_road = GeoNamesLocationResolverAdapter(
+        username="controlled-user",
+        transport=geo_names,
+        locationiq_access_token="controlled-locationiq-token",
+        locationiq_transport=mismatched_road,
+    ).resolve_search_area(query)
+    assert unresolved_mismatched_road == ()
+
     interpolation = ScriptedLocationIQTransport(
         [
             {

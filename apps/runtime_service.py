@@ -530,6 +530,7 @@ def _run(service: RuntimeService) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from modules.postgres_adapter import PostgresRoleReadinessError
     from modules.t5_runtime_configuration import (
         ROLE_CONFIGURATION_KEYS,
         ROLE_DATABASE_KEYS,
@@ -573,6 +574,18 @@ def main(argv: list[str] | None = None) -> int:
             runtime="not_started",
             reason="dependency_unavailable",
         )
+        return 78
+    except PostgresRoleReadinessError as error:
+        _emit_readiness(
+            role,
+            configuration="ready",
+            dependencies=(
+                "failed" if error.status == "database_unavailable" else "not_ready"
+            ),
+            runtime="not_started",
+            reason=error.status,
+        )
+        _notify_systemd("STATUS=Runtime database readiness failed")
         return 78
     except Exception:
         _emit_readiness(

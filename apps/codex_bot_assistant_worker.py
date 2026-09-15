@@ -90,12 +90,16 @@ def run_codex_worker_turn(
 ) -> dict[str, object]:
     """Execute one ephemeral read-only SDK turn using a controlled binding."""
     envelope = _validated_input(payload)
-    configuration = {
-        key: environment[key]
-        for key in T3_BOT_ASSISTANT_CONFIG_KEYS
-        if key in environment
-    }
-    settings = BotAssistantSdkSettings.from_t3_projection(configuration)
+    settings = BotAssistantSdkSettings()
+    try:
+        configuration = {
+            key: environment[key]
+            for key in T3_BOT_ASSISTANT_CONFIG_KEYS
+            if key in environment
+        }
+        settings = BotAssistantSdkSettings.from_t3_projection(configuration)
+    except Exception:
+        return _worker_failure(envelope, "invalid_configuration", settings)
     if set(environment) - _ALLOWED_WORKER_ENVIRONMENT_KEYS:
         return _worker_failure(envelope, "invalid_configuration", settings)
     codex_home = environment.get("CODEX_HOME")
@@ -139,7 +143,10 @@ def run_codex_worker_turn(
     ):
         return _worker_failure(envelope, "invalid_configuration", settings)
 
-    codex_factory, config_factory, sandbox = sdk_bindings or _load_sdk_bindings()
+    try:
+        codex_factory, config_factory, sandbox = sdk_bindings or _load_sdk_bindings()
+    except Exception as error:
+        return _worker_failure(envelope, _failure_code(error), settings, provenance)
     try:
         config = config_factory(
             config_overrides=CODEX_CONFIG_OVERRIDES,
@@ -191,24 +198,54 @@ def run_codex_worker_turn(
 
 def main() -> int:
     """Read one bounded envelope and write exactly one bounded JSON result."""
-    raw_input = sys.stdin.buffer.read(MAX_BOT_ASSISTANT_WORKER_INPUT_BYTES + 1)
-    if len(raw_input) > MAX_BOT_ASSISTANT_WORKER_INPUT_BYTES:
-        return 2
     try:
+        raw_input = sys.stdin.buffer.read(MAX_BOT_ASSISTANT_WORKER_INPUT_BYTES + 1)
+        if len(raw_input) > MAX_BOT_ASSISTANT_WORKER_INPUT_BYTES:
+            return _write_worker_output(_invalid_input_failure())
         payload = json.loads(raw_input)
         output = run_codex_worker_turn(payload, environment=os.environ)
+    except Exception:
+        return _write_worker_output(_invalid_input_failure())
+    return _write_worker_output(output)
+
+
+def _invalid_input_failure() -> dict[str, object]:
+    """Return a bounded failure for input errors before an envelope is available."""
+    return _worker_failure(
+        {"turn_id": "invalid-input"},
+        "invalid_configuration",
+        BotAssistantSdkSettings(),
+    )
+
+
+def _write_worker_output(output: Mapping[str, object]) -> int:
+    """Write one bounded JSON envelope, replacing an unexpected result safely."""
+    try:
         encoded = json.dumps(
             output,
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
         ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        encoded = json.dumps(
+            _invalid_input_failure(),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    if len(encoded) > MAX_BOT_ASSISTANT_WORKER_OUTPUT_BYTES:
+        encoded = json.dumps(
+            _invalid_input_failure(),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    try:
+        sys.stdout.buffer.write(encoded)
+        sys.stdout.buffer.flush()
     except Exception:
         return 2
-    if len(encoded) > MAX_BOT_ASSISTANT_WORKER_OUTPUT_BYTES:
-        return 2
-    sys.stdout.buffer.write(encoded)
-    sys.stdout.buffer.flush()
     return 0
 
 

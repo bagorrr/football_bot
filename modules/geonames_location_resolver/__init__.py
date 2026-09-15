@@ -697,6 +697,7 @@ class GeoNamesLocationResolverAdapter:
                 record,
                 query,
                 house_number=house_number,
+                requested_street=street,
                 context=context,
                 candidate_type=candidate_type,
             )
@@ -757,6 +758,7 @@ class GeoNamesLocationResolverAdapter:
         query: LocationResolutionQuery,
         *,
         house_number: str,
+        requested_street: str,
         context: _AddressContext,
         candidate_type: type[_CandidateT],
     ) -> _CandidateT | None:
@@ -774,6 +776,7 @@ class GeoNamesLocationResolverAdapter:
             != _normalize_house_number(house_number)
             or not isinstance(address.get("road"), str)
             or not address["road"].strip()
+            or not _labels_match(address["road"], (requested_street,))
             or not isinstance(address.get("country_code"), str)
             or address["country_code"].lower() != context.country_code
         ):

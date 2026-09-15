@@ -11097,7 +11097,7 @@ def _accept_search_area_candidate(
         city_id=candidate.city_id,
         verified_parent_ids=candidate.verified_parent_ids,
         parent_display_names=candidate.parent_display_names,
-        iana_timezone=None,
+        iana_timezone=candidate.iana_timezone,
         resolver_version=candidate.resolver_version,
         glossary_version=candidate.glossary_version,
         localized_display_names=candidate.localized_display_names,
@@ -25465,12 +25465,14 @@ def _resolve_source_location_across_supported_locales(
         if not city_label:
             return None
         city_display_labels[locale] = city_label
+        proposed_localized = dict(proposed.localized_display_names)
+        requested_label = proposed_localized.get(locale, proposed.display_name)
+        if not isinstance(requested_label, str) or not requested_label.strip():
+            return None
         if accepted is None:
-            proposed_localized = dict(proposed.localized_display_names)
-            proposed_localized.setdefault(locale, proposed.display_name)
             accepted = replace(
                 proposed,
-                localized_display_names=tuple(sorted(proposed_localized.items())),
+                localized_display_names=((locale, requested_label),),
             )
             continue
         if (
@@ -25489,15 +25491,10 @@ def _resolve_source_location_across_supported_locales(
         ):
             return None
         localized = dict(accepted.localized_display_names)
-        proposed_localized = dict(proposed.localized_display_names)
-        proposed_localized.setdefault(locale, proposed.display_name)
-        if any(
-            existing is not None and existing != label
-            for language, label in proposed_localized.items()
-            if (existing := localized.get(language)) is not None
-        ):
+        existing = localized.get(locale)
+        if existing is not None and existing != requested_label:
             return None
-        localized.update(proposed_localized)
+        localized[locale] = requested_label
         accepted = replace(
             accepted,
             localized_display_names=tuple(sorted(localized.items())),

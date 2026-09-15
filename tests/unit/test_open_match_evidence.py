@@ -240,6 +240,15 @@ class _LocalizedLocationResolver:
                             iana_timezone="Europe/Paris",
                             resolver_version="controlled-resolver-v1",
                             glossary_version="location-glossary-v1",
+                            localized_display_names=tuple(
+                                (
+                                    locale,
+                                    label
+                                    if locale == query.locale
+                                    else place_labels["en"],
+                                )
+                                for locale, label in place_labels.items()
+                            ),
                         ),
                     ),
                     glossary_version="location-glossary-v1",
