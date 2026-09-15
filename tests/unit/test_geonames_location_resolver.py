@@ -16,6 +16,7 @@ from modules.geonames_location_resolver import (
     GEONAMES_MAX_REQUESTS_PER_HOUR,
     GeoNamesHttpTransport,
     GeoNamesLocationResolverAdapter,
+    LocationIQHttpTransport,
 )
 from modules.ports import LocationResolverError
 
@@ -42,6 +43,21 @@ class ScriptedGeoNamesTransport:
         self.calls.append((endpoint, dict(params), timeout_seconds))
         response = self.responses[endpoint]
         return response(params) if callable(response) else response
+
+
+class ScriptedLocationIQTransport:
+    def __init__(self, response: list[Mapping[str, object]]) -> None:
+        self.response = response
+        self.calls: list[tuple[dict[str, str], float]] = []
+
+    def get_json(
+        self,
+        *,
+        params: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> list[Mapping[str, object]]:
+        self.calls.append((dict(params), timeout_seconds))
+        return self.response
 
 
 def test_two_production_resolvers_stay_inside_geonames_daily_credit_budget() -> None:
@@ -104,6 +120,43 @@ def test_http_transport_repeats_geo_names_feature_class_parameters() -> None:
     assert parse_qs(urlsplit(request.full_url).query) == {
         "featureClass": ["A", "P", "S", "L", "H"],
         "username": ["controlled-user"],
+    }
+
+
+def test_locationiq_http_transport_bounds_and_encodes_structured_search() -> None:
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return b'[{"osm_type":"node","osm_id":1}]'
+
+    requests: list[tuple[Request, float]] = []
+
+    def opener(request: Request, *, timeout: float) -> Response:
+        requests.append((request, timeout))
+        return Response()
+
+    transport = LocationIQHttpTransport(opener=opener)
+    response = transport.get_json(
+        params={
+            "format": "json",
+            "key": "controlled-token",
+            "street": "221B Baker Street",
+        },
+        timeout_seconds=3.0,
+    )
+
+    assert response == [{"osm_type": "node", "osm_id": 1}]
+    request, timeout = requests[0]
+    assert timeout == 3.0
+    assert parse_qs(urlsplit(request.full_url).query) == {
+        "format": ["json"],
+        "key": ["controlled-token"],
+        "street": ["221B Baker Street"],
     }
 
 
@@ -403,13 +456,7 @@ def test_bare_street_resolution_includes_source_message_path() -> None:
     )
     assert numbered_interpretations == ()
     numbered_search_calls = transport.calls[calls_before_numbered_query:]
-    assert any(
-        call[1].get("q") == "221B Baker Street"
-        and call[1].get("featureClass") == "R"
-        and call[1].get("featureCode") == "ST"
-        for call in numbered_search_calls
-    )
-    assert not any(call[1].get("q") == "Baker Street" for call in numbered_search_calls)
+    assert not any(call[0] == "searchJSON" for call in numbered_search_calls)
     legacy_numbered = adapter.resolve(
         LocationResolutionQuery(
             text="221B Baker Street",
@@ -563,3 +610,126 @@ def test_nonempty_geonames_result_passes_application_location_contract() -> None
     assert candidate.glossary_version == "location-glossary-v1"
     assert candidate.verified_parent_ids == (city_id, country_id)
     assert city_labels == dict.fromkeys(("en", "es", "fr", "ru"), "Saint Petersburg")
+
+
+def test_explicit_address_requires_provider_verified_point_and_city_timezone() -> None:
+    geo_names = ScriptedGeoNamesTransport(
+        {
+            "getJSON": lambda params: (
+                {
+                    "geonameId": 100,
+                    "name": "Russia",
+                    "toponymName": "Russia",
+                    "countryCode": "RU",
+                    "fcl": "A",
+                    "fcode": "PCLI",
+                }
+                if params["geonameId"] == "100"
+                else {
+                    "geonameId": 200,
+                    "name": "Saint Petersburg",
+                    "toponymName": "Saint Petersburg",
+                    "countryCode": "RU",
+                    "fcl": "P",
+                    "fcode": "PPLA",
+                    "timezone": {"timeZoneId": "Europe/Moscow"},
+                }
+            ),
+            "hierarchyJSON": {
+                "geonames": [
+                    {"geonameId": 100, "name": "Russia", "fcode": "PCLI"},
+                    {
+                        "geonameId": 200,
+                        "name": "Saint Petersburg",
+                        "fcode": "PPLA",
+                    },
+                ]
+            },
+        }
+    )
+    location_iq = ScriptedLocationIQTransport(
+        [
+            {
+                "osm_type": "way",
+                "osm_id": 12345,
+                "display_name": "221B Baker Street, Saint Petersburg, Russia",
+                "lat": "59.9386",
+                "lon": "30.3141",
+                "address": {
+                    "house_number": "221B",
+                    "road": "Baker Street",
+                    "city": "Saint Petersburg",
+                    "country_code": "ru",
+                },
+                "matchquality": {
+                    "matchcode": "exact",
+                    "matchtype": "point",
+                    "matchlevel": "building",
+                },
+            }
+        ]
+    )
+    adapter = GeoNamesLocationResolverAdapter(
+        username="controlled-user",
+        transport=geo_names,
+        locationiq_access_token="controlled-locationiq-token",
+        locationiq_transport=location_iq,
+    )
+    query = LocationResolutionQuery(
+        text="221B Baker Street",
+        locale="en",
+        stage=ConversationStage.SEARCH_AREA,
+        country_id="geonames:100",
+        city_id="geonames:200",
+    )
+
+    search_area = adapter.resolve_search_area(query)
+    assert len(search_area) == 1
+    area = search_area[0].candidates[0]
+    assert type(area) is domain.SearchAreaCandidate
+    assert area.place_id == "osm:way:12345"
+    assert area.geographic_type is GeographicType.ADDRESS
+    assert area.verified_parent_ids == ("geonames:200", "geonames:100")
+    assert area.iana_timezone == "Europe/Moscow"
+    assert location_iq.calls[0][0] == {
+        "accept-language": "en",
+        "addressdetails": "1",
+        "city": "Saint Petersburg",
+        "countrycodes": "ru",
+        "format": "json",
+        "key": "controlled-locationiq-token",
+        "limit": "5",
+        "matchquality": "1",
+        "normalizeaddress": "1",
+        "normalizecity": "1",
+        "source": "nom",
+        "street": "221B Baker Street",
+    }
+
+    source = adapter.resolve_location_mention(query).interpretations
+    assert len(source) == 1
+    source_candidate = source[0].places[0]
+    assert type(source_candidate) is LocationCandidate
+    assert source_candidate.geographic_type is GeographicType.ADDRESS
+    assert source_candidate.iana_timezone == "Europe/Moscow"
+
+    interpolation = ScriptedLocationIQTransport(
+        [
+            {
+                **location_iq.response[0],
+                "matchquality": {
+                    "matchcode": "exact",
+                    "matchtype": "interpolated",
+                    "matchlevel": "building",
+                },
+            }
+        ]
+    )
+    unresolved = GeoNamesLocationResolverAdapter(
+        username="controlled-user",
+        transport=geo_names,
+        locationiq_access_token="controlled-locationiq-token",
+        locationiq_transport=interpolation,
+    ).resolve_search_area(query)
+    assert unresolved == ()
+    assert not any(call[0] == "searchJSON" for call in geo_names.calls)

@@ -44,6 +44,7 @@ def test_application_runtime_preserves_classifier_promotion_gate(
                 "postgresql://football_application:controlled@db/football"
             ),
             "GEONAMES_USERNAME": "controlled-geonames-user",
+            "LOCATIONIQ_ACCESS_TOKEN": "controlled-locationiq-token",
         },
         repository_root=Path("/srv/football-bot/current"),
     )
@@ -51,7 +52,7 @@ def test_application_runtime_preserves_classifier_promotion_gate(
     assert service.store.require_classifier_promotion is True
 
 
-def test_application_production_composition_uses_geonames_without_telegram(
+def test_application_production_composition_uses_location_resolvers_without_telegram(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from modules import postgres_adapter
@@ -65,6 +66,7 @@ def test_application_production_composition_uses_geonames_without_telegram(
                 "postgresql://football_application:controlled@db/football"
             ),
             "GEONAMES_USERNAME": "controlled-geonames-user",
+            "LOCATIONIQ_ACCESS_TOKEN": "controlled-locationiq-token",
         },
         repository_root=Path("/srv/football-bot/current"),
     )
@@ -98,6 +100,7 @@ def test_bot_assistant_production_composition_uses_real_adapters_and_t1_boundary
                 "postgresql://football_bot_assistant:controlled@db/football"
             ),
             "GEONAMES_USERNAME": "controlled-geonames-user",
+            "LOCATIONIQ_ACCESS_TOKEN": "controlled-locationiq-token",
             "TELEGRAM_BOT_TOKEN": "123456:controlled-token",
             "TELEGRAM_ADMIN_USER_ID": "123456",
             "BOT_ASSISTANT_CODEX_HOME": "/var/lib/football-bot/bot_assistant/codex",

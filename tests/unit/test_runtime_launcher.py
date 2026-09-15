@@ -16,6 +16,7 @@ def test_launcher_environment_contains_only_role_projection_and_os_basics() -> N
         "DATABASE_URL_APPLICATION": "postgresql://football_application@db/app",
         "DATABASE_URL_BOT_ASSISTANT": "postgresql://football_bot_assistant@db/app",
         "GEONAMES_USERNAME": "controlled-user",
+        "LOCATIONIQ_ACCESS_TOKEN": "controlled-locationiq-token",
         "TELEGRAM_BOT_TOKEN": "123456:controlled-token",
         "TELEGRAM_ADMIN_USER_ID": "456789",
         "TELEGRAM_API_ID": "123456",
@@ -49,6 +50,7 @@ def test_launcher_environment_contains_only_role_projection_and_os_basics() -> N
         "PYTHONUTF8",
         "DATABASE_URL_APPLICATION",
         "GEONAMES_USERNAME",
+        "LOCATIONIQ_ACCESS_TOKEN",
     }
     assert "TELEGRAM_ADMIN_USER_ID" not in application
     assert "TELEGRAM_SESSION_STRING" not in application
@@ -61,6 +63,7 @@ def test_launcher_environment_contains_only_role_projection_and_os_basics() -> N
         "NOTIFY_SOCKET",
         "DATABASE_URL_BOT_ASSISTANT",
         "GEONAMES_USERNAME",
+        "LOCATIONIQ_ACCESS_TOKEN",
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_ADMIN_USER_ID",
         "BOT_ASSISTANT_CODEX_HOME",
@@ -83,6 +86,7 @@ def test_preflight_only_checks_staged_master_without_starting_role(
             "postgresql://football_application:protected-value@db/app"
         ),
         "GEONAMES_USERNAME": "protected-geonames-user",
+        "LOCATIONIQ_ACCESS_TOKEN": "protected-locationiq-token",
     }
     read_paths: list[Path] = []
 

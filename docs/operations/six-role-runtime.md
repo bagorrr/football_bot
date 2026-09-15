@@ -17,10 +17,10 @@ service or durable conversation queue.
 | Unit instance | Owns | Protected runtime input |
 | --- | --- | --- |
 | `football-bot-role@ingestion.service` | T2 Telethon account and approved Source Chat ingestion | `DATABASE_URL_INGESTION`, Telethon API/session keys, numeric admin ID |
-| `football-bot-role@application.service` | Application validation, onboarding, and domain processing | `DATABASE_URL_APPLICATION`, GeoNames username |
+| `football-bot-role@application.service` | Application validation, onboarding, and domain processing | `DATABASE_URL_APPLICATION`, GeoNames username, LocationIQ access token |
 | `football-bot-role@classification.service` | T4 Source Message classification | `DATABASE_URL_CLASSIFICATION`, classifier `CODEX_HOME`, optional validated model policy |
 | `football-bot-role@recommendation.service` | Matching and recommendation | `DATABASE_URL_RECOMMENDATION` |
-| `football-bot-role@bot_assistant.service` | T1 Bot API long polling, Bot Assistant application boundary, and ephemeral T3 turns | `DATABASE_URL_BOT_ASSISTANT`, Bot API token, numeric admin ID, GeoNames username, assistant `CODEX_HOME`, validated T3 policy |
+| `football-bot-role@bot_assistant.service` | T1 Bot API long polling, Bot Assistant application boundary, and ephemeral T3 turns | `DATABASE_URL_BOT_ASSISTANT`, Bot API token, numeric admin ID, GeoNames username, LocationIQ access token, assistant `CODEX_HOME`, validated T3 policy |
 
 Every database URL must authenticate as its matching `football_<role>` role.
 The runtime catalog is [`.env.example`](../../.env.example); it contains names
@@ -160,28 +160,43 @@ single affected role after service recovery; do not clear offsets or replay
 queues by hand. T1 delivery reconciliation and Bot Assistant idempotency remain
 application-owned; never resend an ambiguous Telegram effect manually.
 
-## GeoNames policy and privacy
+## Geographic provider policy and privacy
 
-The resolver uses only GeoNames HTTPS JSON services with an application-owned
-account username. It sends the normalized location phrase, locale, geographic
-stage, and the minimum already-confirmed country/city identifiers needed for
-the lookup; it never sends a Telegram ID, message body, contact, or profile.
-The adapter caps each owning process at 100 requests/hour, each response at
+The resolver uses GeoNames HTTPS JSON services for canonical country/city
+records, verified parent hierarchy, and the city IANA timezone. It uses the
+LocationIQ structured-search endpoint with `source=nom` for explicit
+house-number addresses, so the address result is backed by OpenStreetMap data.
+The address adapter sends only the normalized number and street, the already
+confirmed city and country code, and the selected locale; it never sends a
+Telegram ID, message body, contact, or profile. The LocationIQ token is a
+protected T5 master value projected only to Application and Bot Assistant.
+
+An address is accepted only when the provider returns a stable OSM identity,
+matching house number and city/country, valid coordinates, and
+`matchquality.matchcode=exact`, `matchtype=point`, and
+`matchlevel=building` or `venue`. Interpolated, street-level, missing, or
+ambiguous results remain unresolved; the resolver never widens a numbered
+address to its street.
+
+Each owning process caps each provider at 100 requests/hour, each response at
 256 KB, each request at three seconds by default, and its in-memory LRU at
 2,048 entries with a 24-hour maximum TTL. Application and Bot Assistant use
-separate in-memory caches and share the account; their combined nominal budget
-is 200 requests/hour and 4,800 requests/day, below GeoNames' published
-10,000-credit daily and 1,000-credit hourly limits. A restart clears the local
-rate window, so use the provider account dashboard to check cumulative usage.
-Rate exhaustion, timeout, provider errors, invalid hierarchy, and missing
-timezone fail closed; there is no model-knowledge fallback.
+separate caches and share the provider accounts; their combined nominal budget
+is 200 requests/hour and 4,800 requests/day. A restart clears local rate
+windows, so use the provider dashboards to check cumulative usage. Rate
+exhaustion, timeout, provider errors, invalid hierarchy, missing timezone, or
+an unverified address fail closed; there is no model-knowledge fallback.
 
-GeoNames data is supplied under CC BY and GeoNames requests require the account
-username. User-facing place presentations include a visible GeoNames credit
-with a provider link; the result-card regression verifies the final rendered
-message. Review the current
-[GeoNames terms and attribution](https://www.geonames.org/export/) and
-[web-service documentation](https://www.geonames.org/export/web-services.html)
+GeoNames data is supplied under CC BY and user-facing GeoNames presentations
+include a visible [GeoNames credit](https://www.geonames.org/). Address
+presentations include `Search by LocationIQ.com` with the
+[LocationIQ attribution link](https://locationiq.com/attribution) and
+`© OpenStreetMap contributors` with the OSM copyright link. Review the current
+[GeoNames terms and attribution](https://www.geonames.org/export/),
+[GeoNames web-service documentation](https://www.geonames.org/export/web-services.html),
+[LocationIQ structured-search documentation](https://docs.locationiq.com/reference/search-structured),
+[LocationIQ match-quality documentation](https://docs.locationiq.com/docs/match-quality),
+and [LocationIQ attribution requirements](https://locationiq.com/attribution)
 when usage or provider policy changes.
 
 ## Database migrations, backup, rollback, and recovery

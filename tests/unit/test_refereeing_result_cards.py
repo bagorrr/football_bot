@@ -122,6 +122,36 @@ def test_geonames_attribution_is_visible_in_final_result_presentation() -> None:
     assert message.text.endswith("© GeoNames — https://www.geonames.org/")
 
 
+def test_locationiq_address_attribution_is_visible_in_final_result_presentation() -> (
+    None
+):
+    result = _result()
+    facts = dict(result.card_facts)
+    facts["city_id"] = "geonames:200"
+    facts["place_id"] = "osm:way:12345"
+    result = SearchResult(
+        result_id=result.result_id,
+        completed_search_id=result.completed_search_id,
+        absolute_position=result.absolute_position,
+        result_class=result.result_class,
+        card_facts=tuple(sorted(facts.items())),
+    )
+
+    message = _render_result_presentation(
+        delivery_id="delivery:referee-address",
+        telegram_user_id=49_100,
+        locale="en",
+        screen_revision=2,
+        result=result,
+        result_count=1,
+        context_token="context:referee-address",
+    )
+
+    assert "Search by LocationIQ.com" in message.text
+    assert "© OpenStreetMap contributors" in message.text
+    assert message.text.endswith("https://www.openstreetmap.org/copyright")
+
+
 def test_standing_referee_availability_card_explains_unknown_date() -> None:
     message = _refereeing_result_message(
         delivery_id="delivery:referee-standing",

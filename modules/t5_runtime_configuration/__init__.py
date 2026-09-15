@@ -38,6 +38,7 @@ CLASSIFIER_REASONING_EFFORT = "CLASSIFIER_REASONING_EFFORT"
 CLASSIFIER_CODEX_HOME = "CLASSIFIER_CODEX_HOME"
 
 GEONAMES_USERNAME = "GEONAMES_USERNAME"
+LOCATIONIQ_ACCESS_TOKEN = "LOCATIONIQ_ACCESS_TOKEN"
 
 MASTER_CONFIGURATION_KEYS = frozenset(
     {
@@ -59,6 +60,7 @@ MASTER_CONFIGURATION_KEYS = frozenset(
         CLASSIFIER_REASONING_EFFORT,
         CLASSIFIER_CODEX_HOME,
         GEONAMES_USERNAME,
+        LOCATIONIQ_ACCESS_TOKEN,
     }
 )
 
@@ -88,7 +90,9 @@ ROLE_CONFIGURATION_KEYS: dict[str, frozenset[str]] = {
             TELEGRAM_ADMIN_USER_ID,
         }
     ),
-    "application": frozenset({DATABASE_URL_APPLICATION, GEONAMES_USERNAME}),
+    "application": frozenset(
+        {DATABASE_URL_APPLICATION, GEONAMES_USERNAME, LOCATIONIQ_ACCESS_TOKEN}
+    ),
     "classification": frozenset(
         {
             DATABASE_URL_CLASSIFICATION,
@@ -102,6 +106,7 @@ ROLE_CONFIGURATION_KEYS: dict[str, frozenset[str]] = {
         {
             DATABASE_URL_BOT_ASSISTANT,
             GEONAMES_USERNAME,
+            LOCATIONIQ_ACCESS_TOKEN,
             TELEGRAM_BOT_TOKEN,
             TELEGRAM_ADMIN_USER_ID,
             BOT_ASSISTANT_MODEL,
@@ -136,6 +141,7 @@ ROLE_REQUIRED_KEYS: dict[str, frozenset[str]] = {
         {
             DATABASE_URL_BOT_ASSISTANT,
             GEONAMES_USERNAME,
+            LOCATIONIQ_ACCESS_TOKEN,
             TELEGRAM_BOT_TOKEN,
             TELEGRAM_ADMIN_USER_ID,
             BOT_ASSISTANT_CODEX_HOME,
@@ -342,6 +348,13 @@ def preflight_role(
         value = cast(str, projection[GEONAMES_USERNAME])
         if len(value) > 64 or value.strip() != value:
             statuses[GEONAMES_USERNAME] = "malformed"
+    if (
+        role in {"application", "bot_assistant"}
+        and statuses.get(LOCATIONIQ_ACCESS_TOKEN) == "ready"
+    ):
+        value = cast(str, projection[LOCATIONIQ_ACCESS_TOKEN])
+        if len(value) > 256 or value.strip() != value:
+            statuses[LOCATIONIQ_ACCESS_TOKEN] = "malformed"
     return ReadinessReport(role, statuses)
 
 

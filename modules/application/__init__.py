@@ -9052,7 +9052,7 @@ class ConversationOnboarding:
             copy_locale,
             tuple(_location_label(candidate, copy_locale) for candidate in candidates),
         )
-        message = _with_geonames_attribution(
+        message = _with_location_attribution(
             TelegramMessage(
                 delivery_id=f"onboarding:{update_id}",
                 telegram_user_id=current.telegram_user_id,
@@ -9167,7 +9167,7 @@ class ConversationOnboarding:
             raise RuntimeError("Conversation Language is missing")
         copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
         back_label = _DIRECTION_COPY[copy_locale][2][5]
-        message = _with_geonames_attribution(
+        message = _with_location_attribution(
             TelegramMessage(
                 delivery_id=f"onboarding:{update_id}",
                 telegram_user_id=current.telegram_user_id,
@@ -9409,7 +9409,7 @@ class ConversationOnboarding:
             raise RuntimeError("Conversation Language is missing")
         copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
         back_label = _DIRECTION_COPY[copy_locale][2][5]
-        message = _with_geonames_attribution(
+        message = _with_location_attribution(
             TelegramMessage(
                 delivery_id=f"onboarding:{update_id}",
                 telegram_user_id=current.telegram_user_id,
@@ -11114,17 +11114,30 @@ def _location_label(
     return labels.get(copy_locale, location.display_name)
 
 
-def _with_geonames_attribution(
+def _with_location_attribution(
     message: TelegramMessage, *place_ids: str | None
 ) -> TelegramMessage:
-    if not any(
+    has_geonames = any(
         place_id is not None and place_id.startswith("geonames:")
         for place_id in place_ids
-    ):
+    )
+    has_locationiq = any(
+        place_id is not None and place_id.startswith("osm:") for place_id in place_ids
+    )
+    credits: list[str] = []
+    if has_geonames:
+        credits.append("© GeoNames — https://www.geonames.org/")
+    if has_locationiq:
+        credits.append(
+            "Search by LocationIQ.com — https://locationiq.com/attribution\n"
+            "© OpenStreetMap contributors — "
+            "https://www.openstreetmap.org/copyright"
+        )
+    if not credits:
         return message
     return replace(
         message,
-        text=f"{message.text}\n\n© GeoNames — https://www.geonames.org/",
+        text=f"{message.text}\n\n" + "\n\n".join(credits),
     )
 
 
@@ -11314,6 +11327,15 @@ def _valid_sub_city_areas(
         return False
     for candidate in candidates:
         parents = candidate.verified_parent_ids
+        if candidate.geographic_type is GeographicType.ADDRESS:
+            if candidate.iana_timezone is None:
+                return False
+            try:
+                ZoneInfo(candidate.iana_timezone)
+            except (ValueError, ZoneInfoNotFoundError):
+                return False
+        elif candidate.iana_timezone is not None:
+            return False
         if (
             not candidate.place_id
             or not candidate.display_name
@@ -11324,7 +11346,6 @@ def _valid_sub_city_areas(
             or candidate.geographic_type not in _SUB_CITY_TYPES
             or candidate.country_id != country.place_id
             or candidate.city_id != city.place_id
-            or candidate.iana_timezone is not None
             or candidate.place_id in parents
             or len(set(parents)) != len(parents)
             or len(candidate.parent_display_names) != len(parents)
@@ -11580,7 +11601,7 @@ def _country_message(
             ((other_country, f"location:other-country:{screen_revision}"),),
             ((back_label, f"direction:back:{screen_revision}"),),
         )
-    return _with_geonames_attribution(
+    return _with_location_attribution(
         TelegramMessage(
             delivery_id=f"onboarding:{update_id}",
             telegram_user_id=telegram_user_id,
@@ -11627,7 +11648,7 @@ def _city_message(
             ((other_city, f"location:other-city:{screen_revision}"),),
             ((back_label, f"direction:back:{screen_revision}"),),
         )
-    return _with_geonames_attribution(
+    return _with_location_attribution(
         TelegramMessage(
             delivery_id=f"onboarding:{update_id}",
             telegram_user_id=telegram_user_id,
@@ -11654,7 +11675,7 @@ def _search_area_message(
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     heading, selected_city, instruction = _SEARCH_AREA_COPY[copy_locale]
     back_label = _DIRECTION_COPY[copy_locale][2][5]
-    return _with_geonames_attribution(
+    return _with_location_attribution(
         TelegramMessage(
             delivery_id=f"onboarding:{update_id}",
             telegram_user_id=telegram_user_id,
@@ -11693,7 +11714,7 @@ def _required_date_message(
         locale=copy_locale,
         whole_city_label=whole_city_label,
     )
-    return _with_geonames_attribution(
+    return _with_location_attribution(
         TelegramMessage(
             delivery_id=f"onboarding:{update_id}",
             telegram_user_id=telegram_user_id,
@@ -11746,7 +11767,7 @@ def _post_core_message(
         in {UserIntent.NEW_TEAM_SEARCH, UserIntent.TRANSFER_PLAYER_SEARCH}
         else "details:open"
     )
-    return _with_geonames_attribution(
+    return _with_location_attribution(
         TelegramMessage(
             delivery_id=f"onboarding:{update_id}",
             telegram_user_id=telegram_user_id,
@@ -12752,7 +12773,7 @@ def _render_result_presentation(
 ) -> TelegramMessage:
     """Render one canonical card and add pagination only for a multi-result set."""
     result_facts = dict(result.card_facts)
-    message = _with_geonames_attribution(
+    message = _with_location_attribution(
         _result_renderer_for(result)(
             delivery_id=delivery_id,
             telegram_user_id=telegram_user_id,

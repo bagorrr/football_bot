@@ -103,6 +103,7 @@ def test_role_preflight_rejects_unauthorized_configuration_keys() -> None:
                 "postgresql://football_application:local@localhost/football"
             ),
             "GEONAMES_USERNAME": "controlled-user",
+            "LOCATIONIQ_ACCESS_TOKEN": "controlled-locationiq-token",
             "TELEGRAM_ADMIN_USER_ID": "123456",
         },
         check_protected_paths=False,
@@ -122,6 +123,7 @@ def test_role_preflight_checks_required_values_and_database_role_identity() -> N
                 "postgresql://football_recommendation:local@localhost/football"
             ),
             "GEONAMES_USERNAME": "",
+            "LOCATIONIQ_ACCESS_TOKEN": "controlled-locationiq-token",
         },
         check_protected_paths=False,
     )
@@ -130,6 +132,7 @@ def test_role_preflight_checks_required_values_and_database_role_identity() -> N
     assert report.key_statuses == {
         "DATABASE_URL_APPLICATION": "identity_mismatch",
         "GEONAMES_USERNAME": "empty",
+        "LOCATIONIQ_ACCESS_TOKEN": "ready",
     }
     public = report.to_public_dict()
     assert public["configuration"] == "failed"

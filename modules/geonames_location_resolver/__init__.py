@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping
@@ -32,6 +33,10 @@ GEONAMES_GLOSSARY_VERSION = "location-glossary-v1"
 GEONAMES_BASE_URL = "https://api.geonames.org/"
 GEONAMES_MAX_ROWS = 5
 GEONAMES_MAX_REQUESTS_PER_HOUR = 100
+LOCATIONIQ_RESOLVER_VERSION = "locationiq-osm-v1"
+LOCATIONIQ_BASE_URL = "https://us1.locationiq.com/v1/search/structured"
+LOCATIONIQ_MAX_ROWS = 5
+LOCATIONIQ_MAX_REQUESTS_PER_HOUR = 100
 _MAX_CACHE_SIZE = 2_048
 _MAX_CACHE_TTL_SECONDS = 86_400.0
 _MAX_QUERY_LENGTH = 240
@@ -139,20 +144,105 @@ class GeoNamesHttpTransport:
         return decoded
 
 
+class LocationIQTransport(Protocol):
+    """Small JSON boundary for deterministic address adapter tests."""
+
+    def get_json(
+        self,
+        *,
+        params: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> list[Mapping[str, object]]:
+        """Return bounded LocationIQ structured-search results."""
+        ...
+
+
+class LocationIQHttpTransport:
+    """HTTPS-only, bounded LocationIQ structured-search client."""
+
+    def __init__(
+        self,
+        *,
+        opener: Callable[..., Any] = urlopen,
+        max_response_bytes: int = 256_000,
+    ) -> None:
+        if type(max_response_bytes) is not int or max_response_bytes < 1:
+            raise ValueError("LocationIQ response limit must be positive")
+        self._opener = opener
+        self._max_response_bytes = max_response_bytes
+
+    def get_json(
+        self,
+        *,
+        params: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> list[Mapping[str, object]]:
+        if not 0 < timeout_seconds <= 10:
+            raise LocationResolverError("location provider timeout is invalid")
+        request = Request(
+            f"{LOCATIONIQ_BASE_URL}?{urlencode(params)}",
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "football-bot-location-resolver/1.0",
+            },
+        )
+        try:
+            with self._opener(request, timeout=timeout_seconds) as response:
+                payload = response.read(self._max_response_bytes + 1)
+        except (HTTPError, URLError, TimeoutError, OSError):
+            raise LocationResolverError("location provider request failed") from None
+        if len(payload) > self._max_response_bytes:
+            raise LocationResolverError("location provider response is oversized")
+        try:
+            decoded = json.loads(payload)
+        except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            raise LocationResolverError(
+                "location provider response is malformed"
+            ) from None
+        if not isinstance(decoded, list):
+            raise LocationResolverError("location provider response is unavailable")
+        if len(decoded) > LOCATIONIQ_MAX_ROWS or any(
+            not isinstance(item, dict) for item in decoded
+        ):
+            raise LocationResolverError("location provider response is malformed")
+        return decoded
+
+
 @dataclass(frozen=True, slots=True)
 class _CachedResponse:
     expires_at: float
     value: Mapping[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedAddressResponse:
+    expires_at: float
+    value: tuple[Mapping[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _AddressContext:
+    city_id: str
+    country_id: str
+    country_code: str
+    city_names: tuple[str, ...]
+    city_display_name: str
+    country_display_name: str
+    canonical_city_name: str
+    canonical_country_name: str
+    iana_timezone: str
+
+
 class GeoNamesLocationResolverAdapter:
-    """Resolve stable candidates, admitting only verified GeoNames ancestry."""
+    """Resolve stable candidates with GeoNames and provider-verified addresses."""
 
     def __init__(
         self,
         *,
         username: str,
         transport: GeoNamesTransport | None = None,
+        locationiq_access_token: str | None = None,
+        locationiq_transport: LocationIQTransport | None = None,
         timeout_seconds: float = 3.0,
         requests_per_hour: int = GEONAMES_MAX_REQUESTS_PER_HOUR,
         cache_ttl_seconds: float = _MAX_CACHE_TTL_SECONDS,
@@ -178,6 +268,18 @@ class GeoNamesLocationResolverAdapter:
             raise ValueError("GeoNames cache capacity is outside the supported range")
         self._username = username
         self._transport = transport or GeoNamesHttpTransport()
+        if locationiq_access_token is not None and (
+            not locationiq_access_token
+            or locationiq_access_token.strip() != locationiq_access_token
+            or len(locationiq_access_token) > 256
+        ):
+            raise ValueError("LocationIQ access token is malformed")
+        if locationiq_access_token is None and locationiq_transport is not None:
+            raise ValueError("LocationIQ access token is required")
+        self._locationiq_access_token = locationiq_access_token
+        self._locationiq_transport = locationiq_transport or (
+            LocationIQHttpTransport() if locationiq_access_token is not None else None
+        )
         self._timeout_seconds = timeout_seconds
         self._requests_per_hour = requests_per_hour
         self._cache_ttl_seconds = cache_ttl_seconds
@@ -187,6 +289,10 @@ class GeoNamesLocationResolverAdapter:
             tuple[str, tuple[tuple[str, str | tuple[str, ...]], ...]], _CachedResponse
         ] = OrderedDict()
         self._request_times: deque[float] = deque()
+        self._locationiq_cache: OrderedDict[
+            tuple[tuple[str, str], ...], _CachedAddressResponse
+        ] = OrderedDict()
+        self._locationiq_request_times: deque[float] = deque()
 
     def opportunity_revision_id(self, proposal_id: str) -> str:
         """Return a namespaced synthetic revision identity for the app port."""
@@ -454,34 +560,41 @@ class GeoNamesLocationResolverAdapter:
                 country_id=query.country_id,
                 city_id=query.city_id,
             )
-            records = self._search(
-                phrase_query,
-                country_code=country_code,
-                feature_class="R" if is_street else ("A", "P", "S", "L", "H"),
-                feature_code="ST" if is_street else None,
-            )
             matches: list[_CandidateT] = []
-            for record in records:
-                if is_street:
-                    geographic_type = (
-                        GeographicType.STREET
-                        if not has_house_number and _is_street_record(record)
-                        else None
+            if is_street and has_house_number:
+                matches.extend(
+                    self._resolve_address_candidates(
+                        phrase_query,
+                        country_code=country_code,
+                        candidate_type=candidate_type,
                     )
-                else:
-                    geographic_type = _sub_city_type(record)
-                if geographic_type is None:
-                    continue
-                candidate = self._build_candidate(
-                    record,
-                    query,
-                    country_id=query.country_id or "",
-                    geographic_type=geographic_type,
-                    city_id=query.city_id,
-                    candidate_type=candidate_type,
                 )
-                if candidate is not None:
-                    matches.append(candidate)
+            else:
+                records = self._search(
+                    phrase_query,
+                    country_code=country_code,
+                    feature_class="R" if is_street else ("A", "P", "S", "L", "H"),
+                    feature_code="ST" if is_street else None,
+                )
+                for record in records:
+                    if is_street:
+                        geographic_type = (
+                            GeographicType.STREET if _is_street_record(record) else None
+                        )
+                    else:
+                        geographic_type = _sub_city_type(record)
+                    if geographic_type is None:
+                        continue
+                    candidate = self._build_candidate(
+                        record,
+                        query,
+                        country_id=query.country_id or "",
+                        geographic_type=geographic_type,
+                        city_id=query.city_id,
+                        candidate_type=candidate_type,
+                    )
+                    if candidate is not None:
+                        matches.append(candidate)
             unique = _unique_candidates(matches)
             if not unique:
                 return None
@@ -544,6 +657,166 @@ class GeoNamesLocationResolverAdapter:
             resolver_version=GEONAMES_RESOLVER_VERSION,
             glossary_version=GEONAMES_GLOSSARY_VERSION,
             localized_display_names=_localized_names(record, query.locale),
+        )
+
+    def _resolve_address_candidates(
+        self,
+        query: LocationResolutionQuery,
+        *,
+        country_code: str,
+        candidate_type: type[_CandidateT],
+    ) -> tuple[_CandidateT, ...]:
+        if self._locationiq_access_token is None or self._locationiq_transport is None:
+            return ()
+        address_parts = _house_address_parts(query.text)
+        if address_parts is None or query.city_id is None or query.country_id is None:
+            return ()
+        context = self._address_context(query)
+        if context is None:
+            return ()
+        house_number, street = address_parts
+        response = self._request_locationiq(
+            {
+                "accept-language": _language_tag(query.locale),
+                "addressdetails": "1",
+                "city": context.city_display_name,
+                "countrycodes": country_code.lower(),
+                "format": "json",
+                "key": self._locationiq_access_token,
+                "limit": str(LOCATIONIQ_MAX_ROWS),
+                "matchquality": "1",
+                "normalizeaddress": "1",
+                "normalizecity": "1",
+                "source": "nom",
+                "street": f"{house_number} {street}",
+            }
+        )
+        candidates: list[_CandidateT] = []
+        for record in response:
+            candidate = self._build_address_candidate(
+                record,
+                query,
+                house_number=house_number,
+                context=context,
+                candidate_type=candidate_type,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        return _unique_candidates(candidates)
+
+    def _address_context(
+        self, query: LocationResolutionQuery
+    ) -> _AddressContext | None:
+        country_id = query.country_id
+        city_id = query.city_id
+        if country_id is None or city_id is None:
+            return None
+        country = self._get(country_id, query.locale)
+        city = self._get(city_id, query.locale)
+        country_code = country.get("countryCode") if country is not None else None
+        if (
+            country is None
+            or country.get("fcode") != "PCLI"
+            or city is None
+            or city.get("fcode") not in _CITY_CODES
+            or not isinstance(country_code, str)
+            or re.fullmatch(r"[A-Z]{2}", country_code) is None
+            or city.get("countryCode") != country_code
+        ):
+            return None
+        ancestors = self._ancestors(city_id, query.locale)
+        if ancestors is None or _parents_through_country(ancestors, country_id) is None:
+            return None
+        city_name = _localized_name(city)
+        country_name = _localized_name(country)
+        timezone = _timezone_name(city)
+        if (
+            city_name is None
+            or country_name is None
+            or not isinstance(timezone, str)
+            or not _installed_timezone(timezone)
+        ):
+            return None
+        canonical_city_name = _canonical_name(city, fallback=city_name)
+        canonical_country_name = _canonical_name(country, fallback=country_name)
+        return _AddressContext(
+            city_id=city_id,
+            country_id=country_id,
+            country_code=country_code.lower(),
+            city_names=_record_names(city),
+            city_display_name=city_name,
+            country_display_name=country_name,
+            canonical_city_name=canonical_city_name,
+            canonical_country_name=canonical_country_name,
+            iana_timezone=timezone,
+        )
+
+    def _build_address_candidate(
+        self,
+        record: Mapping[str, object],
+        query: LocationResolutionQuery,
+        *,
+        house_number: str,
+        context: _AddressContext,
+        candidate_type: type[_CandidateT],
+    ) -> _CandidateT | None:
+        place_id = _osm_place_id(record)
+        quality = record.get("matchquality")
+        address = record.get("address")
+        if (
+            place_id is None
+            or not isinstance(quality, dict)
+            or quality.get("matchcode") != "exact"
+            or quality.get("matchtype") != "point"
+            or quality.get("matchlevel") not in {"building", "venue"}
+            or not isinstance(address, dict)
+            or _normalize_house_number(address.get("house_number"))
+            != _normalize_house_number(house_number)
+            or not isinstance(address.get("road"), str)
+            or not address["road"].strip()
+            or not isinstance(address.get("country_code"), str)
+            or address["country_code"].lower() != context.country_code
+        ):
+            return None
+        provider_city = _provider_city_name(address)
+        if provider_city is None or not _labels_match(
+            provider_city, context.city_names
+        ):
+            return None
+        display_name = record.get("display_name")
+        if (
+            not isinstance(display_name, str)
+            or not display_name.strip()
+            or display_name.strip() != display_name
+            or len(display_name) > 400
+        ):
+            return None
+        if not _valid_coordinates(record.get("lat"), record.get("lon")):
+            return None
+        address_road = address["road"]
+        fallback_display_name = (
+            f"{house_number} {address_road}, {context.canonical_city_name}, "
+            f"{context.canonical_country_name}"
+        )
+        return candidate_type(
+            place_id=place_id,
+            display_name=display_name,
+            geographic_type=GeographicType.ADDRESS,
+            country_id=context.country_id,
+            city_id=context.city_id,
+            verified_parent_ids=(context.city_id, context.country_id),
+            parent_display_names=(
+                context.city_display_name,
+                context.country_display_name,
+            ),
+            iana_timezone=context.iana_timezone,
+            resolver_version=LOCATIONIQ_RESOLVER_VERSION,
+            glossary_version=GEONAMES_GLOSSARY_VERSION,
+            localized_display_names=_address_localized_names(
+                display_name,
+                query.locale,
+                fallback_display_name,
+            ),
         )
 
     def _ancestors(self, place_id: str, locale: str) -> tuple[_Parent, ...] | None:
@@ -658,6 +931,51 @@ class GeoNamesLocationResolverAdapter:
             self._cache.popitem(last=False)
         return deepcopy(normalized)
 
+    def _request_locationiq(
+        self, params: Mapping[str, str]
+    ) -> tuple[Mapping[str, object], ...]:
+        key = tuple(
+            sorted((name, value) for name, value in params.items() if name != "key")
+        )
+        now = self._clock()
+        cached = self._locationiq_cache.get(key)
+        if cached is not None and cached.expires_at > now:
+            self._locationiq_cache.move_to_end(key)
+            return deepcopy(cached.value)
+        if cached is not None:
+            del self._locationiq_cache[key]
+        while self._locationiq_request_times and (
+            now - self._locationiq_request_times[0] >= 3_600
+        ):
+            self._locationiq_request_times.popleft()
+        if len(self._locationiq_request_times) >= LOCATIONIQ_MAX_REQUESTS_PER_HOUR:
+            raise LocationResolverError("location provider rate limit is exhausted")
+        self._locationiq_request_times.append(now)
+        try:
+            response = self._locationiq_transport.get_json(  # type: ignore[union-attr]
+                params=params,
+                timeout_seconds=self._timeout_seconds,
+            )
+        except LocationResolverError:
+            raise
+        except Exception:
+            raise LocationResolverError("location provider request failed") from None
+        if not isinstance(response, list) or len(response) > LOCATIONIQ_MAX_ROWS:
+            raise LocationResolverError("location provider response is malformed")
+        normalized = tuple(
+            deepcopy(dict(item)) for item in response if isinstance(item, Mapping)
+        )
+        if len(normalized) != len(response):
+            raise LocationResolverError("location provider response is malformed")
+        self._locationiq_cache[key] = _CachedAddressResponse(
+            expires_at=now + self._cache_ttl_seconds,
+            value=normalized,
+        )
+        self._locationiq_cache.move_to_end(key)
+        while len(self._locationiq_cache) > self._cache_capacity:
+            self._locationiq_cache.popitem(last=False)
+        return deepcopy(normalized)
+
 
 @dataclass(frozen=True, slots=True)
 class _Parent:
@@ -730,6 +1048,120 @@ def _localized_names(
             requested_name if supported_locale == _language_tag(locale) else fallback,
         )
         for supported_locale in _SUPPORTED_LOCALES
+    )
+
+
+def _address_localized_names(
+    display_name: str, locale: str, fallback: str
+) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (
+            supported_locale,
+            display_name if supported_locale == _language_tag(locale) else fallback,
+        )
+        for supported_locale in _SUPPORTED_LOCALES
+    )
+
+
+def _canonical_name(record: Mapping[str, object], *, fallback: str) -> str:
+    value = record.get("toponymName")
+    return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+
+def _record_names(record: Mapping[str, object]) -> tuple[str, ...]:
+    names: list[str] = []
+    for key in ("name", "toponymName", "asciiName"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip() and len(value) <= 200:
+            names.append(value.strip())
+    alternate_names = record.get("alternateNames")
+    if isinstance(alternate_names, list):
+        for alternate in alternate_names:
+            value = alternate.get("name") if isinstance(alternate, dict) else alternate
+            if isinstance(value, str) and value.strip() and len(value) <= 200:
+                names.append(value.strip())
+    return tuple(dict.fromkeys(names))
+
+
+def _house_address_parts(text: str) -> tuple[str, str] | None:
+    leading = _LEADING_HOUSE_NUMBER_PATTERN.fullmatch(text)
+    if leading is not None and _has_street_designator(leading.group(2)):
+        return leading.group(1), leading.group(2)
+    trailing = _TRAILING_HOUSE_NUMBER_PATTERN.fullmatch(text)
+    if trailing is not None and _has_street_designator(trailing.group(1)):
+        return trailing.group(2), trailing.group(1)
+    return None
+
+
+def _normalize_house_number(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", "", value).casefold()
+
+
+def _normalize_label(value: str) -> str:
+    return re.sub(r"[^\w]+", " ", value.casefold(), flags=re.UNICODE).strip()
+
+
+def _labels_match(value: str, accepted: tuple[str, ...]) -> bool:
+    normalized = _normalize_label(value)
+    return bool(normalized) and normalized in {
+        _normalize_label(candidate) for candidate in accepted
+    }
+
+
+def _provider_city_name(address: Mapping[str, object]) -> str | None:
+    for key in (
+        "city",
+        "town",
+        "village",
+        "municipality",
+        "borough",
+        "hamlet",
+        "locality",
+    ):
+        value = address.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _osm_place_id(record: Mapping[str, object]) -> str | None:
+    osm_type = record.get("osm_type")
+    osm_id = record.get("osm_id")
+    if osm_type not in {"node", "way", "relation"}:
+        return None
+    if isinstance(osm_id, bool):
+        return None
+    if isinstance(osm_id, int):
+        raw_id = str(osm_id)
+    elif isinstance(osm_id, str):
+        raw_id = osm_id
+    else:
+        return None
+    if re.fullmatch(r"[1-9][0-9]{0,15}", raw_id) is None:
+        return None
+    return f"osm:{osm_type}:{raw_id}"
+
+
+def _valid_coordinates(latitude: object, longitude: object) -> bool:
+    if (
+        isinstance(latitude, bool)
+        or isinstance(longitude, bool)
+        or not isinstance(latitude, (int, float, str))
+        or not isinstance(longitude, (int, float, str))
+    ):
+        return False
+    try:
+        parsed_latitude = float(latitude)
+        parsed_longitude = float(longitude)
+    except (TypeError, ValueError):
+        return False
+    return (
+        math.isfinite(parsed_latitude)
+        and math.isfinite(parsed_longitude)
+        and -90 <= parsed_latitude <= 90
+        and -180 <= parsed_longitude <= 180
     )
 
 

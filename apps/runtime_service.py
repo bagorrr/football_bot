@@ -172,7 +172,8 @@ def build_runtime_service(
         from modules.geonames_location_resolver import GeoNamesLocationResolverAdapter
 
         resolver = GeoNamesLocationResolverAdapter(
-            username=_required(values, "GEONAMES_USERNAME")
+            username=_required(values, "GEONAMES_USERNAME"),
+            locationiq_access_token=_required(values, "LOCATIONIQ_ACCESS_TOKEN"),
         )
         application = RuntimeApplication(
             role=role,
@@ -282,7 +283,8 @@ def build_runtime_service(
             codex_home=Path(_required(values, "BOT_ASSISTANT_CODEX_HOME")),
         )
         location_resolver = GeoNamesLocationResolverAdapter(
-            username=_required(values, "GEONAMES_USERNAME")
+            username=_required(values, "GEONAMES_USERNAME"),
+            locationiq_access_token=_required(values, "LOCATIONIQ_ACCESS_TOKEN"),
         )
         conversation_language = CodexConversationLanguageAdapter(
             model=assistant_model,
