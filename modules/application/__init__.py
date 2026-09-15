@@ -4343,14 +4343,12 @@ class ConversationOnboarding:
                     current=current,
                     text=_source_chat_invalid_address_text(
                         locale,
-                        self._language_rendering(locale, update_id=update_id),
                     ),
                 )
                 self.deliver_pending()
                 return
             recorded_at = self._clock.now()
             locale = current.locale or "en"
-            selection = self._language_rendering(locale, update_id=update_id)
             registry_generation = self._store.next_source_chat_registration_generation()
             message_id = _runtime_identifier(
                 update_id,
@@ -4395,7 +4393,6 @@ class ConversationOnboarding:
                     telegram_user_id=telegram_user_id,
                     locale=locale,
                     screen_revision=state.screen_revision,
-                    selection=selection,
                 ),
                 command=command,
                 recorded_at=recorded_at,
@@ -4448,13 +4445,10 @@ class ConversationOnboarding:
         if current is None:
             raise LookupError(telegram_user_id)
         locale = current.locale or "en"
-        selection = self._language_rendering(
-            locale, update_id=origin.originating_update_id
-        )
-        presentation_locale = (
-            locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
-        )
-        if self._is_administrator(telegram_user_id):
+        is_administrator = self._is_administrator(telegram_user_id)
+        selection: LanguageSelection | None = None
+        if is_administrator:
+            presentation_locale = locale
             state = replace(
                 current,
                 stage=ConversationStage.SOURCE_CHATS,
@@ -4466,11 +4460,16 @@ class ConversationOnboarding:
                 telegram_user_id=telegram_user_id,
                 locale=presentation_locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
-                text=_source_chat_registered_text(presentation_locale, selection),
+                text=_source_chat_registered_text(presentation_locale),
                 entries=self._store.source_chat_administration_views(),
             )
         else:
+            selection = self._language_rendering(
+                locale, update_id=origin.originating_update_id
+            )
+            presentation_locale = (
+                locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
+            )
             state = replace(
                 current,
                 stage=ConversationStage.SETTINGS,
@@ -4531,12 +4530,6 @@ class ConversationOnboarding:
         if current is None:
             raise LookupError(origin.telegram_user_id)
         locale = current.locale or "en"
-        selection = self._language_rendering(
-            locale, update_id=origin.originating_update_id
-        )
-        presentation_locale = (
-            locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
-        )
         state = replace(
             current,
             stage=ConversationStage.SOURCE_CHATS,
@@ -4546,13 +4539,12 @@ class ConversationOnboarding:
         message = _source_chats_message(
             update_id=str(incoming.message_id),
             telegram_user_id=origin.telegram_user_id,
-            locale=presentation_locale,
+            locale=locale,
             screen_revision=state.screen_revision,
-            selection=selection,
             text=_source_chat_lifecycle_result_text(
                 origin.action,
                 SourceChatLifecycleState(str(lifecycle_state)),
-                presentation_locale,
+                locale,
             ),
             entries=self._store.source_chat_administration_views(),
         )
@@ -4603,13 +4595,10 @@ class ConversationOnboarding:
         if current is None:
             raise LookupError(telegram_user_id)
         locale = current.locale or "en"
-        selection = self._language_rendering(
-            locale, update_id=origin.originating_update_id
-        )
-        presentation_locale = (
-            locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
-        )
-        if self._is_administrator(telegram_user_id):
+        is_administrator = self._is_administrator(telegram_user_id)
+        selection: LanguageSelection | None = None
+        if is_administrator:
+            presentation_locale = locale
             state = replace(
                 current,
                 stage=ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
@@ -4621,10 +4610,15 @@ class ConversationOnboarding:
                 telegram_user_id=telegram_user_id,
                 locale=presentation_locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
-                text=_source_chat_failed_text(presentation_locale, selection),
+                text=_source_chat_failed_text(presentation_locale),
             )
         else:
+            selection = self._language_rendering(
+                locale, update_id=origin.originating_update_id
+            )
+            presentation_locale = (
+                locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
+            )
             state = replace(
                 current,
                 stage=ConversationStage.SETTINGS,
@@ -4666,13 +4660,19 @@ class ConversationOnboarding:
                 )
                 return
             locale = current.locale or "en"
-            selection = self._language_rendering(
-                locale, update_id=lifecycle_origin.originating_update_id
-            )
-            presentation_locale = (
-                locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
-            )
             is_administrator = self._is_administrator(lifecycle_origin.telegram_user_id)
+            lifecycle_selection: LanguageSelection | None = None
+            if is_administrator:
+                presentation_locale = locale
+            else:
+                lifecycle_selection = self._language_rendering(
+                    locale, update_id=lifecycle_origin.originating_update_id
+                )
+                presentation_locale = (
+                    locale
+                    if locale in SUPPORTED_LOCALES or lifecycle_selection is not None
+                    else "en"
+                )
             if is_administrator:
                 state = replace(
                     current,
@@ -4685,7 +4685,6 @@ class ConversationOnboarding:
                     telegram_user_id=lifecycle_origin.telegram_user_id,
                     locale=presentation_locale,
                     screen_revision=state.screen_revision,
-                    selection=selection,
                     text=(
                         "Source Chat "
                         f"{lifecycle_origin.action.value.replace('_', ' ')} "
@@ -4705,7 +4704,7 @@ class ConversationOnboarding:
                     telegram_user_id=lifecycle_origin.telegram_user_id,
                     locale=presentation_locale,
                     screen_revision=state.screen_revision,
-                    selection=selection,
+                    selection=lifecycle_selection,
                     is_administrator=False,
                 )
             message = replace(
@@ -4737,13 +4736,10 @@ class ConversationOnboarding:
             )
             return
         locale = current.locale or "en"
-        selection = self._language_rendering(
-            locale, update_id=origin.originating_update_id
-        )
-        presentation_locale = (
-            locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
-        )
-        if self._is_administrator(telegram_user_id):
+        is_administrator = self._is_administrator(telegram_user_id)
+        selection: LanguageSelection | None = None
+        if is_administrator:
+            presentation_locale = locale
             state = replace(
                 current,
                 stage=ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
@@ -4755,10 +4751,15 @@ class ConversationOnboarding:
                 telegram_user_id=telegram_user_id,
                 locale=presentation_locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
-                text=_source_chat_failed_text(presentation_locale, selection),
+                text=_source_chat_failed_text(presentation_locale),
             )
         else:
+            selection = self._language_rendering(
+                locale, update_id=origin.originating_update_id
+            )
+            presentation_locale = (
+                locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
+            )
             state = replace(
                 current,
                 stage=ConversationStage.SETTINGS,
@@ -4885,7 +4886,6 @@ class ConversationOnboarding:
             self._queue_current_view(update_id=update_id, state=current)
             return
         locale = current.locale or "en"
-        selection = self._language_rendering(locale, update_id=update_id)
         state = replace(
             current,
             stage=ConversationStage.ADMINISTRATION,
@@ -4901,7 +4901,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
             ),
             recorded_at=self._clock.now(),
         )
@@ -5049,9 +5048,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=current.locale or "en",
                 screen_revision=state.screen_revision,
-                selection=self._language_rendering(
-                    current.locale or "en", update_id=update_id
-                ),
                 requests=self._store.source_data_deletion_requests(),
             ),
             command=command,
@@ -5068,7 +5064,6 @@ class ConversationOnboarding:
             self._queue_current_view(update_id=update_id, state=current)
             return
         locale = current.locale or "en"
-        selection = self._language_rendering(locale, update_id=update_id)
         state = replace(
             current,
             stage=ConversationStage.SOURCE_CHATS,
@@ -5084,7 +5079,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
                 entries=self._store.source_chat_administration_views(),
             ),
             recorded_at=self._clock.now(),
@@ -5115,7 +5109,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=self._language_rendering(locale, update_id=update_id),
                 events=self._store.source_data_audit(),
             ),
             recorded_at=self._clock.now(),
@@ -5146,7 +5139,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=self._language_rendering(locale, update_id=update_id),
                 requests=self._store.source_data_deletion_requests(),
             ),
             recorded_at=self._clock.now(),
@@ -5241,7 +5233,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=self._language_rendering(locale, update_id=update_id),
                 text=_source_chat_lifecycle_pending_text(action, locale),
                 entries=entries,
             ),
@@ -5260,7 +5251,6 @@ class ConversationOnboarding:
             self._queue_current_view(update_id=update_id, state=current)
             return
         locale = current.locale or "en"
-        selection = self._language_rendering(locale, update_id=update_id)
         state = replace(
             current,
             stage=ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
@@ -5276,7 +5266,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
                 text=text,
             ),
             recorded_at=self._clock.now(),
@@ -16373,30 +16362,15 @@ def _administration_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
-    selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
-    if locale in SUPPORTED_LOCALES:
-        (
-            text,
-            source_chats,
-            source_data_deletion,
-            source_data_audit,
-            back,
-            menu,
-        ) = _ADMINISTRATION_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.administration_text is not None
-        and selection.administration_labels is not None
-    ):
-        text = selection.administration_text
-        source_chats, source_data_audit, back, menu = selection.administration_labels
-        source_data_deletion = (
-            selection.source_data_deletion_label or "Source Data Deletion Requests"
-        )
-    else:
-        raise RuntimeError("Conversation Language has no Administration rendering")
+    (
+        text,
+        source_chats,
+        source_data_deletion,
+        source_data_audit,
+        back,
+        menu,
+    ) = _ADMINISTRATION_COPY.get(locale, _ADMINISTRATION_COPY["en"])
     return TelegramMessage(
         delivery_id=f"administration:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -16430,21 +16404,11 @@ def _source_data_deletion_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
-    selection: LanguageSelection | None = None,
     requests: tuple[SourceDataDeletionRequest, ...] = (),
 ) -> TelegramMessage:
-    if locale in SUPPORTED_LOCALES:
-        text, back, menu = _SOURCE_DATA_DELETION_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_data_deletion_text is not None
-        and selection.source_data_deletion_labels is not None
-    ):
-        text = selection.source_data_deletion_text
-        back, menu = selection.source_data_deletion_labels
-    else:
-        text, back, menu = _SOURCE_DATA_DELETION_COPY["en"]
+    text, back, menu = _SOURCE_DATA_DELETION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_COPY["en"]
+    )
     actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
         locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
     )
@@ -16617,21 +16581,11 @@ def _source_data_audit_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
-    selection: LanguageSelection | None = None,
     events: tuple[SourceDataAuditEvent, ...] = (),
 ) -> TelegramMessage:
-    if locale in SUPPORTED_LOCALES:
-        text, back, menu = _SOURCE_DATA_AUDIT_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_data_audit_text is not None
-        and selection.source_data_audit_labels is not None
-    ):
-        text = selection.source_data_audit_text
-        back, menu = selection.source_data_audit_labels
-    else:
-        raise RuntimeError("Conversation Language has no Source Data Audit rendering")
+    text, back, menu = _SOURCE_DATA_AUDIT_COPY.get(
+        locale, _SOURCE_DATA_AUDIT_COPY["en"]
+    )
     lines = [text]
     lines.extend(
         " · ".join(
@@ -16666,24 +16620,14 @@ def _source_chats_message(
     locale: str,
     screen_revision: int,
     text: str | None = None,
-    selection: LanguageSelection | None = None,
     entries: tuple[SourceChatRegistryEntry, ...] = (),
 ) -> TelegramMessage:
     lifecycle_copy = _SOURCE_CHAT_LIFECYCLE_COPY.get(
         locale, _SOURCE_CHAT_LIFECYCLE_COPY["en"]
     )
-    if locale in SUPPORTED_LOCALES:
-        default_text, add, back, menu = _SOURCE_CHATS_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chats_text is not None
-        and selection.source_chats_labels is not None
-    ):
-        default_text = selection.source_chats_text
-        add, back, menu = selection.source_chats_labels
-    else:
-        raise RuntimeError("Conversation Language has no Source Chats rendering")
+    default_text, add, back, menu = _SOURCE_CHATS_COPY.get(
+        locale, _SOURCE_CHATS_COPY["en"]
+    )
     button_rows: list[tuple[tuple[str, str], ...]] = []
     status_lines: list[str] = []
     for entry in entries:
@@ -16925,20 +16869,10 @@ def _source_chat_address_message(
     locale: str,
     screen_revision: int,
     text: str | None = None,
-    selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
-    if locale in SUPPORTED_LOCALES:
-        default_text, back, menu = _SOURCE_CHAT_ADDRESS_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chat_address_text is not None
-        and selection.source_chat_address_labels is not None
-    ):
-        default_text = selection.source_chat_address_text
-        back, menu = selection.source_chat_address_labels
-    else:
-        raise RuntimeError("Conversation Language has no Source Chat address rendering")
+    default_text, back, menu = _SOURCE_CHAT_ADDRESS_COPY.get(
+        locale, _SOURCE_CHAT_ADDRESS_COPY["en"]
+    )
     return TelegramMessage(
         delivery_id=f"source-chat-address:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -16957,21 +16891,11 @@ def _source_chat_pending_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
-    selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
-    if locale in SUPPORTED_LOCALES:
-        _default_text, _back, menu = _SOURCE_CHAT_ADDRESS_COPY[locale]
-        text = _SOURCE_CHAT_PENDING_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chat_address_labels is not None
-        and selection.source_chat_pending_text is not None
-    ):
-        _back, menu = selection.source_chat_address_labels
-        text = selection.source_chat_pending_text
-    else:
-        raise RuntimeError("Conversation Language has no Source Chat pending rendering")
+    _default_text, _back, menu = _SOURCE_CHAT_ADDRESS_COPY.get(
+        locale, _SOURCE_CHAT_ADDRESS_COPY["en"]
+    )
+    text = _SOURCE_CHAT_PENDING_COPY.get(locale, _SOURCE_CHAT_PENDING_COPY["en"])
     return TelegramMessage(
         delivery_id=f"source-chat-pending:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -16986,47 +16910,22 @@ def _source_chat_pending_message(
 
 def _source_chat_registered_text(
     locale: str,
-    selection: LanguageSelection | None,
 ) -> str:
-    if locale in SUPPORTED_LOCALES:
-        return _SOURCE_CHAT_REGISTERED_COPY[locale]
-    if (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chat_registered_text is not None
-    ):
-        return selection.source_chat_registered_text
-    raise RuntimeError("Conversation Language has no Source Chat success rendering")
+    return _SOURCE_CHAT_REGISTERED_COPY.get(locale, _SOURCE_CHAT_REGISTERED_COPY["en"])
 
 
 def _source_chat_invalid_address_text(
     locale: str,
-    selection: LanguageSelection | None,
 ) -> str:
-    if locale in SUPPORTED_LOCALES:
-        return _SOURCE_CHAT_INVALID_ADDRESS_COPY[locale]
-    if (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chat_invalid_address_text is not None
-    ):
-        return selection.source_chat_invalid_address_text
-    raise RuntimeError("Conversation Language has no invalid Source Chat rendering")
+    return _SOURCE_CHAT_INVALID_ADDRESS_COPY.get(
+        locale, _SOURCE_CHAT_INVALID_ADDRESS_COPY["en"]
+    )
 
 
 def _source_chat_failed_text(
     locale: str,
-    selection: LanguageSelection | None,
 ) -> str:
-    if locale in SUPPORTED_LOCALES:
-        return _SOURCE_CHAT_FAILED_COPY[locale]
-    if (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chat_failed_text is not None
-    ):
-        return selection.source_chat_failed_text
-    raise RuntimeError("Conversation Language has no Source Chat failure rendering")
+    return _SOURCE_CHAT_FAILED_COPY.get(locale, _SOURCE_CHAT_FAILED_COPY["en"])
 
 
 def _settings_language_message(

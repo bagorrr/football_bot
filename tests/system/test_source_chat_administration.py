@@ -24,6 +24,7 @@ from modules.domain import (
     ConversationStage,
     GeographicType,
     InitialConsentAttestation,
+    LanguageSelection,
     LocationCandidate,
     LocationInterpretation,
     LocationResolution,
@@ -43,6 +44,7 @@ from modules.source_chat_bootstrap import (
 from modules.testkit import (
     AcceptanceSpine,
     ControlledBotAssistantModelAdapter,
+    ControlledConversationLanguageAdapter,
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
     ControlledTelegramDeliveryAdapter,
@@ -3174,9 +3176,21 @@ def test_malformed_source_chat_admission_fails_closed_and_releases_pending_user(
     system.reset()
 
 
-def test_non_static_language_renders_every_source_chat_administration_surface() -> None:
+class _CountingConversationLanguageAdapter(ControlledConversationLanguageAdapter):
+    def __init__(self) -> None:
+        self.render_update_ids: list[str | None] = []
+
+    def render(
+        self, locale: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
+        self.render_update_ids.append(update_id)
+        return super().render(locale, update_id=update_id)
+
+
+def test_unsupported_language_uses_fixed_source_chat_administration_copy() -> None:
     telegram = ControlledTelegramDeliveryAdapter()
     telethon = ControlledTelegramIngestionAdapter()
+    language_adapter = _CountingConversationLanguageAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 55, tzinfo=UTC))
     administrator_id = 46_107
     telethon.allow_public_username(
@@ -3194,6 +3208,7 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
         telegram_delivery=telegram,
         model=ControlledModelAdapter(),
         location_resolver=ControlledLocationResolverAdapter(),
+        conversation_language=language_adapter,
         telegram_admin_user_id=administrator_id,
     )
     system.reset()
@@ -3228,6 +3243,9 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
         "Verwaltung",
         f"settings:administration:{settings.screen_revision}",
     ) in tuple(button for row in settings.button_rows for button in row)
+    assert "menu:german-administration" in language_adapter.render_update_ids
+    assert "settings:german-administration" in language_adapter.render_update_ids
+    render_count_before_administration = len(language_adapter.render_update_ids)
 
     system.select_settings_action(
         update_id="administration:german-administration",
@@ -3236,10 +3254,11 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     )
     administration = telegram.messages[-1]
     assert administration.display_locale == "de"
-    assert administration.text == "⚙️ **Verwaltung**"
-    assert administration.button_rows[0][0][0] == "Quell-Chats"
-    assert administration.button_rows[1][0][0] == "Löschanfragen für Source Data"
-    assert administration.button_rows[2][0][0] == "Datenaufbewahrungs-Audit"
+    assert administration.text == "⚙️ **Administration**"
+    assert administration.button_rows[0][0][0] == "Source Chats"
+    assert administration.button_rows[1][0][0] == "Source Data Deletion Requests"
+    assert administration.button_rows[2][0][0] == "Source Data Audit"
+    assert len(language_adapter.render_update_ids) == render_count_before_administration
 
     system.select_administration_action(
         update_id="source-chats:german-administration",
@@ -3248,8 +3267,9 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     )
     source_chats = telegram.messages[-1]
     assert source_chats.display_locale == "de"
-    assert source_chats.text == "📡 **Quell-Chats**"
-    assert source_chats.button_rows[0][0][0] == "Quell-Chat hinzufügen"
+    assert source_chats.text == "📡 **Source Chats**"
+    assert source_chats.button_rows[0][0][0] == "Add Source Chat"
+    assert len(language_adapter.render_update_ids) == render_count_before_administration
 
     system.select_source_chats_action(
         update_id="add:german-administration",
@@ -3258,7 +3278,8 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     )
     address = telegram.messages[-1]
     assert address.display_locale == "de"
-    assert address.text.startswith("Senden Sie einen öffentlichen @Benutzernamen")
+    assert address.text.startswith("Send a public @username")
+    assert len(language_adapter.render_update_ids) == render_count_before_administration
 
     system.submit_source_chat_address(
         update_id="address:german-malformed",
@@ -3273,9 +3294,8 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
         ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
     )
     assert malformed.display_locale == "de"
-    assert malformed.text.startswith(
-        "Verwenden Sie einen gültigen öffentlichen @Benutzernamen"
-    )
+    assert malformed.text.startswith("Use a valid public @username")
+    assert len(language_adapter.render_update_ids) == render_count_before_administration
 
     message_count_before_registration = len(telegram.messages)
     system.submit_source_chat_address(
@@ -3288,13 +3308,13 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     pending = next(
         message
         for message in registration_messages
-        if message.text == "Quell-Chat-Zugriff wird geprüft…"
+        if message.text == "Checking Source Chat access…"
     )
     assert pending.display_locale == "de"
     registered = telegram.messages[-1]
     assert registered.display_locale == "de"
     assert registered.text == (
-        "✅ Quell-Chat registriert.\n\nErste Zustimmung bestätigt.\n\n"
+        "✅ Source Chat registered.\n\nInitial consent confirmed.\n\n"
         "@synthetic_german_source [enabled]"
     )
 
@@ -3311,8 +3331,9 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     system.process_source_chat_registrations_until_idle()
     failed = telegram.messages[-1]
     assert failed.display_locale == "de"
-    assert failed.text.startswith("Dieser Quell-Chat konnte nicht registriert werden")
+    assert failed.text.startswith("Could not register this Source Chat")
     assert system.conversation_state(administrator_id).locale == "de"
+    assert len(language_adapter.render_update_ids) == render_count_before_administration
     system.reset()
 
 

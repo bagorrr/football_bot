@@ -15,6 +15,7 @@ import pytest
 from modules.contracts import RuntimeRole
 from modules.domain import (
     ConversationStage,
+    LanguageSelection,
     SourceEventKind,
     TelegramAccountCheckpoint,
     TelegramMessage,
@@ -24,6 +25,7 @@ from modules.domain import (
 from modules.postgres_adapter import PostgresRoleStore, _scrub_source_scope_outbox
 from modules.testkit import (
     AcceptanceSpine,
+    ControlledConversationLanguageAdapter,
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
     ControlledTelegramDeliveryAdapter,
@@ -192,6 +194,96 @@ def test_source_data_deletion_ui_is_bounded_and_revision_bound() -> None:
         for event in system.source_data_audit()
     )
     assert all("source body" not in message.text for message in delivery.messages)
+
+
+class _GuardedConversationLanguageAdapter(ControlledConversationLanguageAdapter):
+    def __init__(self) -> None:
+        self.render_update_ids: list[str | None] = []
+        self.rendering_forbidden = False
+
+    def render(
+        self, locale: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
+        if self.rendering_forbidden:
+            raise AssertionError(
+                "fixed administration/deletion presentation rendered dynamic language"
+            )
+        self.render_update_ids.append(update_id)
+        return super().render(locale, update_id=update_id)
+
+
+def test_deletion_screen_uses_fixed_copy_for_unsupported_language() -> None:
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    administrator_id = 46_804
+    delivery = ControlledTelegramDeliveryAdapter()
+    language_adapter = _GuardedConversationLanguageAdapter()
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=ControlledTelegramIngestionAdapter(),
+        telegram_delivery=delivery,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        conversation_language=language_adapter,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="start:german-deletion",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.open_language_input(
+        update_id="language-input:german-deletion",
+        telegram_user_id=administrator_id,
+    )
+    system.submit_language_text(
+        update_id="language:german-deletion",
+        telegram_user_id=administrator_id,
+        text="Deutsch",
+    )
+    clock.advance_to(datetime(2026, 9, 1, 12, 0, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:german-deletion",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:german-deletion",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    settings = delivery.messages[-1]
+    assert settings.display_locale == "de"
+    assert "Verwaltung" in tuple(
+        button[0] for row in settings.button_rows for button in row
+    )
+    render_count_before_fixed_screens = len(language_adapter.render_update_ids)
+    language_adapter.rendering_forbidden = True
+
+    system.select_settings_action(
+        update_id="administration:german-deletion",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    administration = delivery.messages[-1]
+    assert administration.display_locale == "de"
+    assert administration.text == "⚙️ **Administration**"
+    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+
+    system.select_administration_action(
+        update_id="source-data-deletion:german-deletion",
+        telegram_user_id=administrator_id,
+        action="source-data-deletion",
+    )
+    deletion = delivery.messages[-1]
+    assert deletion.display_locale == "de"
+    assert deletion.text == (
+        "🗑️ **Source Data Deletion Requests**\n\n"
+        "Exact Source Author and Source Chat requests. The view is body-free."
+    )
+    assert deletion.button_rows[0][0][0] == "Add Request"
+    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
 
 
 def test_source_data_deletion_captures_pending_and_racing_ingestion() -> None:
