@@ -1,5 +1,7 @@
 """Source Chat administration behavior at the approved PostgreSQL-backed seam."""
 
+# ruff: noqa: RUF001 -- reviewed multilingual interface copy is intentional.
+
 from __future__ import annotations
 
 import os
@@ -7,7 +9,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from pathlib import Path
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import psycopg
 import pytest
@@ -23,6 +26,7 @@ from modules.domain import (
     ConversationStage,
     GeographicType,
     InitialConsentAttestation,
+    LanguageSelection,
     LocationCandidate,
     LocationInterpretation,
     LocationResolution,
@@ -35,9 +39,14 @@ from modules.domain import (
     TelegramPeerKind,
 )
 from modules.ports import ClassifierAdapterResult
+from modules.source_chat_bootstrap import (
+    bootstrap_source_chat_catalog,
+    load_source_chat_seed_catalog,
+)
 from modules.testkit import (
     AcceptanceSpine,
     ControlledBotAssistantModelAdapter,
+    ControlledConversationLanguageAdapter,
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
     ControlledTelegramDeliveryAdapter,
@@ -49,6 +58,130 @@ from modules.testkit import (
     OwnershipViolationError,
     boot_legacy_acceptance_spine,
 )
+
+
+def test_tracked_source_chat_seeds_bootstrap_exactly_once_and_preserve_pause() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    telegram = ControlledTelegramDeliveryAdapter()
+    administrator_id = 46_901
+    clock = FrozenClock(datetime(2026, 9, 15, 12, 0, tzinfo=UTC))
+    catalog = load_source_chat_seed_catalog(
+        Path(__file__).resolve().parents[2] / "config" / "source-chats.yaml"
+    )
+    identities = {
+        seed.address: TelegramPeerIdentity(TelegramPeerKind.CHANNEL, index)
+        for index, seed in enumerate(catalog.seeds, start=901)
+    }
+    for index, seed in enumerate(catalog.seeds, start=1):
+        telethon.allow_public_username(
+            address=seed.address,
+            identity=identities[seed.address],
+            transport_boundary=f"channel-pts:{index}",
+        )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+
+    ingestion_role = system._roles[RuntimeRole.INGESTION]
+    assert ingestion_role.telegram_ingestion is telethon
+    bootstrap_source_chat_catalog(
+        catalog,
+        ingestion=telethon,
+        publisher=ingestion_role.store,
+        telegram_user_id=administrator_id,
+        recorded_at=clock.now(),
+    )
+    system.process_source_chat_registrations_until_idle()
+
+    initial_registry = system.source_chats()
+    assert len(initial_registry) == 4
+    assert {entry.current_address for entry in initial_registry} == {
+        seed.address for seed in catalog.seeds
+    }
+    assert all(entry.registry_generation == 1 for entry in initial_registry)
+    assert all(entry.enabled for entry in initial_registry)
+    assert len(telethon.admitted_source_chats) == 4
+
+    system.start_bot_user(
+        update_id="start:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 10, 15, 12, 0, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:seed-bootstrap",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="pause:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        action="pause",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="confirm-pause:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        action="pause",
+        confirm=True,
+    )
+    system.process_source_chat_registrations_until_idle()
+    paused_registry = system.source_chats()
+    paused_entry = next(entry for entry in paused_registry if not entry.enabled)
+
+    for index, seed in enumerate(catalog.seeds, start=11):
+        telethon.allow_public_username(
+            address=seed.address,
+            identity=identities[seed.address],
+            transport_boundary=f"channel-pts:{index}",
+        )
+    system.restart(RuntimeRole.INGESTION)
+    restarted_ingestion = system._roles[RuntimeRole.INGESTION]
+    assert restarted_ingestion.telegram_ingestion is telethon
+    bootstrap_source_chat_catalog(
+        catalog,
+        ingestion=telethon,
+        publisher=restarted_ingestion.store,
+        telegram_user_id=administrator_id,
+        recorded_at=clock.now(),
+    )
+    system.process_source_chat_registrations_until_idle()
+
+    assert system.source_chats() == paused_registry
+    assert next(entry for entry in system.source_chats() if not entry.enabled) == (
+        paused_entry
+    )
+    assert len(telethon.admitted_source_chats) == 4
 
 
 def test_administration_requires_the_exact_configured_telegram_user_id() -> None:
@@ -320,6 +453,7 @@ def test_public_username_registration_persists_the_complete_admission_boundary()
         "✅ Source Chat registered.\n\nInitial consent confirmed.\n\n"
         "@synthetic_public_source [enabled]"
     )
+    assert telegram.messages[-1].originating_update_id == "address:public-registration"
     system.reset()
 
 
@@ -3044,9 +3178,21 @@ def test_malformed_source_chat_admission_fails_closed_and_releases_pending_user(
     system.reset()
 
 
-def test_non_static_language_renders_every_source_chat_administration_surface() -> None:
+class _CountingConversationLanguageAdapter(ControlledConversationLanguageAdapter):
+    def __init__(self) -> None:
+        self.render_update_ids: list[str | None] = []
+
+    def render(
+        self, locale: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
+        self.render_update_ids.append(update_id)
+        return super().render(locale, update_id=update_id)
+
+
+def test_unsupported_language_uses_fixed_source_chat_administration_copy() -> None:
     telegram = ControlledTelegramDeliveryAdapter()
     telethon = ControlledTelegramIngestionAdapter()
+    language_adapter = _CountingConversationLanguageAdapter()
     clock = FrozenClock(datetime(2026, 8, 9, 13, 55, tzinfo=UTC))
     administrator_id = 46_107
     telethon.allow_public_username(
@@ -3064,6 +3210,7 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
         telegram_delivery=telegram,
         model=ControlledModelAdapter(),
         location_resolver=ControlledLocationResolverAdapter(),
+        conversation_language=language_adapter,
         telegram_admin_user_id=administrator_id,
     )
     system.reset()
@@ -3098,6 +3245,9 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
         "Verwaltung",
         f"settings:administration:{settings.screen_revision}",
     ) in tuple(button for row in settings.button_rows for button in row)
+    assert "menu:german-administration" in language_adapter.render_update_ids
+    assert "settings:german-administration" in language_adapter.render_update_ids
+    render_count_before_administration = len(language_adapter.render_update_ids)
 
     system.select_settings_action(
         update_id="administration:german-administration",
@@ -3106,10 +3256,11 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     )
     administration = telegram.messages[-1]
     assert administration.display_locale == "de"
-    assert administration.text == "⚙️ **Verwaltung**"
-    assert administration.button_rows[0][0][0] == "Quell-Chats"
-    assert administration.button_rows[1][0][0] == "Löschanfragen für Source Data"
-    assert administration.button_rows[2][0][0] == "Datenaufbewahrungs-Audit"
+    assert administration.text == "⚙️ **Administration**"
+    assert administration.button_rows[0][0][0] == "Source Chats"
+    assert administration.button_rows[1][0][0] == "Source Data Deletion Requests"
+    assert administration.button_rows[2][0][0] == "Source Data Audit"
+    assert len(language_adapter.render_update_ids) == render_count_before_administration
 
     system.select_administration_action(
         update_id="source-chats:german-administration",
@@ -3118,8 +3269,9 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     )
     source_chats = telegram.messages[-1]
     assert source_chats.display_locale == "de"
-    assert source_chats.text == "📡 **Quell-Chats**"
-    assert source_chats.button_rows[0][0][0] == "Quell-Chat hinzufügen"
+    assert source_chats.text == "📡 **Source Chats**"
+    assert source_chats.button_rows[0][0][0] == "Add Source Chat"
+    assert len(language_adapter.render_update_ids) == render_count_before_administration
 
     system.select_source_chats_action(
         update_id="add:german-administration",
@@ -3128,7 +3280,8 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     )
     address = telegram.messages[-1]
     assert address.display_locale == "de"
-    assert address.text.startswith("Senden Sie einen öffentlichen @Benutzernamen")
+    assert address.text.startswith("Send a public @username")
+    assert len(language_adapter.render_update_ids) == render_count_before_administration
 
     system.submit_source_chat_address(
         update_id="address:german-malformed",
@@ -3143,9 +3296,8 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
         ConversationStage.SOURCE_CHAT_ADDRESS_INPUT
     )
     assert malformed.display_locale == "de"
-    assert malformed.text.startswith(
-        "Verwenden Sie einen gültigen öffentlichen @Benutzernamen"
-    )
+    assert malformed.text.startswith("Use a valid public @username")
+    assert len(language_adapter.render_update_ids) == render_count_before_administration
 
     message_count_before_registration = len(telegram.messages)
     system.submit_source_chat_address(
@@ -3158,13 +3310,13 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     pending = next(
         message
         for message in registration_messages
-        if message.text == "Quell-Chat-Zugriff wird geprüft…"
+        if message.text == "Checking Source Chat access…"
     )
     assert pending.display_locale == "de"
     registered = telegram.messages[-1]
     assert registered.display_locale == "de"
     assert registered.text == (
-        "✅ Quell-Chat registriert.\n\nErste Zustimmung bestätigt.\n\n"
+        "✅ Source Chat registered.\n\nInitial consent confirmed.\n\n"
         "@synthetic_german_source [enabled]"
     )
 
@@ -3181,8 +3333,9 @@ def test_non_static_language_renders_every_source_chat_administration_surface() 
     system.process_source_chat_registrations_until_idle()
     failed = telegram.messages[-1]
     assert failed.display_locale == "de"
-    assert failed.text.startswith("Dieser Quell-Chat konnte nicht registriert werden")
+    assert failed.text.startswith("Could not register this Source Chat")
     assert system.conversation_state(administrator_id).locale == "de"
+    assert len(language_adapter.render_update_ids) == render_count_before_administration
     system.reset()
 
 
@@ -3667,6 +3820,7 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
         confirm=True,
     )
     assert telegram.messages[-1].text.startswith("Applying Source Chat pause")
+    assert telegram.messages[-1].originating_update_id == "pause-confirm:lifecycle"
     assert system.source_chats() == (initial,)
 
     clock.advance_to(paused_at)
@@ -3678,6 +3832,7 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
     assert paused.permanently_removed_at is None
     assert system.process_next_source_chat_bot_result()
     assert "Source Chat pause complete: paused." in telegram.messages[-1].text
+    assert telegram.messages[-1].originating_update_id == "pause-confirm:lifecycle"
     assert not system.process_next_source_chat_change_request()
 
     terminal_pause_count = sum(
@@ -3785,6 +3940,168 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
     system.process_source_chat_registrations_until_idle()
     assert system.source_chats() == (removed,)
     assert "Source Chat re-enable complete: removed." in telegram.messages[-1].text
+    system.reset()
+
+
+@pytest.mark.parametrize(
+    ("locale", "language_text", "expected_failure"),
+    (
+        pytest.param(
+            "en",
+            None,
+            "Source Chat pause failed. Please try again.",
+        ),
+        pytest.param(
+            "ru",
+            None,
+            "Не удалось выполнить действие «приостановить» для Source Chat. "
+            "Попробуйте ещё раз.",
+        ),
+        pytest.param(
+            "es",
+            None,
+            "No se pudo completar la acción pausar del Source Chat. "
+            "Inténtelo de nuevo.",
+        ),
+        pytest.param(
+            "fr",
+            None,
+            "Impossible de terminer l’action « mettre en pause » du Source Chat. "
+            "Réessayez.",
+        ),
+        pytest.param(
+            "de",
+            "Deutsch",
+            "Source Chat pause failed. Please try again.",
+        ),
+    ),
+)
+def test_malformed_source_chat_lifecycle_terminal_uses_fixed_localized_copy(
+    locale: str,
+    language_text: str | None,
+    expected_failure: str,
+) -> None:
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    language_adapter = _CountingConversationLanguageAdapter()
+    clock = FrozenClock(datetime(2026, 8, 20, 10, 0, tzinfo=UTC))
+    administrator_id = 46_510
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_651_000,
+    )
+    address = f"@synthetic_malformed_lifecycle_{locale}"
+    telethon.allow_public_username(
+        address=address,
+        identity=identity,
+        transport_boundary="channel-pts:6510",
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        conversation_language=language_adapter,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id=f"start:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    if language_text is None:
+        system.select_fixed_language(
+            update_id=f"language:malformed-lifecycle:{locale}",
+            telegram_user_id=administrator_id,
+            locale=locale,
+        )
+    else:
+        system.open_language_input(
+            update_id=f"language-input:malformed-lifecycle:{locale}",
+            telegram_user_id=administrator_id,
+        )
+        system.submit_language_text(
+            update_id=f"language:malformed-lifecycle:{locale}",
+            telegram_user_id=administrator_id,
+            text=language_text,
+        )
+    clock.advance_to(datetime(2026, 9, 20, 10, 0, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id=f"menu:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id=f"settings:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id=f"administration:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id=f"source-chats:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id=f"add:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    system.submit_source_chat_address(
+        update_id=f"address:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        address=address,
+    )
+    system.process_source_chat_registrations_until_idle()
+
+    render_count_before_lifecycle_terminal = len(language_adapter.render_update_ids)
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id=f"pause-request:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="pause",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id=f"pause-confirm:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="pause",
+        confirm=True,
+    )
+    confirm_update_id = f"pause-confirm:malformed-lifecycle:{locale}"
+    assert system.process_next_source_chat_change_request()
+    lifecycle_correlation_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:{confirm_update_id}:"
+        f"{ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value}:pause",
+    )
+    malformed = system._observer.invalidate_source_chat_contract(
+        lifecycle_correlation_id,
+        contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+        payload_updates={"unknown_fact": "must-not-reach-fixed-copy"},
+    )
+
+    assert system.process_next_source_chat_bot_result()
+    message = telegram.messages[-1]
+    assert message.display_locale == locale
+    assert message.text.startswith(expected_failure)
+    assert message.originating_update_id == confirm_update_id
+    assert system.operator_alert(malformed.message_id).failure_code is (
+        FailureCode.INVALID_CONTRACT
+    )
+    assert (
+        len(language_adapter.render_update_ids)
+        == render_count_before_lifecycle_terminal
+    )
     system.reset()
 
 

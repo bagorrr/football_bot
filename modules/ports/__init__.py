@@ -53,6 +53,7 @@ from modules.domain import (
     RequiredDateConfirmationEvent,
     ResultConversation,
     ResultConversationMessage,
+    SearchAreaInterpretation,
     SearchResult,
     SourceChatAdmissionProvenance,
     SourceChatAdmissionResolution,
@@ -140,6 +141,13 @@ class TelegramIngestionAdapter(Protocol):
         self, lookup: Callable[[TelegramPeerIdentity], int | None]
     ) -> None:
         """Bind the durable active-generation lookup for account pages."""
+        ...
+
+    def configure_source_scope_activation_lookup(
+        self,
+        lookup: Callable[[TelegramPeerIdentity, int], tuple[datetime, str] | None],
+    ) -> None:
+        """Bind the durable current activation boundary for scope admission."""
         ...
 
     def configure_source_message_revision_lookup(
@@ -531,14 +539,26 @@ class ClassificationProofWork:
 
 
 class LocationResolverAdapter(Protocol):
-    """Controlled location boundary for accepted publication facts."""
+    """Controlled boundaries for Bot User geography and source mentions."""
 
     def opportunity_revision_id(self, proposal_id: str) -> str:
         """Return one synthetic accepted Opportunity revision identity."""
         ...
 
     def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
-        """Return non-authoritative interpretations for application validation."""
+        """Return the legacy Search Area interpretation shape."""
+        ...
+
+    def resolve_search_area(
+        self, query: LocationResolutionQuery
+    ) -> tuple[SearchAreaInterpretation, ...]:
+        """Return typed candidates for country, city, or Sub-city Area input."""
+        ...
+
+    def resolve_location_mention(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution:
+        """Return Location Candidates only for a Source Message Location Mention."""
         ...
 
 
@@ -561,11 +581,11 @@ class DateInterpretationError(RuntimeError):
 class ConversationLanguageAdapter(Protocol):
     """Bounded semantic adapter for free-text language names."""
 
-    def interpret(self, text: str) -> LanguageSelection | None:
+    def interpret(self, text: str, *, update_id: str) -> LanguageSelection | None:
         """Propose one unambiguous language or request clarification."""
         ...
 
-    def render(self, locale: str) -> LanguageSelection | None:
+    def render(self, locale: str, *, update_id: str | None) -> LanguageSelection | None:
         """Render one previously validated non-static Conversation Language."""
         ...
 
@@ -1174,13 +1194,21 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Atomically commit initial owner state and its outbox."""
         ...
 
+    def publish_source_chat_seed_resolution(
+        self,
+        *,
+        envelope: ContractEnvelope,
+    ) -> None:
+        """Publish one deterministic tracked-seed admission resolution."""
+        ...
+
     def register_source_chat(
         self,
         *,
         incoming: RawContractEnvelope,
         entry: SourceChatRegistryEntry,
-        outgoing: ContractEnvelope,
-        stale_outgoing: ContractEnvelope,
+        outgoing: ContractEnvelope | None,
+        stale_outgoing: ContractEnvelope | None,
         activation_outgoing: ContractEnvelope | None,
         received_at: datetime,
     ) -> ConsumeResult:
@@ -1249,10 +1277,29 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read the current eligible generation and durable difference cursor."""
         ...
 
+    def source_chat_ingestion_activation_boundary(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> tuple[datetime, str] | None:
+        """Read the current enabled generation's processing boundary."""
+        ...
+
     def source_chat_ingestion_generation(
         self, identity: TelegramPeerIdentity
     ) -> int | None:
         """Read the current active generation for account-page scope gating."""
+        ...
+
+    def active_source_chat_ingestion_scope(
+        self,
+    ) -> tuple[tuple[TelegramPeerIdentity, int], ...]:
+        """Read only active Source Chat identities and generations for T2."""
+        ...
+
+    def source_chat_ingestion_bootstrap_required(self) -> bool:
+        """Read whether the T2 registry is empty and needs initial bootstrap."""
         ...
 
     def initialize_account_ingestion_checkpoint(
@@ -1486,8 +1533,9 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         *,
         incoming: ContractEnvelope,
         received_at: datetime,
+        administrator_id: int | None = None,
     ) -> ConsumeResult:
-        """Queue one body-free administrator reminder delivery."""
+        """Queue one reminder for the T1-configured administrator destination."""
         ...
 
     def source_data_deletion_replay_barriers(

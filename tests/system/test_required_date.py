@@ -71,6 +71,7 @@ def test_relative_date_uses_the_confirmed_city_local_calendar() -> None:
     assert draft.required_date.iana_timezone == "Europe/Moscow"
     assert dates.queries[0].timezone_data_version == real_timezone_data_version
     assert draft.required_date.timezone_data_version == real_timezone_data_version
+    assert dates.queries[0].update_id == "date-tomorrow"
     assert dates.queries[0].authoritative_utc == datetime(
         2026, 8, 8, 21, 30, tzinfo=UTC
     )

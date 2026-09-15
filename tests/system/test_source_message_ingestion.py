@@ -1061,18 +1061,15 @@ def test_raw_telethon_warm_peerless_delete_must_match_durable_chat_mapping(
         values,
         client_factory=lambda _configuration: client,
     )
-    provider = TelethonProvider(
-        client=client,
-        approved_source_chats=(warm_chat, durable_chat),
-    )
+    provider = TelethonProvider(client=client)
     runtime.verify_conformance(
         transport=provider,
-        approved_source_chats=(warm_chat, durable_chat),
+        approved_source_chats=(),
     )
     ingestion = TelethonIngestionAdapter(
         runtime=runtime,
         source=provider,
-        approved_source_chats=(warm_chat, durable_chat),
+        approved_source_chats=(),
     )
     clock = FrozenClock(datetime(2026, 8, 12, 11, 0, tzinfo=UTC))
     system = boot_legacy_acceptance_spine(
@@ -1108,6 +1105,10 @@ def test_raw_telethon_warm_peerless_delete_must_match_durable_chat_mapping(
     warm_generation = registered_sources[warm_chat].registry_generation
     durable_generation = registered_sources[durable_chat].registry_generation
     ingestion_store = system._roles[RuntimeRole.INGESTION].store
+    assert ingestion_store.active_source_chat_ingestion_scope() == (
+        (warm_chat, warm_generation),
+        (durable_chat, durable_generation),
+    )
     assert ingestion_store.source_chat_ingestion_generation(durable_chat) == (
         durable_generation
     )

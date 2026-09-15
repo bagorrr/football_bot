@@ -14,7 +14,7 @@ from enum import IntEnum
 from hashlib import sha256
 from threading import Event, Thread
 from time import monotonic
-from typing import TypedDict, cast
+from typing import TypedDict, TypeVar, cast
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -86,12 +86,13 @@ from modules.domain import (
     LanguageSelection,
     LocaleSource,
     LocationCandidate,
-    LocationInterpretation,
     LocationResolutionQuery,
     ReplyKeyboardAction,
     RequiredDate,
     RequiredDateConfirmation,
     ResultConversation,
+    SearchAreaCandidate,
+    SearchAreaInterpretation,
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionProvenance,
@@ -162,6 +163,11 @@ from modules.proposition_graph import (
     CanonicalPropositionGraph,
     PropositionState,
     canonical_proposition_graph_from_wire,
+)
+from modules.source_chat_bootstrap import (
+    SourceChatBootstrapError,
+    is_source_chat_seed_bootstrap,
+    validate_source_chat_seed_resolution,
 )
 
 SUPPORTED_LOCALES = frozenset({"en", "es", "fr", "ru"})
@@ -1875,32 +1881,130 @@ _ADMINISTRATION_COPY = {
     ),
 }
 
-_SOURCE_DATA_DELETION_COPY = {
-    "en": (
-        "🗑️ **Source Data Deletion Requests**\n\n"
-        "Exact Source Author and Source Chat requests. The view is body-free.",
-        "Back",
-        "Menu",
-    ),
-    "ru": (
-        "🗑️ **Запросы на удаление Source Data**\n\n"
-        "Точные запросы Source Author и Source Chat. Просмотр не содержит тела.",
-        "Назад",
-        "Меню",
-    ),
-    "es": (
-        "🗑️ **Solicitudes de eliminación de Source Data**\n\n"
-        "Solicitudes exactas de Source Author y Source Chat. "
-        "La vista no contiene cuerpos.",
-        "Atrás",
-        "Menú",
-    ),
-    "fr": (
-        "🗑️ **Demandes de suppression de Source Data**\n\n"
-        "Demandes exactes de Source Author et Source Chat. La vue est sans corps.",
-        "Retour",
-        "Menu",
-    ),
+
+class _SourceDataDeletionCopy(TypedDict):
+    heading: str
+    back: str
+    menu: str
+    review: str
+    intake: str
+    reject: str
+    completion: str
+
+
+_SOURCE_DATA_DELETION_COPY: dict[str, _SourceDataDeletionCopy] = {
+    "en": {
+        "heading": (
+            "🗑️ **Source Data Deletion Requests**\n\n"
+            "Exact Source Author and Source Chat requests. The view is body-free."
+        ),
+        "back": "Back",
+        "menu": "Menu",
+        "review": (
+            "🛡️ **Review Source Data Deletion target**\n\n"
+            "request={request}\n"
+            "source_author={source_author}\n"
+            "source_chat={source_chat}\n"
+            "support_case={support_case}\n"
+            "status={status}\n\n"
+            "This starts request-scoped suppression and deletion. Confirm explicitly."
+        ),
+        "intake": (
+            "Enter exactly request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Do not include a body."
+        ),
+        "reject": "Enter one bounded rejection reason without whitespace.",
+        "completion": (
+            "Enter body-free completion proof pointer for outcome {outcome}."
+        ),
+    },
+    "ru": {
+        "heading": (
+            "🗑️ **Запросы на удаление Source Data**\n\n"
+            "Точные запросы Source Author и Source Chat. Просмотр не содержит тела."
+        ),
+        "back": "Назад",
+        "menu": "Меню",
+        "review": (
+            "🛡️ **Проверка цели удаления Source Data**\n\n"
+            "request={request}\n"
+            "source_author={source_author}\n"
+            "source_chat={source_chat}\n"
+            "support_case={support_case}\n"
+            "status={status}\n\n"
+            "Эта операция запускает подавление и удаление в рамках запроса. "
+            "Явно подтвердите действие."
+        ),
+        "intake": (
+            "Введите ровно request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Не включайте тело данных."
+        ),
+        "reject": "Введите одну ограниченную причину отклонения без пробелов.",
+        "completion": (
+            "Введите указатель на подтверждение выполнения без тела для результата "
+            "{outcome}."
+        ),
+    },
+    "es": {
+        "heading": (
+            "🗑️ **Solicitudes de eliminación de Source Data**\n\n"
+            "Solicitudes exactas de Source Author y Source Chat. "
+            "La vista no contiene cuerpos."
+        ),
+        "back": "Atrás",
+        "menu": "Menú",
+        "review": (
+            "🛡️ **Revisar el objetivo de eliminación de Source Data**\n\n"
+            "request={request}\n"
+            "source_author={source_author}\n"
+            "source_chat={source_chat}\n"
+            "support_case={support_case}\n"
+            "status={status}\n\n"
+            "Esta operación inicia la supresión y eliminación limitada a la solicitud. "
+            "Confirme explícitamente."
+        ),
+        "intake": (
+            "Introduzca exactamente request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "No incluya ningún cuerpo."
+        ),
+        "reject": "Introduzca un motivo de rechazo acotado, sin espacios.",
+        "completion": (
+            "Introduzca el puntero de prueba de finalización sin cuerpo para el "
+            "resultado {outcome}."
+        ),
+    },
+    "fr": {
+        "heading": (
+            "🗑️ **Demandes de suppression de Source Data**\n\n"
+            "Demandes exactes de Source Author et Source Chat. La vue est sans corps."
+        ),
+        "back": "Retour",
+        "menu": "Menu",
+        "review": (
+            "🛡️ **Vérifier la cible de suppression de Source Data**\n\n"
+            "request={request}\n"
+            "source_author={source_author}\n"
+            "source_chat={source_chat}\n"
+            "support_case={support_case}\n"
+            "status={status}\n\n"
+            "Cette opération lance la suppression et l’effacement "
+            "limités à la demande. "
+            "Confirmez explicitement."
+        ),
+        "intake": (
+            "Entrez exactement request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "N’incluez aucun corps."
+        ),
+        "reject": "Entrez un motif de rejet délimité, sans espace.",
+        "completion": (
+            "Entrez le pointeur de preuve d’achèvement sans corps pour le résultat "
+            "{outcome}."
+        ),
+    },
 }
 
 _SOURCE_DATA_DELETION_ACTION_COPY = {
@@ -2031,6 +2135,7 @@ class _SourceChatLifecycleCopy(TypedDict):
     confirm: str
     pending: str
     result: str
+    failed: str
     confirm_button: str
     cancel_button: str
     menu_button: str
@@ -2043,6 +2148,7 @@ _SOURCE_CHAT_LIFECYCLE_COPY: dict[str, _SourceChatLifecycleCopy] = {
         "confirm": "Confirm {action} for {address}?",
         "pending": "Applying Source Chat {action}...",
         "result": "Source Chat {action} complete: {state}.",
+        "failed": "Source Chat {action} failed. Please try again.",
         "confirm_button": "Confirm",
         "cancel_button": "Cancel",
         "menu_button": "Menu",
@@ -2061,6 +2167,10 @@ _SOURCE_CHAT_LIFECYCLE_COPY: dict[str, _SourceChatLifecycleCopy] = {
         "confirm": "Подтвердить действие «{action}» для {address}?",
         "pending": "Применяю действие «{action}» к Source Chat…",
         "result": "Действие «{action}» для Source Chat завершено: {state}.",
+        "failed": (
+            "Не удалось выполнить действие «{action}» для Source Chat. "
+            "Попробуйте ещё раз."
+        ),
         "confirm_button": "Подтвердить",
         "cancel_button": "Отмена",
         "menu_button": "Меню",
@@ -2071,6 +2181,10 @@ _SOURCE_CHAT_LIFECYCLE_COPY: dict[str, _SourceChatLifecycleCopy] = {
         "confirm": "¿Confirma {action} el Source Chat {address}?",
         "pending": "Aplicando {action} el Source Chat…",
         "result": "Source Chat {action} completado: {state}.",
+        "failed": (
+            "No se pudo completar la acción {action} del Source Chat. "
+            "Inténtelo de nuevo."
+        ),
         "confirm_button": "Confirmar",
         "cancel_button": "Cancelar",
         "menu_button": "Menú",
@@ -2085,6 +2199,9 @@ _SOURCE_CHAT_LIFECYCLE_COPY: dict[str, _SourceChatLifecycleCopy] = {
         "confirm": "Confirmer {action} pour le Source Chat {address} ?",
         "pending": "Application de l’action « {action} » au Source Chat…",
         "result": "Action « {action} » du Source Chat terminée : {state}.",
+        "failed": (
+            "Impossible de terminer l’action « {action} » du Source Chat. Réessayez."
+        ),
         "confirm_button": "Confirmer",
         "cancel_button": "Annuler",
         "menu_button": "Menu",
@@ -2260,8 +2377,12 @@ _SUB_CITY_TYPES = frozenset(
         GeographicType.STATION,
         GeographicType.TRANSPORT_HUB,
         GeographicType.LANDMARK,
+        GeographicType.STREET,
         GeographicType.ADDRESS,
     }
+)
+_GeographicCandidateT = TypeVar(
+    "_GeographicCandidateT", LocationCandidate, SearchAreaCandidate
 )
 
 _DATE_REQUIRED_INTENTS = frozenset(
@@ -3615,7 +3736,9 @@ class ConversationOnboarding:
                             prepared_text=current.result_stale_callback_text,
                         ),
                     )
-                    selection = self._language_rendering(current.locale or "en")
+                    selection = self._language_rendering(
+                        current.locale or "en", update_id=update_id
+                    )
                     message = self._render_active_result_view(
                         delivery_id=f"result-stale-view:{update_id}",
                         state=current,
@@ -3653,7 +3776,9 @@ class ConversationOnboarding:
                     current=current,
                     text=None,
                 )
-                selection = self._language_rendering(current.locale or "en")
+                selection = self._language_rendering(
+                    current.locale or "en", update_id=update_id
+                )
                 query_result = self._store.get_completed_search(
                     GetCompletedSearch.request_id(context.completed_search_id),
                     supported_versions=self._supported_query_versions,
@@ -3824,7 +3949,9 @@ class ConversationOnboarding:
                 elif (
                     current.stage is ConversationStage.SETTINGS and action == "premium"
                 ):
-                    selection = self._language_rendering(current.locale or "en")
+                    selection = self._language_rendering(
+                        current.locale or "en", update_id=update_id
+                    )
                     self._answer_placeholder_callback(
                         update_id=update_id,
                         callback_id=callback_id or update_id,
@@ -3845,7 +3972,9 @@ class ConversationOnboarding:
                     self._show_administration(update_id=update_id, current=current)
                     accepted = True
                 elif current.stage is ConversationStage.MODE and action == "feed":
-                    selection = self._language_rendering(current.locale or "en")
+                    selection = self._language_rendering(
+                        current.locale or "en", update_id=update_id
+                    )
                     self._answer_placeholder_callback(
                         update_id=update_id,
                         callback_id=callback_id or update_id,
@@ -3856,7 +3985,9 @@ class ConversationOnboarding:
                 elif (
                     current.stage is ConversationStage.MODE and action == "mode-search"
                 ):
-                    selection = self._language_rendering(current.locale or "en")
+                    selection = self._language_rendering(
+                        current.locale or "en", update_id=update_id
+                    )
                     self._answer_placeholder_callback(
                         update_id=update_id,
                         callback_id=callback_id or update_id,
@@ -4323,14 +4454,12 @@ class ConversationOnboarding:
                     current=current,
                     text=_source_chat_invalid_address_text(
                         locale,
-                        self._language_rendering(locale),
                     ),
                 )
                 self.deliver_pending()
                 return
             recorded_at = self._clock.now()
             locale = current.locale or "en"
-            selection = self._language_rendering(locale)
             registry_generation = self._store.next_source_chat_registration_generation()
             message_id = _runtime_identifier(
                 update_id,
@@ -4375,7 +4504,6 @@ class ConversationOnboarding:
                     telegram_user_id=telegram_user_id,
                     locale=locale,
                     screen_revision=state.screen_revision,
-                    selection=selection,
                 ),
                 command=command,
                 recorded_at=recorded_at,
@@ -4428,8 +4556,10 @@ class ConversationOnboarding:
         if current is None:
             raise LookupError(telegram_user_id)
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
-        if self._is_administrator(telegram_user_id):
+        is_administrator = self._is_administrator(telegram_user_id)
+        selection: LanguageSelection | None = None
+        if is_administrator:
+            presentation_locale = locale
             state = replace(
                 current,
                 stage=ConversationStage.SOURCE_CHATS,
@@ -4439,13 +4569,18 @@ class ConversationOnboarding:
             message = _source_chats_message(
                 update_id=str(incoming.message_id),
                 telegram_user_id=telegram_user_id,
-                locale=locale,
+                locale=presentation_locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
-                text=_source_chat_registered_text(locale, selection),
+                text=_source_chat_registered_text(presentation_locale),
                 entries=self._store.source_chat_administration_views(),
             )
         else:
+            selection = self._language_rendering(
+                locale, update_id=origin.originating_update_id
+            )
+            presentation_locale = (
+                locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
+            )
             state = replace(
                 current,
                 stage=ConversationStage.SETTINGS,
@@ -4455,11 +4590,12 @@ class ConversationOnboarding:
             message = _settings_message(
                 update_id=str(incoming.message_id),
                 telegram_user_id=telegram_user_id,
-                locale=locale,
+                locale=presentation_locale,
                 screen_revision=state.screen_revision,
                 selection=selection,
                 is_administrator=False,
             )
+        message = replace(message, originating_update_id=origin.originating_update_id)
         self._store.accept_source_chat_registration(
             incoming=incoming,
             expected_revision=current.revision,
@@ -4505,7 +4641,6 @@ class ConversationOnboarding:
         if current is None:
             raise LookupError(origin.telegram_user_id)
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
         state = replace(
             current,
             stage=ConversationStage.SOURCE_CHATS,
@@ -4517,7 +4652,6 @@ class ConversationOnboarding:
             telegram_user_id=origin.telegram_user_id,
             locale=locale,
             screen_revision=state.screen_revision,
-            selection=selection,
             text=_source_chat_lifecycle_result_text(
                 origin.action,
                 SourceChatLifecycleState(str(lifecycle_state)),
@@ -4525,6 +4659,7 @@ class ConversationOnboarding:
             ),
             entries=self._store.source_chat_administration_views(),
         )
+        message = replace(message, originating_update_id=origin.originating_update_id)
         self._store.accept_source_chat_lifecycle(
             incoming=incoming,
             expected_revision=current.revision,
@@ -4571,8 +4706,10 @@ class ConversationOnboarding:
         if current is None:
             raise LookupError(telegram_user_id)
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
-        if self._is_administrator(telegram_user_id):
+        is_administrator = self._is_administrator(telegram_user_id)
+        selection: LanguageSelection | None = None
+        if is_administrator:
+            presentation_locale = locale
             state = replace(
                 current,
                 stage=ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
@@ -4582,12 +4719,17 @@ class ConversationOnboarding:
             message = _source_chat_address_message(
                 update_id=str(incoming.message_id),
                 telegram_user_id=telegram_user_id,
-                locale=locale,
+                locale=presentation_locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
-                text=_source_chat_failed_text(locale, selection),
+                text=_source_chat_failed_text(presentation_locale),
             )
         else:
+            selection = self._language_rendering(
+                locale, update_id=origin.originating_update_id
+            )
+            presentation_locale = (
+                locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
+            )
             state = replace(
                 current,
                 stage=ConversationStage.SETTINGS,
@@ -4597,11 +4739,12 @@ class ConversationOnboarding:
             message = _settings_message(
                 update_id=str(incoming.message_id),
                 telegram_user_id=telegram_user_id,
-                locale=locale,
+                locale=presentation_locale,
                 screen_revision=state.screen_revision,
                 selection=selection,
                 is_administrator=False,
             )
+        message = replace(message, originating_update_id=origin.originating_update_id)
         self._store.accept_source_chat_registration(
             incoming=incoming,
             expected_revision=current.revision,
@@ -4629,6 +4772,18 @@ class ConversationOnboarding:
                 return
             locale = current.locale or "en"
             is_administrator = self._is_administrator(lifecycle_origin.telegram_user_id)
+            lifecycle_selection: LanguageSelection | None = None
+            if is_administrator:
+                presentation_locale = locale
+            else:
+                lifecycle_selection = self._language_rendering(
+                    locale, update_id=lifecycle_origin.originating_update_id
+                )
+                presentation_locale = (
+                    locale
+                    if locale in SUPPORTED_LOCALES or lifecycle_selection is not None
+                    else "en"
+                )
             if is_administrator:
                 state = replace(
                     current,
@@ -4639,13 +4794,11 @@ class ConversationOnboarding:
                 message = _source_chats_message(
                     update_id=str(incoming.message_id),
                     telegram_user_id=lifecycle_origin.telegram_user_id,
-                    locale=locale,
+                    locale=presentation_locale,
                     screen_revision=state.screen_revision,
-                    selection=self._language_rendering(locale),
-                    text=(
-                        "Source Chat "
-                        f"{lifecycle_origin.action.value.replace('_', ' ')} "
-                        "failed. Please try again."
+                    text=_source_chat_lifecycle_failed_text(
+                        lifecycle_origin.action,
+                        presentation_locale,
                     ),
                     entries=self._store.source_chat_administration_views(),
                 )
@@ -4659,11 +4812,15 @@ class ConversationOnboarding:
                 message = _settings_message(
                     update_id=str(incoming.message_id),
                     telegram_user_id=lifecycle_origin.telegram_user_id,
-                    locale=locale,
+                    locale=presentation_locale,
                     screen_revision=state.screen_revision,
-                    selection=self._language_rendering(locale),
+                    selection=lifecycle_selection,
                     is_administrator=False,
                 )
+            message = replace(
+                message,
+                originating_update_id=lifecycle_origin.originating_update_id,
+            )
             self._store.accept_source_chat_lifecycle(
                 incoming=incoming,
                 expected_revision=current.revision,
@@ -4689,8 +4846,10 @@ class ConversationOnboarding:
             )
             return
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
-        if self._is_administrator(telegram_user_id):
+        is_administrator = self._is_administrator(telegram_user_id)
+        selection: LanguageSelection | None = None
+        if is_administrator:
+            presentation_locale = locale
             state = replace(
                 current,
                 stage=ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
@@ -4700,12 +4859,17 @@ class ConversationOnboarding:
             message = _source_chat_address_message(
                 update_id=str(incoming.message_id),
                 telegram_user_id=telegram_user_id,
-                locale=locale,
+                locale=presentation_locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
-                text=_source_chat_failed_text(locale, selection),
+                text=_source_chat_failed_text(presentation_locale),
             )
         else:
+            selection = self._language_rendering(
+                locale, update_id=origin.originating_update_id
+            )
+            presentation_locale = (
+                locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
+            )
             state = replace(
                 current,
                 stage=ConversationStage.SETTINGS,
@@ -4715,11 +4879,12 @@ class ConversationOnboarding:
             message = _settings_message(
                 update_id=str(incoming.message_id),
                 telegram_user_id=telegram_user_id,
-                locale=locale,
+                locale=presentation_locale,
                 screen_revision=state.screen_revision,
                 selection=selection,
                 is_administrator=False,
             )
+        message = replace(message, originating_update_id=origin.originating_update_id)
         self._store.accept_source_chat_registration(
             incoming=incoming,
             expected_revision=current.revision,
@@ -4729,10 +4894,14 @@ class ConversationOnboarding:
             invalid_contract=True,
         )
 
-    def _language_rendering(self, locale: str) -> LanguageSelection | None:
+    def _language_rendering(
+        self, locale: str, *, update_id: str | None
+    ) -> LanguageSelection | None:
         if locale in SUPPORTED_LOCALES:
             return None
-        selection = self._conversation_language.render(locale)
+        selection = self._conversation_language.render(locale, update_id=update_id)
+        if update_id is None and selection is None:
+            return None
         if selection is None or selection.locale != locale:
             raise RuntimeError("saved Conversation Language could not be rendered")
         return selection
@@ -4801,7 +4970,7 @@ class ConversationOnboarding:
             revision=1 if paused is None else paused.revision + 1,
             last_activity_at=now,
         )
-        selection = self._language_rendering(locale)
+        selection = self._language_rendering(locale, update_id=update_id)
         self._store.commit_conversation_update(
             update_id=update_id,
             expected_revision=current.revision,
@@ -4827,7 +4996,6 @@ class ConversationOnboarding:
             self._queue_current_view(update_id=update_id, state=current)
             return
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
         state = replace(
             current,
             stage=ConversationStage.ADMINISTRATION,
@@ -4843,7 +5011,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
             ),
             recorded_at=self._clock.now(),
         )
@@ -4991,7 +5158,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=current.locale or "en",
                 screen_revision=state.screen_revision,
-                selection=self._language_rendering(current.locale or "en"),
                 requests=self._store.source_data_deletion_requests(),
             ),
             command=command,
@@ -5008,7 +5174,6 @@ class ConversationOnboarding:
             self._queue_current_view(update_id=update_id, state=current)
             return
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
         state = replace(
             current,
             stage=ConversationStage.SOURCE_CHATS,
@@ -5024,7 +5189,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
                 entries=self._store.source_chat_administration_views(),
             ),
             recorded_at=self._clock.now(),
@@ -5055,7 +5219,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=self._language_rendering(locale),
                 events=self._store.source_data_audit(),
             ),
             recorded_at=self._clock.now(),
@@ -5086,7 +5249,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=self._language_rendering(locale),
                 requests=self._store.source_data_deletion_requests(),
             ),
             recorded_at=self._clock.now(),
@@ -5181,7 +5343,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=self._language_rendering(locale),
                 text=_source_chat_lifecycle_pending_text(action, locale),
                 entries=entries,
             ),
@@ -5200,7 +5361,6 @@ class ConversationOnboarding:
             self._queue_current_view(update_id=update_id, state=current)
             return
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
         state = replace(
             current,
             stage=ConversationStage.SOURCE_CHAT_ADDRESS_INPUT,
@@ -5216,7 +5376,6 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
-                selection=selection,
                 text=text,
             ),
             recorded_at=self._clock.now(),
@@ -5229,7 +5388,7 @@ class ConversationOnboarding:
         current: ConversationState,
     ) -> None:
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
+        selection = self._language_rendering(locale, update_id=update_id)
         state = replace(
             current,
             stage=ConversationStage.MAIN_MENU,
@@ -5257,7 +5416,7 @@ class ConversationOnboarding:
         current: ConversationState,
     ) -> None:
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
+        selection = self._language_rendering(locale, update_id=update_id)
         state = replace(
             current,
             stage=ConversationStage.RESULTS,
@@ -5354,7 +5513,7 @@ class ConversationOnboarding:
         current: ConversationState,
     ) -> None:
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
+        selection = self._language_rendering(locale, update_id=update_id)
         state = replace(
             current,
             stage=ConversationStage.SETTINGS,
@@ -5383,7 +5542,7 @@ class ConversationOnboarding:
         current: ConversationState,
     ) -> None:
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
+        selection = self._language_rendering(locale, update_id=update_id)
         state = replace(
             current,
             stage=ConversationStage.MODE,
@@ -5411,7 +5570,7 @@ class ConversationOnboarding:
         current: ConversationState,
     ) -> None:
         locale = current.locale or "en"
-        selection = self._language_rendering(locale)
+        selection = self._language_rendering(locale, update_id=update_id)
         state = replace(
             current,
             stage=ConversationStage.SETTINGS_LANGUAGE_SELECTION,
@@ -5946,7 +6105,9 @@ class ConversationOnboarding:
                 update_id=update_id,
                 state=current,
                 text=reply,
-                selection=self._language_rendering(current.locale or "en"),
+                selection=self._language_rendering(
+                    current.locale or "en", update_id=update_id
+                ),
             )
             assistant_model = self._assistant_model
             logging.getLogger(__name__).info(
@@ -7339,6 +7500,7 @@ class ConversationOnboarding:
     def _interpret_transfer_start_date_text(
         self,
         *,
+        update_id: str,
         text: str,
         locale: str,
         draft: DiscoveryDraft,
@@ -7366,6 +7528,7 @@ class ConversationOnboarding:
         try:
             resolution = self._date_interpretation.interpret(
                 DateInterpretationQuery(
+                    update_id=update_id,
                     text=text,
                     locale=locale,
                     authoritative_utc=authoritative_utc,
@@ -7479,6 +7642,7 @@ class ConversationOnboarding:
                 if current.locale is None or value is None:
                     raise ValueError("Transfer Search start date is invalid")
                 normalized = self._interpret_transfer_start_date_text(
+                    update_id=update_id,
                     text=value,
                     locale=current.locale,
                     draft=draft,
@@ -7994,7 +8158,9 @@ class ConversationOnboarding:
                 telegram_user_id=telegram_user_id,
                 locale=current.locale or "en",
                 screen_revision=current.screen_revision + 1,
-                selection=self._language_rendering(current.locale or "en"),
+                selection=self._language_rendering(
+                    current.locale or "en", update_id=search_update_id
+                ),
             )
         else:
             message = _render_result_presentation(
@@ -8007,8 +8173,11 @@ class ConversationOnboarding:
                 context_token=_result_context_token(
                     telegram_user_id, completed_search_id
                 ),
-                selection=self._language_rendering(current.locale or "en"),
+                selection=self._language_rendering(
+                    current.locale or "en", update_id=search_update_id
+                ),
             )
+        message = replace(message, originating_update_id=search_update_id)
         self._store.accept_search_completion(
             incoming=incoming,
             expected_state_revision=current.revision,
@@ -8073,6 +8242,7 @@ class ConversationOnboarding:
             screen_revision=screen_revision,
             text=text,
             button_rows=(((retry_label, f"search:retry:{screen_revision}"),),),
+            originating_update_id=search_update_id,
         )
         self._store.accept_search_failure(
             incoming=incoming,
@@ -8147,7 +8317,9 @@ class ConversationOnboarding:
             )
             selection = None
             if current.locale not in SUPPORTED_LOCALES:
-                selection = self._conversation_language.render(current.locale)
+                selection = self._conversation_language.render(
+                    current.locale, update_id=update_id
+                )
                 if selection is None or selection.locale != current.locale:
                     raise RuntimeError(
                         "saved Conversation Language could not be rendered"
@@ -8687,6 +8859,7 @@ class ConversationOnboarding:
         try:
             resolution = self._date_interpretation.interpret(
                 DateInterpretationQuery(
+                    update_id=update_id,
                     text=text,
                     locale=current.locale,
                     authoritative_utc=authoritative_utc,
@@ -8820,7 +8993,7 @@ class ConversationOnboarding:
         if locale is None:
             raise RuntimeError("Conversation Language is missing")
         try:
-            resolution = self._location_resolver.resolve(
+            interpretations = self._location_resolver.resolve_search_area(
                 LocationResolutionQuery(
                     text=text,
                     locale=locale,
@@ -8835,10 +9008,10 @@ class ConversationOnboarding:
             )
             return
         raw_candidates = tuple(
-            interpretation.places[0]
-            for interpretation in resolution.interpretations
-            if len(interpretation.places) == 1
-            and _valid_country(interpretation.places[0])
+            interpretation.candidates[0]
+            for interpretation in interpretations
+            if len(interpretation.candidates) == 1
+            and _valid_country(interpretation.candidates[0])
         )
         candidates = _deduplicate_location_candidates(raw_candidates)
         if candidates is None:
@@ -8852,9 +9025,7 @@ class ConversationOnboarding:
             self._queue_country_ambiguity(
                 update_id=update_id,
                 current=current,
-                candidates=tuple(
-                    _location_label(candidate, locale) for candidate in candidates
-                ),
+                candidates=candidates,
             )
             return
         if not candidates:
@@ -8863,7 +9034,7 @@ class ConversationOnboarding:
                 current=current,
                 outcome=(
                     _ResolutionOutcome.INVALID
-                    if resolution.interpretations
+                    if interpretations
                     else _ResolutionOutcome.UNKNOWN
                 ),
             )
@@ -8909,7 +9080,7 @@ class ConversationOnboarding:
         update_id: str,
         current: ConversationState,
         draft: DiscoveryDraft,
-        country: LocationCandidate | AcceptedLocation,
+        country: SearchAreaCandidate | AcceptedLocation,
     ) -> None:
         locale = current.locale
         if locale is None:
@@ -8974,28 +9145,36 @@ class ConversationOnboarding:
         *,
         update_id: str,
         current: ConversationState,
-        candidates: tuple[str, ...],
+        candidates: tuple[SearchAreaCandidate, ...],
     ) -> None:
         locale = current.locale
         if locale is None:
             raise RuntimeError("Conversation Language is missing")
         copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
         back_label = _DIRECTION_COPY[copy_locale][2][5]
-        candidate_text = _format_list(copy_locale, candidates)
-        message = TelegramMessage(
-            delivery_id=f"onboarding:{update_id}",
-            telegram_user_id=current.telegram_user_id,
-            display_locale=locale,
-            screen_revision=current.screen_revision,
-            text=_AMBIGUOUS_COUNTRY_COPY[copy_locale].format(candidates=candidate_text),
-            button_rows=(
-                (
+        candidate_text = _format_list(
+            copy_locale,
+            tuple(_location_label(candidate, copy_locale) for candidate in candidates),
+        )
+        message = _with_location_attribution(
+            TelegramMessage(
+                delivery_id=f"onboarding:{update_id}",
+                telegram_user_id=current.telegram_user_id,
+                display_locale=locale,
+                screen_revision=current.screen_revision,
+                text=_AMBIGUOUS_COUNTRY_COPY[copy_locale].format(
+                    candidates=candidate_text
+                ),
+                button_rows=(
                     (
-                        back_label,
-                        f"direction:back:{current.screen_revision}",
+                        (
+                            back_label,
+                            f"direction:back:{current.screen_revision}",
+                        ),
                     ),
                 ),
             ),
+            *(candidate.place_id for candidate in candidates),
         )
         self._store.commit_conversation_presentation(
             update_id=update_id,
@@ -9019,7 +9198,7 @@ class ConversationOnboarding:
         if draft.country is None:
             raise RuntimeError("city stage has no confirmed country")
         try:
-            resolution = self._location_resolver.resolve(
+            interpretations = self._location_resolver.resolve_search_area(
                 LocationResolutionQuery(
                     text=text,
                     locale=locale,
@@ -9036,10 +9215,10 @@ class ConversationOnboarding:
             )
             return
         raw_candidates = tuple(
-            interpretation.places[0]
-            for interpretation in resolution.interpretations
-            if len(interpretation.places) == 1
-            and _valid_city(interpretation.places[0], draft.country)
+            interpretation.candidates[0]
+            for interpretation in interpretations
+            if len(interpretation.candidates) == 1
+            and _valid_city(interpretation.candidates[0], draft.country)
         )
         candidates = _deduplicate_location_candidates(raw_candidates)
         if candidates is None:
@@ -9066,7 +9245,7 @@ class ConversationOnboarding:
                 country=draft.country,
                 outcome=(
                     _ResolutionOutcome.INVALID
-                    if resolution.interpretations
+                    if interpretations
                     else _ResolutionOutcome.UNKNOWN
                 ),
             )
@@ -9085,23 +9264,29 @@ class ConversationOnboarding:
         current: ConversationState,
         country: AcceptedLocation,
         outcome: _ResolutionOutcome,
-        candidates: tuple[LocationCandidate, ...] = (),
+        candidates: tuple[SearchAreaCandidate, ...] = (),
     ) -> None:
         locale = current.locale
         if locale is None:
             raise RuntimeError("Conversation Language is missing")
         copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
         back_label = _DIRECTION_COPY[copy_locale][2][5]
-        message = TelegramMessage(
-            delivery_id=f"onboarding:{update_id}",
-            telegram_user_id=current.telegram_user_id,
-            display_locale=locale,
-            screen_revision=current.screen_revision,
-            text=_CITY_RESOLUTION_COPY[copy_locale][outcome].format(
-                country=_location_label(country, copy_locale),
-                candidates=_format_city_candidates(copy_locale, candidates),
+        message = _with_location_attribution(
+            TelegramMessage(
+                delivery_id=f"onboarding:{update_id}",
+                telegram_user_id=current.telegram_user_id,
+                display_locale=locale,
+                screen_revision=current.screen_revision,
+                text=_CITY_RESOLUTION_COPY[copy_locale][outcome].format(
+                    country=_location_label(country, copy_locale),
+                    candidates=_format_city_candidates(copy_locale, candidates),
+                ),
+                button_rows=(
+                    ((back_label, f"direction:back:{current.screen_revision}"),),
+                ),
             ),
-            button_rows=(((back_label, f"direction:back:{current.screen_revision}"),),),
+            country.place_id,
+            *(candidate.place_id for candidate in candidates),
         )
         self._store.commit_conversation_presentation(
             update_id=update_id,
@@ -9117,7 +9302,7 @@ class ConversationOnboarding:
         update_id: str,
         current: ConversationState,
         draft: DiscoveryDraft,
-        city: LocationCandidate | AcceptedLocation,
+        city: SearchAreaCandidate | AcceptedLocation,
     ) -> None:
         locale = current.locale
         if locale is None:
@@ -9188,7 +9373,7 @@ class ConversationOnboarding:
         if draft.user_intent is None:
             raise RuntimeError("Search Area stage has no confirmed User Intent")
         try:
-            resolution = self._location_resolver.resolve(
+            interpretations = self._location_resolver.resolve_search_area(
                 LocationResolutionQuery(
                     text=text,
                     locale=locale,
@@ -9207,7 +9392,7 @@ class ConversationOnboarding:
             return
         raw_validated = tuple(
             (interpretation, accepted_areas)
-            for interpretation in resolution.interpretations
+            for interpretation in interpretations
             if (
                 accepted_areas := _validated_search_area(
                     interpretation,
@@ -9241,7 +9426,7 @@ class ConversationOnboarding:
                 city=draft.city,
                 outcome=(
                     _ResolutionOutcome.INVALID
-                    if resolution.interpretations
+                    if interpretations
                     else _ResolutionOutcome.UNKNOWN
                 ),
             )
@@ -9307,9 +9492,10 @@ class ConversationOnboarding:
                 whole_city=interpretation.whole_city,
                 resolver_versions=tuple(
                     dict.fromkeys(
-                        place.resolver_version for place in interpretation.places
+                        place.resolver_version for place in interpretation.candidates
                     )
-                ),
+                )
+                or (interpretation.resolver_version,),
                 glossary_version=interpretation.glossary_version,
             ),
         )
@@ -9327,15 +9513,20 @@ class ConversationOnboarding:
             raise RuntimeError("Conversation Language is missing")
         copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
         back_label = _DIRECTION_COPY[copy_locale][2][5]
-        message = TelegramMessage(
-            delivery_id=f"onboarding:{update_id}",
-            telegram_user_id=current.telegram_user_id,
-            display_locale=locale,
-            screen_revision=current.screen_revision,
-            text=_SEARCH_AREA_RESOLUTION_COPY[copy_locale][outcome].format(
-                city=_location_label(city, copy_locale)
+        message = _with_location_attribution(
+            TelegramMessage(
+                delivery_id=f"onboarding:{update_id}",
+                telegram_user_id=current.telegram_user_id,
+                display_locale=locale,
+                screen_revision=current.screen_revision,
+                text=_SEARCH_AREA_RESOLUTION_COPY[copy_locale][outcome].format(
+                    city=_location_label(city, copy_locale)
+                ),
+                button_rows=(
+                    ((back_label, f"direction:back:{current.screen_revision}"),),
+                ),
             ),
-            button_rows=(((back_label, f"direction:back:{current.screen_revision}"),),),
+            city.place_id,
         )
         self._store.commit_conversation_presentation(
             update_id=update_id,
@@ -9667,7 +9858,9 @@ class ConversationOnboarding:
         if intent_branch is None:
             selection = None
             if locale not in SUPPORTED_LOCALES:
-                selection = self._conversation_language.render(locale)
+                selection = self._conversation_language.render(
+                    locale, update_id=update_id
+                )
                 if selection is None or selection.locale != locale:
                     raise RuntimeError(
                         "saved Conversation Language could not be rendered"
@@ -9741,7 +9934,7 @@ class ConversationOnboarding:
                 current=current,
             )
             locale = current.locale or "en"
-            selection = self._language_rendering(locale)
+            selection = self._language_rendering(locale, update_id=update_id)
             state = replace(
                 current,
                 stage=ConversationStage.SETTINGS_LANGUAGE_INPUT,
@@ -9853,10 +10046,10 @@ class ConversationOnboarding:
         current: ConversationState,
         text: str,
     ) -> None:
-        selection = self._conversation_language.interpret(text)
+        selection = self._conversation_language.interpret(text, update_id=update_id)
         if selection is None or selection.locale not in APPLICATION_LOCALES:
             locale = current.locale or "en"
-            current_rendering = self._language_rendering(locale)
+            current_rendering = self._language_rendering(locale, update_id=update_id)
             if current.stage is ConversationStage.SETTINGS_LANGUAGE_INPUT:
                 message = replace(
                     _settings_language_input_message(
@@ -9987,7 +10180,7 @@ class ConversationOnboarding:
                     telegram_user_id=state.telegram_user_id,
                     locale=locale,
                     screen_revision=demoted.screen_revision,
-                    selection=self._language_rendering(locale),
+                    selection=self._language_rendering(locale, update_id=update_id),
                     is_administrator=False,
                 ),
                 recorded_at=self._clock.now(),
@@ -10021,7 +10214,9 @@ class ConversationOnboarding:
                 delivery_id=f"result-view:{update_id}",
                 state=replace(state, screen_revision=state.screen_revision + 1),
                 context=context,
-                selection=self._language_rendering(state.locale or "en"),
+                selection=self._language_rendering(
+                    state.locale or "en", update_id=update_id
+                ),
             )
             if message is None:
                 return
@@ -10092,7 +10287,12 @@ class ConversationOnboarding:
             if current is None:
                 raise LookupError(message.telegram_user_id)
             locale = current.locale or "en"
-            selection = self._language_rendering(locale)
+            selection = self._language_rendering(
+                locale, update_id=message.originating_update_id
+            )
+            presentation_locale = (
+                locale if locale in SUPPORTED_LOCALES or selection is not None else "en"
+            )
             state = replace(
                 current,
                 stage=ConversationStage.SETTINGS,
@@ -10102,10 +10302,14 @@ class ConversationOnboarding:
             settings = _settings_message(
                 update_id=f"authorization-revoked:{message.delivery_id}",
                 telegram_user_id=message.telegram_user_id,
-                locale=locale,
+                locale=presentation_locale,
                 screen_revision=state.screen_revision,
                 selection=selection,
                 is_administrator=False,
+            )
+            settings = replace(
+                settings,
+                originating_update_id=message.originating_update_id,
             )
             self._store.replace_unauthorized_administration_delivery(
                 delivery_id=message.delivery_id,
@@ -10537,6 +10741,7 @@ class ConversationOnboarding:
         if current is None or draft is None or current.locale is None:
             raise ValueError("Coaching Search start date is invalid")
         normalized = self._interpret_coaching_start_date_text(
+            update_id=update_id,
             text=text,
             locale=current.locale,
             draft=draft,
@@ -10574,6 +10779,7 @@ class ConversationOnboarding:
     def _interpret_coaching_start_date_text(
         self,
         *,
+        update_id: str,
         text: str,
         locale: str,
         draft: DiscoveryDraft,
@@ -10605,6 +10811,7 @@ class ConversationOnboarding:
         try:
             resolution = self._date_interpretation.interpret(
                 DateInterpretationQuery(
+                    update_id=update_id,
                     text=text,
                     locale=locale,
                     authoritative_utc=now.astimezone(UTC),
@@ -10952,7 +11159,7 @@ def _format_list(locale: str, values: tuple[str, ...]) -> str:
 
 
 def _format_city_candidates(
-    locale: str, candidates: tuple[LocationCandidate, ...]
+    locale: str, candidates: tuple[SearchAreaCandidate, ...]
 ) -> str:
     labels = tuple(
         f"{_location_label(candidate, locale)} "
@@ -10963,7 +11170,7 @@ def _format_city_candidates(
 
 
 def _accept_location(
-    location: LocationCandidate | AcceptedLocation,
+    location: LocationCandidate | SearchAreaCandidate | AcceptedLocation,
 ) -> AcceptedLocation:
     if isinstance(location, AcceptedLocation):
         return location
@@ -10983,8 +11190,27 @@ def _accept_location(
     )
 
 
+def _accept_search_area_candidate(
+    candidate: SearchAreaCandidate,
+) -> AcceptedLocation:
+    return AcceptedLocation(
+        place_id=candidate.place_id,
+        display_name=candidate.display_name,
+        geographic_type=candidate.geographic_type,
+        country_id=candidate.country_id,
+        city_id=candidate.city_id,
+        verified_parent_ids=candidate.verified_parent_ids,
+        parent_display_names=candidate.parent_display_names,
+        iana_timezone=candidate.iana_timezone,
+        resolver_version=candidate.resolver_version,
+        glossary_version=candidate.glossary_version,
+        localized_display_names=candidate.localized_display_names,
+        verified_disjoint_place_ids=candidate.verified_disjoint_place_ids,
+    )
+
+
 def _location_label(
-    location: LocationCandidate | AcceptedLocation,
+    location: LocationCandidate | SearchAreaCandidate | AcceptedLocation,
     locale: str,
 ) -> str:
     labels = dict(location.localized_display_names)
@@ -10992,12 +11218,40 @@ def _location_label(
     return labels.get(copy_locale, location.display_name)
 
 
+def _with_location_attribution(
+    message: TelegramMessage, *place_ids: str | None
+) -> TelegramMessage:
+    has_geonames = any(
+        place_id is not None and place_id.startswith("geonames:")
+        for place_id in place_ids
+    )
+    has_locationiq = any(
+        place_id is not None and place_id.startswith("osm:") for place_id in place_ids
+    )
+    credits: list[str] = []
+    if has_geonames:
+        credits.append("© GeoNames — https://www.geonames.org/")
+    if has_locationiq:
+        credits.append(
+            "Search by LocationIQ.com — https://locationiq.com/attribution\n"
+            "© OpenStreetMap contributors — "
+            "https://www.openstreetmap.org/copyright"
+        )
+    if not credits:
+        return message
+    return replace(
+        message,
+        text=f"{message.text}\n\n" + "\n\n".join(credits),
+    )
+
+
 def _merge_location_candidates(
-    first: LocationCandidate,
-    second: LocationCandidate,
-) -> LocationCandidate | None:
+    first: _GeographicCandidateT,
+    second: _GeographicCandidateT,
+) -> _GeographicCandidateT | None:
     if (
-        first.place_id != second.place_id
+        type(first) is not type(second)
+        or first.place_id != second.place_id
         or first.display_name != second.display_name
         or first.geographic_type is not second.geographic_type
         or first.country_id != second.country_id
@@ -11023,9 +11277,9 @@ def _merge_location_candidates(
 
 
 def _deduplicate_location_candidates(
-    candidates: tuple[LocationCandidate, ...],
-) -> tuple[LocationCandidate, ...] | None:
-    deduplicated: list[LocationCandidate] = []
+    candidates: tuple[_GeographicCandidateT, ...],
+) -> tuple[_GeographicCandidateT, ...] | None:
+    deduplicated: list[_GeographicCandidateT] = []
     indexes: dict[str, int] = {}
     for candidate in candidates:
         index = indexes.get(candidate.place_id)
@@ -11041,14 +11295,18 @@ def _deduplicate_location_candidates(
 
 
 def _deduplicate_search_areas(
-    validated: tuple[tuple[LocationInterpretation, tuple[AcceptedLocation, ...]], ...],
-) -> tuple[tuple[LocationInterpretation, tuple[AcceptedLocation, ...]], ...] | None:
-    deduplicated: list[tuple[LocationInterpretation, tuple[AcceptedLocation, ...]]] = []
+    validated: tuple[
+        tuple[SearchAreaInterpretation, tuple[AcceptedLocation, ...]], ...
+    ],
+) -> tuple[tuple[SearchAreaInterpretation, tuple[AcceptedLocation, ...]], ...] | None:
+    deduplicated: list[
+        tuple[SearchAreaInterpretation, tuple[AcceptedLocation, ...]]
+    ] = []
     indexes: dict[tuple[bool, frozenset[str]], int] = {}
     for interpretation, accepted_areas in validated:
         identity = (
             interpretation.whole_city,
-            frozenset(candidate.place_id for candidate in interpretation.places),
+            frozenset(candidate.place_id for candidate in interpretation.candidates),
         )
         index = indexes.get(identity)
         if index is None:
@@ -11059,10 +11317,10 @@ def _deduplicate_search_areas(
         if first_interpretation.glossary_version != interpretation.glossary_version:
             return None
         candidates_by_id = {
-            candidate.place_id: candidate for candidate in interpretation.places
+            candidate.place_id: candidate for candidate in interpretation.candidates
         }
-        merged_candidates: list[LocationCandidate] = []
-        for first_candidate in first_interpretation.places:
+        merged_candidates: list[SearchAreaCandidate] = []
+        for first_candidate in first_interpretation.candidates:
             merged = _merge_location_candidates(
                 first_candidate,
                 candidates_by_id[first_candidate.place_id],
@@ -11072,7 +11330,7 @@ def _deduplicate_search_areas(
             merged_candidates.append(merged)
         merged_interpretation = replace(
             first_interpretation,
-            places=tuple(merged_candidates),
+            candidates=tuple(merged_candidates),
         )
         deduplicated[index] = (
             merged_interpretation,
@@ -11080,7 +11338,8 @@ def _deduplicate_search_areas(
                 ()
                 if merged_interpretation.whole_city
                 else tuple(
-                    _accept_location(candidate) for candidate in merged_candidates
+                    _accept_search_area_candidate(candidate)
+                    for candidate in merged_candidates
                 )
             ),
         )
@@ -11088,7 +11347,7 @@ def _deduplicate_search_areas(
 
 
 def _valid_location_presentation(
-    candidate: LocationCandidate | AcceptedLocation,
+    candidate: LocationCandidate | SearchAreaCandidate | AcceptedLocation,
 ) -> bool:
     if isinstance(candidate, AcceptedLocation):
         return True
@@ -11101,7 +11360,7 @@ def _valid_location_presentation(
 
 
 def _valid_location_disjointness(
-    candidate: LocationCandidate | AcceptedLocation,
+    candidate: LocationCandidate | SearchAreaCandidate | AcceptedLocation,
 ) -> bool:
     disjoint_ids = candidate.verified_disjoint_place_ids
     return (
@@ -11113,7 +11372,7 @@ def _valid_location_disjointness(
     )
 
 
-def _valid_country(candidate: LocationCandidate | AcceptedLocation) -> bool:
+def _valid_country(candidate: SearchAreaCandidate | AcceptedLocation) -> bool:
     return (
         bool(candidate.place_id)
         and bool(candidate.display_name)
@@ -11131,7 +11390,7 @@ def _valid_country(candidate: LocationCandidate | AcceptedLocation) -> bool:
 
 
 def _valid_city(
-    candidate: LocationCandidate | AcceptedLocation,
+    candidate: SearchAreaCandidate | AcceptedLocation,
     country: AcceptedLocation,
 ) -> bool:
     if candidate.iana_timezone is None:
@@ -11161,7 +11420,7 @@ def _valid_city(
 
 
 def _valid_sub_city_areas(
-    candidates: tuple[LocationCandidate, ...],
+    candidates: tuple[SearchAreaCandidate, ...],
     *,
     country: AcceptedLocation,
     city: AcceptedLocation,
@@ -11172,6 +11431,15 @@ def _valid_sub_city_areas(
         return False
     for candidate in candidates:
         parents = candidate.verified_parent_ids
+        if candidate.geographic_type is GeographicType.ADDRESS:
+            if candidate.iana_timezone is None:
+                return False
+            try:
+                ZoneInfo(candidate.iana_timezone)
+            except (ValueError, ZoneInfoNotFoundError):
+                return False
+        elif candidate.iana_timezone is not None:
+            return False
         if (
             not candidate.place_id
             or not candidate.display_name
@@ -11182,7 +11450,6 @@ def _valid_sub_city_areas(
             or candidate.geographic_type not in _SUB_CITY_TYPES
             or candidate.country_id != country.place_id
             or candidate.city_id != city.place_id
-            or candidate.iana_timezone is not None
             or candidate.place_id in parents
             or len(set(parents)) != len(parents)
             or len(candidate.parent_display_names) != len(parents)
@@ -11195,28 +11462,25 @@ def _valid_sub_city_areas(
 
 
 def _validated_search_area(
-    interpretation: LocationInterpretation,
+    interpretation: SearchAreaInterpretation,
     *,
     country: AcceptedLocation,
     city: AcceptedLocation,
 ) -> tuple[AcceptedLocation, ...] | None:
-    if not interpretation.glossary_version:
+    if not interpretation.resolver_version or not interpretation.glossary_version:
         return None
     if interpretation.whole_city:
-        if not (
-            len(interpretation.places) == 1
-            and interpretation.places[0].place_id == city.place_id
-            and _valid_city(interpretation.places[0], country)
-        ):
-            return None
-        return ()
+        return () if not interpretation.candidates else None
     if not _valid_sub_city_areas(
-        interpretation.places,
+        interpretation.candidates,
         country=country,
         city=city,
     ):
         return None
-    return tuple(_accept_location(candidate) for candidate in interpretation.places)
+    return tuple(
+        _accept_search_area_candidate(candidate)
+        for candidate in interpretation.candidates
+    )
 
 
 def _language_selection_message(
@@ -11441,13 +11705,16 @@ def _country_message(
             ((other_country, f"location:other-country:{screen_revision}"),),
             ((back_label, f"direction:back:{screen_revision}"),),
         )
-    return TelegramMessage(
-        delivery_id=f"onboarding:{update_id}",
-        telegram_user_id=telegram_user_id,
-        display_locale=locale,
-        screen_revision=screen_revision,
-        text=_COUNTRY_COPY[copy_locale][user_intent],
-        button_rows=button_rows,
+    return _with_location_attribution(
+        TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=_COUNTRY_COPY[copy_locale][user_intent],
+            button_rows=button_rows,
+        ),
+        suggestion.country.place_id if suggestion is not None else None,
     )
 
 
@@ -11466,11 +11733,13 @@ def _city_message(
     button_rows: tuple[tuple[tuple[str, str], ...], ...] = (
         ((back_label, f"direction:back:{screen_revision}"),),
     )
+    visible_place_ids = [country.place_id]
     if (
         suggestion is not None
         and suggestion.city is not None
         and suggestion.city.country_id == country.place_id
     ):
+        visible_place_ids.append(suggestion.city.place_id)
         _, other_city = _OTHER_LOCATION_COPY[copy_locale]
         button_rows = (
             (
@@ -11483,16 +11752,19 @@ def _city_message(
             ((other_city, f"location:other-city:{screen_revision}"),),
             ((back_label, f"direction:back:{screen_revision}"),),
         )
-    return TelegramMessage(
-        delivery_id=f"onboarding:{update_id}",
-        telegram_user_id=telegram_user_id,
-        display_locale=locale,
-        screen_revision=screen_revision,
-        text=(
-            f"{confirmation.format(country=_location_label(country, copy_locale))}"
-            f"\n\n{question}"
+    return _with_location_attribution(
+        TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=(
+                f"{confirmation.format(country=_location_label(country, copy_locale))}"
+                f"\n\n{question}"
+            ),
+            button_rows=button_rows,
         ),
-        button_rows=button_rows,
+        *visible_place_ids,
     )
 
 
@@ -11507,17 +11779,20 @@ def _search_area_message(
     copy_locale = locale if locale in SUPPORTED_LOCALES else "en"
     heading, selected_city, instruction = _SEARCH_AREA_COPY[copy_locale]
     back_label = _DIRECTION_COPY[copy_locale][2][5]
-    return TelegramMessage(
-        delivery_id=f"onboarding:{update_id}",
-        telegram_user_id=telegram_user_id,
-        display_locale=locale,
-        screen_revision=screen_revision,
-        text=(
-            f"{heading}\n\n"
-            f"{selected_city.format(city=_location_label(city, copy_locale))}"
-            f"\n\n{instruction}"
+    return _with_location_attribution(
+        TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=(
+                f"{heading}\n\n"
+                f"{selected_city.format(city=_location_label(city, copy_locale))}"
+                f"\n\n{instruction}"
+            ),
+            button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
         ),
-        button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
+        city.place_id,
     )
 
 
@@ -11543,13 +11818,18 @@ def _required_date_message(
         locale=copy_locale,
         whole_city_label=whole_city_label,
     )
-    return TelegramMessage(
-        delivery_id=f"onboarding:{update_id}",
-        telegram_user_id=telegram_user_id,
-        display_locale=locale,
-        screen_revision=screen_revision,
-        text=f"✅ {heading}: **{scope}**.\n\n{_REQUIRED_DATE_COPY[copy_locale]}",
-        button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
+    return _with_location_attribution(
+        TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=f"✅ {heading}: **{scope}**.\n\n{_REQUIRED_DATE_COPY[copy_locale]}",
+            button_rows=(((back_label, f"direction:back:{screen_revision}"),),),
+        ),
+        country.place_id,
+        city.place_id,
+        *(area.place_id for area in areas),
     )
 
 
@@ -11591,17 +11871,22 @@ def _post_core_message(
         in {UserIntent.NEW_TEAM_SEARCH, UserIntent.TRANSFER_PLAYER_SEARCH}
         else "details:open"
     )
-    return TelegramMessage(
-        delivery_id=f"onboarding:{update_id}",
-        telegram_user_id=telegram_user_id,
-        display_locale=locale,
-        screen_revision=screen_revision,
-        text=f"✅ {heading}: **{scope}**.\n\n{body}",
-        button_rows=(
-            ((back_label, f"direction:back:{screen_revision}"),),
-            ((details_label, f"{details_callback}:{screen_revision}"),),
-            ((search_label, f"search:submit:{screen_revision}"),),
+    return _with_location_attribution(
+        TelegramMessage(
+            delivery_id=f"onboarding:{update_id}",
+            telegram_user_id=telegram_user_id,
+            display_locale=locale,
+            screen_revision=screen_revision,
+            text=f"✅ {heading}: **{scope}**.\n\n{body}",
+            button_rows=(
+                ((back_label, f"direction:back:{screen_revision}"),),
+                ((details_label, f"{details_callback}:{screen_revision}"),),
+                ((search_label, f"search:submit:{screen_revision}"),),
+            ),
         ),
+        country.place_id,
+        city.place_id,
+        *(area.place_id for area in areas),
     )
 
 
@@ -12591,12 +12876,17 @@ def _render_result_presentation(
     selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
     """Render one canonical card and add pagination only for a multi-result set."""
-    message = _result_renderer_for(result)(
-        delivery_id=delivery_id,
-        telegram_user_id=telegram_user_id,
-        locale=locale,
-        screen_revision=screen_revision,
-        result=result,
+    result_facts = dict(result.card_facts)
+    message = _with_location_attribution(
+        _result_renderer_for(result)(
+            delivery_id=delivery_id,
+            telegram_user_id=telegram_user_id,
+            locale=locale,
+            screen_revision=screen_revision,
+            result=result,
+        ),
+        result_facts.get("city_id"),
+        result_facts.get("place_id"),
     )
     if result_count <= 1:
         return message
@@ -16182,30 +16472,15 @@ def _administration_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
-    selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
-    if locale in SUPPORTED_LOCALES:
-        (
-            text,
-            source_chats,
-            source_data_deletion,
-            source_data_audit,
-            back,
-            menu,
-        ) = _ADMINISTRATION_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.administration_text is not None
-        and selection.administration_labels is not None
-    ):
-        text = selection.administration_text
-        source_chats, source_data_audit, back, menu = selection.administration_labels
-        source_data_deletion = (
-            selection.source_data_deletion_label or "Source Data Deletion Requests"
-        )
-    else:
-        raise RuntimeError("Conversation Language has no Administration rendering")
+    (
+        text,
+        source_chats,
+        source_data_deletion,
+        source_data_audit,
+        back,
+        menu,
+    ) = _ADMINISTRATION_COPY.get(locale, _ADMINISTRATION_COPY["en"])
     return TelegramMessage(
         delivery_id=f"administration:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -16239,25 +16514,15 @@ def _source_data_deletion_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
-    selection: LanguageSelection | None = None,
     requests: tuple[SourceDataDeletionRequest, ...] = (),
 ) -> TelegramMessage:
-    if locale in SUPPORTED_LOCALES:
-        text, back, menu = _SOURCE_DATA_DELETION_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_data_deletion_text is not None
-        and selection.source_data_deletion_labels is not None
-    ):
-        text = selection.source_data_deletion_text
-        back, menu = selection.source_data_deletion_labels
-    else:
-        text, back, menu = _SOURCE_DATA_DELETION_COPY["en"]
+    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_COPY["en"]
+    )
     actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
         locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
     )
-    lines = [text]
+    lines = [deletion_copy["heading"]]
     button_rows: list[tuple[tuple[str, str], ...]] = [
         ((actions["add"], f"sdd:intake:{screen_revision}"),),
     ]
@@ -16324,7 +16589,7 @@ def _source_data_deletion_message(
                         ),
                     )
                 )
-    button_rows.append(((back, f"sdd:back:{screen_revision}"),))
+    button_rows.append(((deletion_copy["back"], f"sdd:back:{screen_revision}"),))
     return TelegramMessage(
         delivery_id=f"source-data-deletion:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -16332,7 +16597,7 @@ def _source_data_deletion_message(
         screen_revision=screen_revision,
         text="\n\n".join(lines),
         button_rows=tuple(button_rows),
-        reply_button=menu or actions["menu"],
+        reply_button=deletion_copy["menu"] or actions["menu"],
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
 
@@ -16346,18 +16611,19 @@ def _source_data_deletion_review_message(
     request: SourceDataDeletionRequest,
 ) -> TelegramMessage:
     """Render a body-free exact author/chat scope before execution."""
+    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_COPY["en"]
+    )
     actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
         locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
     )
     token = _source_data_deletion_callback_token(request.request_id)
-    text = (
-        "🛡️ **Review Source Data Deletion target**\n\n"
-        f"request={request.request_id}\n"
-        f"source_author={request.source_author_telegram_id}\n"
-        f"source_chat={request.source_chat_key}\n"
-        f"support_case={request.support_case_pointer}\n"
-        f"status={request.status.value}\n\n"
-        "This starts request-scoped suppression and deletion. Confirm explicitly."
+    text = deletion_copy["review"].format(
+        request=request.request_id,
+        source_author=request.source_author_telegram_id,
+        source_chat=request.source_chat_key,
+        support_case=request.support_case_pointer,
+        status=request.status.value,
     )
     menu = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
     return TelegramMessage(
@@ -16391,20 +16657,19 @@ def _source_data_deletion_input_message(
     completion_outcome: str | None = None,
 ) -> TelegramMessage:
     """Render a fixed prompt for structured administrator input."""
+    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_COPY["en"]
+    )
     actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
         locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
     )
     if operation == "intake":
-        prompt = (
-            "Enter exactly request_id=<opaque> source_author=<numeric> "
-            "source_chat=<exact Source Chat key> support_case=<opaque>. "
-            "Do not include a body."
-        )
+        prompt = deletion_copy["intake"]
     elif operation == "reject":
-        prompt = "Enter one bounded rejection reason without whitespace."
+        prompt = deletion_copy["reject"]
     else:
         outcome = completion_outcome or "completed"
-        prompt = f"Enter body-free completion proof pointer for outcome {outcome}."
+        prompt = deletion_copy["completion"].format(outcome=outcome)
     if request is not None:
         prompt = f"request={request.request_id}\n\n{prompt}"
     menu = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
@@ -16426,21 +16691,11 @@ def _source_data_audit_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
-    selection: LanguageSelection | None = None,
     events: tuple[SourceDataAuditEvent, ...] = (),
 ) -> TelegramMessage:
-    if locale in SUPPORTED_LOCALES:
-        text, back, menu = _SOURCE_DATA_AUDIT_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_data_audit_text is not None
-        and selection.source_data_audit_labels is not None
-    ):
-        text = selection.source_data_audit_text
-        back, menu = selection.source_data_audit_labels
-    else:
-        raise RuntimeError("Conversation Language has no Source Data Audit rendering")
+    text, back, menu = _SOURCE_DATA_AUDIT_COPY.get(
+        locale, _SOURCE_DATA_AUDIT_COPY["en"]
+    )
     lines = [text]
     lines.extend(
         " · ".join(
@@ -16475,24 +16730,14 @@ def _source_chats_message(
     locale: str,
     screen_revision: int,
     text: str | None = None,
-    selection: LanguageSelection | None = None,
     entries: tuple[SourceChatRegistryEntry, ...] = (),
 ) -> TelegramMessage:
     lifecycle_copy = _SOURCE_CHAT_LIFECYCLE_COPY.get(
         locale, _SOURCE_CHAT_LIFECYCLE_COPY["en"]
     )
-    if locale in SUPPORTED_LOCALES:
-        default_text, add, back, menu = _SOURCE_CHATS_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chats_text is not None
-        and selection.source_chats_labels is not None
-    ):
-        default_text = selection.source_chats_text
-        add, back, menu = selection.source_chats_labels
-    else:
-        raise RuntimeError("Conversation Language has no Source Chats rendering")
+    default_text, add, back, menu = _SOURCE_CHATS_COPY.get(
+        locale, _SOURCE_CHATS_COPY["en"]
+    )
     button_rows: list[tuple[tuple[str, str], ...]] = []
     status_lines: list[str] = []
     for entry in entries:
@@ -16727,6 +16972,19 @@ def _source_chat_lifecycle_result_text(
     )
 
 
+def _source_chat_lifecycle_failed_text(
+    action: SourceChatLifecycleAction,
+    locale: str,
+) -> str:
+    """Render the fixed administrator error for one malformed terminal."""
+    lifecycle_copy = _SOURCE_CHAT_LIFECYCLE_COPY.get(
+        locale, _SOURCE_CHAT_LIFECYCLE_COPY["en"]
+    )
+    return lifecycle_copy["failed"].format(
+        action=lifecycle_copy["actions"][action.value],
+    )
+
+
 def _source_chat_address_message(
     *,
     update_id: str,
@@ -16734,20 +16992,10 @@ def _source_chat_address_message(
     locale: str,
     screen_revision: int,
     text: str | None = None,
-    selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
-    if locale in SUPPORTED_LOCALES:
-        default_text, back, menu = _SOURCE_CHAT_ADDRESS_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chat_address_text is not None
-        and selection.source_chat_address_labels is not None
-    ):
-        default_text = selection.source_chat_address_text
-        back, menu = selection.source_chat_address_labels
-    else:
-        raise RuntimeError("Conversation Language has no Source Chat address rendering")
+    default_text, back, menu = _SOURCE_CHAT_ADDRESS_COPY.get(
+        locale, _SOURCE_CHAT_ADDRESS_COPY["en"]
+    )
     return TelegramMessage(
         delivery_id=f"source-chat-address:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -16766,21 +17014,11 @@ def _source_chat_pending_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
-    selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
-    if locale in SUPPORTED_LOCALES:
-        _default_text, _back, menu = _SOURCE_CHAT_ADDRESS_COPY[locale]
-        text = _SOURCE_CHAT_PENDING_COPY[locale]
-    elif (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chat_address_labels is not None
-        and selection.source_chat_pending_text is not None
-    ):
-        _back, menu = selection.source_chat_address_labels
-        text = selection.source_chat_pending_text
-    else:
-        raise RuntimeError("Conversation Language has no Source Chat pending rendering")
+    _default_text, _back, menu = _SOURCE_CHAT_ADDRESS_COPY.get(
+        locale, _SOURCE_CHAT_ADDRESS_COPY["en"]
+    )
+    text = _SOURCE_CHAT_PENDING_COPY.get(locale, _SOURCE_CHAT_PENDING_COPY["en"])
     return TelegramMessage(
         delivery_id=f"source-chat-pending:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -16795,47 +17033,22 @@ def _source_chat_pending_message(
 
 def _source_chat_registered_text(
     locale: str,
-    selection: LanguageSelection | None,
 ) -> str:
-    if locale in SUPPORTED_LOCALES:
-        return _SOURCE_CHAT_REGISTERED_COPY[locale]
-    if (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chat_registered_text is not None
-    ):
-        return selection.source_chat_registered_text
-    raise RuntimeError("Conversation Language has no Source Chat success rendering")
+    return _SOURCE_CHAT_REGISTERED_COPY.get(locale, _SOURCE_CHAT_REGISTERED_COPY["en"])
 
 
 def _source_chat_invalid_address_text(
     locale: str,
-    selection: LanguageSelection | None,
 ) -> str:
-    if locale in SUPPORTED_LOCALES:
-        return _SOURCE_CHAT_INVALID_ADDRESS_COPY[locale]
-    if (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chat_invalid_address_text is not None
-    ):
-        return selection.source_chat_invalid_address_text
-    raise RuntimeError("Conversation Language has no invalid Source Chat rendering")
+    return _SOURCE_CHAT_INVALID_ADDRESS_COPY.get(
+        locale, _SOURCE_CHAT_INVALID_ADDRESS_COPY["en"]
+    )
 
 
 def _source_chat_failed_text(
     locale: str,
-    selection: LanguageSelection | None,
 ) -> str:
-    if locale in SUPPORTED_LOCALES:
-        return _SOURCE_CHAT_FAILED_COPY[locale]
-    if (
-        selection is not None
-        and selection.locale == locale
-        and selection.source_chat_failed_text is not None
-    ):
-        return selection.source_chat_failed_text
-    raise RuntimeError("Conversation Language has no Source Chat failure rendering")
+    return _SOURCE_CHAT_FAILED_COPY.get(locale, _SOURCE_CHAT_FAILED_COPY["en"])
 
 
 def _settings_language_message(
@@ -17235,6 +17448,20 @@ class RuntimeApplication:
                 scope_generation_lookup
             ):
                 configure_scope_generation(scope_generation_lookup)
+            configure_scope_activation = getattr(
+                self.telegram_ingestion,
+                "configure_source_scope_activation_lookup",
+                None,
+            )
+            scope_activation_lookup = getattr(
+                self.store,
+                "source_chat_ingestion_activation_boundary",
+                None,
+            )
+            if callable(configure_scope_activation) and callable(
+                scope_activation_lookup
+            ):
+                configure_scope_activation(scope_activation_lookup)
             configure_revision_history = getattr(
                 self.telegram_ingestion,
                 "configure_source_message_revision_lookup",
@@ -17268,6 +17495,10 @@ class RuntimeApplication:
                     )
                     or (
                         definition.name is ContractName.SEARCH_COMPLETED
+                        and definition.version == 2
+                    )
+                    or (
+                        definition.name is ContractName.SOURCE_DATA_DELETION_REMINDER
                         and definition.version == 2
                     )
                     or (
@@ -18303,6 +18534,8 @@ class RuntimeApplication:
             IngestionFailureReason.AUTHENTICATION_LOST,
         }:
             return self._stop_ingestion_role(reason)
+        if scope is IngestionFailureScope.INGESTION_ROLE:
+            return self._stop_ingestion_role(reason)
         if account_stream or scope is IngestionFailureScope.ACCOUNT_STREAM:
             return self._stop_account_stream_for_transport_failure(reason=reason)
         if identity is not None and registry_generation is not None:
@@ -18518,6 +18751,7 @@ class RuntimeApplication:
             result = self.store.accept_source_data_deletion_reminder(
                 incoming=envelope,
                 received_at=self.clock.now(),
+                administrator_id=self.telegram_admin_user_id,
             )
             return result is ConsumeResult.APPLIED
         if self.role is RuntimeRole.APPLICATION and envelope.contract_name in {
@@ -19045,10 +19279,19 @@ class RuntimeApplication:
             incoming.contract_name is ContractName.SOURCE_CHAT_ADMISSION_RESOLVED
             and supported_incoming is not None
         ):
-            self._register_source_chat(
-                supported_incoming,
-                inject_outbox_conflict=inject_outbox_conflict,
-            )
+            if is_source_chat_seed_bootstrap(incoming):
+                try:
+                    self._register_source_chat_seed(supported_incoming)
+                except (SourceChatBootstrapError, TypeError, ValueError):
+                    self.store.reject_invalid_contract(
+                        incoming=incoming,
+                        received_at=self.clock.now(),
+                    )
+            else:
+                self._register_source_chat(
+                    supported_incoming,
+                    inject_outbox_conflict=inject_outbox_conflict,
+                )
             return True
         if (
             incoming.contract_name is ContractName.SOURCE_CHAT_SCOPE_ACTIVATED
@@ -19121,6 +19364,7 @@ class RuntimeApplication:
             self.store.accept_source_data_deletion_reminder(
                 incoming=supported_incoming,
                 received_at=self.clock.now(),
+                administrator_id=self.telegram_admin_user_id,
             )
             return True
         if (
@@ -22189,7 +22433,10 @@ class RuntimeApplication:
             kind=TelegramPeerKind(raw_peer_kind),
             telegram_id=telegram_chat_id,
         )
-        if telegram_user_id != self.telegram_admin_user_id:
+        if (
+            self.telegram_admin_user_id is not None
+            and telegram_user_id != self.telegram_admin_user_id
+        ):
             self.store.consume(
                 incoming=incoming,
                 supported_versions=self.versions_for(incoming.contract_name),
@@ -22332,7 +22579,10 @@ class RuntimeApplication:
         )
         if inject_outbox_conflict:
             outgoing = _runtime_with_message_id(outgoing, incoming.message_id)
-        if telegram_user_id != self.telegram_admin_user_id:
+        if (
+            self.telegram_admin_user_id is not None
+            and telegram_user_id != self.telegram_admin_user_id
+        ):
             self._fail_source_chat_registration(
                 incoming,
                 telegram_user_id=telegram_user_id,
@@ -22668,6 +22918,25 @@ class RuntimeApplication:
         started_at = datetime.fromisoformat(processing_started_at)
         if started_at.tzinfo is None:
             raise ValueError("SourceChatScopeActivated time must be timezone-aware")
+        current_boundary = getattr(
+            self.store, "source_chat_ingestion_activation_boundary", None
+        )
+        if not callable(current_boundary):
+            raise RuntimeError("Source Chat activation lookup is unavailable")
+        if current_boundary(
+            identity=resolution.identity,
+            registry_generation=registry_generation,
+        ) != (started_at, transport_boundary):
+            try:
+                self.store.consume(
+                    incoming=incoming,
+                    supported_versions=self.versions_for(incoming.contract_name),
+                    received_at=self.clock.now(),
+                    outgoing=None,
+                )
+            except OutboxConflictError as error:
+                raise RuntimeProcessingError from error
+            return
         self.telegram_ingestion.admit_source_chat(
             resolution,
             registry_generation=registry_generation,
@@ -22753,6 +23022,93 @@ class RuntimeApplication:
                 supported_versions=self.versions_for(incoming.contract_name),
                 received_at=recorded_at,
                 outgoing=outgoing,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
+
+    def _register_source_chat_seed(self, incoming: ContractEnvelope) -> None:
+        """Commit one tracked seed without creating a Bot administration result."""
+        if self.role is not RuntimeRole.APPLICATION:
+            raise RuntimeError("only Application owns the Source Chat registry")
+        validate_source_chat_seed_resolution(incoming)
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("SourceChatAdmissionResolved payload must be an object")
+        telegram_user_id = payload.get("telegram_user_id")
+        telegram_peer_kind = payload.get("telegram_peer_kind")
+        telegram_chat_id = payload.get("telegram_chat_id")
+        address_kind = payload.get("address_kind")
+        current_address = payload.get("current_address")
+        transport_boundary = payload.get("transport_boundary")
+        registry_generation = payload.get("registry_generation")
+        source_chat_key = payload.get("source_chat_key")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("SourceChatAdmissionResolved requires telegram_user_id")
+        if not isinstance(telegram_peer_kind, str):
+            raise TypeError("SourceChatAdmissionResolved requires telegram_peer_kind")
+        if not isinstance(telegram_chat_id, int) or isinstance(telegram_chat_id, bool):
+            raise TypeError("SourceChatAdmissionResolved requires telegram_chat_id")
+        if not isinstance(address_kind, str):
+            raise TypeError("SourceChatAdmissionResolved requires address_kind")
+        if not isinstance(current_address, str) or not current_address:
+            raise ValueError("SourceChatAdmissionResolved requires current_address")
+        if not isinstance(transport_boundary, str) or not transport_boundary:
+            raise ValueError("SourceChatAdmissionResolved requires transport_boundary")
+        if not isinstance(registry_generation, int) or isinstance(
+            registry_generation, bool
+        ):
+            raise TypeError("SourceChatAdmissionResolved requires registry_generation")
+        if not isinstance(source_chat_key, str) or not source_chat_key:
+            raise ValueError("SourceChatAdmissionResolved requires source_chat_key")
+        registered_at = self.clock.now()
+        entry = SourceChatRegistryEntry(
+            identity=TelegramPeerIdentity(
+                kind=TelegramPeerKind(telegram_peer_kind),
+                telegram_id=telegram_chat_id,
+            ),
+            registry_generation=registry_generation,
+            address_kind=SourceChatAddressKind(address_kind),
+            current_address=current_address,
+            processing_started_at=registered_at,
+            transport_boundary=transport_boundary,
+            enabled=True,
+            initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
+            attested_at=registered_at,
+        )
+        activation_outgoing = ContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+            contract_version=1,
+            message_id=derive_contract_message_id(
+                incoming.message_id,
+                ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.INGESTION,
+            subject_id=source_chat_key,
+            subject_revision=registry_generation,
+            idempotency_key=(f"source-chat-scope-activated:{incoming.message_id}"),
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=registered_at,
+            payload={
+                "source_chat_key": source_chat_key,
+                "telegram_peer_kind": telegram_peer_kind,
+                "telegram_chat_id": telegram_chat_id,
+                "registry_generation": registry_generation,
+                "address_kind": address_kind,
+                "current_address": current_address,
+                "processing_started_at": entry.processing_started_at.isoformat(),
+                "transport_boundary": transport_boundary,
+            },
+        )
+        try:
+            self.store.register_source_chat(
+                incoming=incoming,
+                entry=entry,
+                outgoing=None,
+                stale_outgoing=None,
+                activation_outgoing=activation_outgoing,
+                received_at=registered_at,
             )
         except OutboxConflictError as error:
             raise RuntimeProcessingError from error
@@ -22854,7 +23210,10 @@ class RuntimeApplication:
                 outgoing=failure,
             )
             return
-        if telegram_user_id != self.telegram_admin_user_id:
+        if (
+            self.telegram_admin_user_id is not None
+            and telegram_user_id != self.telegram_admin_user_id
+        ):
             self._fail_source_chat_registration(
                 incoming,
                 telegram_user_id=telegram_user_id,
@@ -23314,26 +23673,24 @@ def _source_data_deletion_input_operation(
     ):
         return None
     prompt = current_message.text
-    if prompt.startswith("Enter exactly request_id=<opaque>"):
+    locale = current.locale or "en"
+    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_COPY["en"]
+    )
+    prompt_copies = (deletion_copy, _SOURCE_DATA_DELETION_COPY["en"])
+    if any(prompt == copy["intake"] for copy in prompt_copies):
         return "intake", None, None
     request_id = current.source_data_deletion_request_id
     if request_id is None:
         return None
-    escaped_request_id = re.escape(request_id)
-    if re.fullmatch(
-        rf"request={escaped_request_id}\n\nEnter one bounded rejection reason "
-        rf"without whitespace\.",
-        prompt,
-    ):
-        return "reject", request_id, None
-    completion = re.fullmatch(
-        rf"request={escaped_request_id}\n\nEnter body-free completion proof "
-        rf"pointer for outcome "
-        rf"(completed|data_not_found)\.",
-        prompt,
-    )
-    if completion is not None:
-        return "complete", request_id, completion.group(1)
+    for copy in prompt_copies:
+        if prompt == f"request={request_id}\n\n{copy['reject']}":
+            return "reject", request_id, None
+        for outcome in ("completed", "data_not_found"):
+            if prompt == (
+                f"request={request_id}\n\n{copy['completion'].format(outcome=outcome)}"
+            ):
+                return "complete", request_id, outcome
     return None
 
 
@@ -25222,7 +25579,7 @@ def _resolve_source_location_across_supported_locales(
     city_display_labels: dict[str, str] = {}
     for locale in ("en", "es", "fr", "ru"):
         try:
-            resolution = resolver.resolve(
+            resolution = resolver.resolve_location_mention(
                 LocationResolutionQuery(
                     text=mention,
                     locale=locale,
@@ -25246,6 +25603,8 @@ def _resolve_source_location_across_supported_locales(
         ):
             return None
         proposed = interpretation.places[0]
+        if not isinstance(proposed, LocationCandidate):
+            return None
         city_label: str | None
         if proposed.geographic_type is GeographicType.CITY:
             city_label = dict(proposed.localized_display_names).get(
@@ -25262,12 +25621,14 @@ def _resolve_source_location_across_supported_locales(
         if not city_label:
             return None
         city_display_labels[locale] = city_label
+        proposed_localized = dict(proposed.localized_display_names)
+        requested_label = proposed_localized.get(locale, proposed.display_name)
+        if not isinstance(requested_label, str) or not requested_label.strip():
+            return None
         if accepted is None:
-            proposed_localized = dict(proposed.localized_display_names)
-            proposed_localized.setdefault(locale, proposed.display_name)
             accepted = replace(
                 proposed,
-                localized_display_names=tuple(sorted(proposed_localized.items())),
+                localized_display_names=((locale, requested_label),),
             )
             continue
         if (
@@ -25286,15 +25647,10 @@ def _resolve_source_location_across_supported_locales(
         ):
             return None
         localized = dict(accepted.localized_display_names)
-        proposed_localized = dict(proposed.localized_display_names)
-        proposed_localized.setdefault(locale, proposed.display_name)
-        if any(
-            existing is not None and existing != label
-            for language, label in proposed_localized.items()
-            if (existing := localized.get(language)) is not None
-        ):
+        existing = localized.get(locale)
+        if existing is not None and existing != requested_label:
             return None
-        localized.update(proposed_localized)
+        localized[locale] = requested_label
         accepted = replace(
             accepted,
             localized_display_names=tuple(sorted(localized.items())),

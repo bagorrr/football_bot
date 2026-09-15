@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -213,6 +213,9 @@ _LEGACY_MIGRATION_NAMES = (
     "0059_telethon_history_progress.sql",
     "0060_telethon_ingestion_scope_lookup.sql",
     "0061_telethon_event_identity_and_progress_retention.sql",
+    "0062_telethon_active_ingestion_scope.sql",
+    "0063_semantic_origin_update_id.sql",
+    "0064_runtime_readiness_and_ingestion_bootstrap.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -278,6 +281,9 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "f4f7e4fef466817d37c5c271c7f978b06d51f9a0bcda16a2812a7d9b5969149d",
     "96788c3cf2a25f912e068517a1b2f15736d1b2ab9ee64132c96c6eda05da7247",
     "ae782f526807bf08c2daee9fe523ef72f0d17c8b6f335061597147af659db559",
+    "bf3dbc633756c1d7264d7a447eea530c4daefb0f81b57ab08880ae44fd46699b",
+    "b543c9190bafe36a006c0ce01eb2224c19f9a0e760132bf0d967b58d487c921b",
+    "daa33b855d2ccc7ea94d72df15b6c2638a75a9807bba1200bf1d50651c19504a",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -301,6 +307,109 @@ ALTER TABLE football_runtime.bot_message_outbox
 """
 
 _RUNTIME_DATABASE_ROLES = tuple(role.database_role for role in RuntimeRole)
+
+
+def _repository_migration_paths() -> tuple[Path, ...]:
+    """Return the ordered migration files used by every schema boundary."""
+    migration_root = Path(__file__).resolve().parents[2] / "db" / "migrations"
+    return tuple(sorted(migration_root.glob("*.sql")))
+
+
+def _validate_applied_migrations(
+    applied_migrations: Mapping[str, str],
+    migration_paths: Sequence[Path],
+) -> int:
+    """Validate the immutable, contiguous migration prefix and its checksums."""
+    migration_names = tuple(path.name for path in migration_paths)
+    expected_names = migration_names[: len(applied_migrations)]
+    if tuple(sorted(applied_migrations)) != expected_names:
+        raise RuntimeError("Migration history is not a contiguous prefix")
+    for migration_path in migration_paths[: len(applied_migrations)]:
+        migration_checksum = sha256(migration_path.read_bytes()).hexdigest()
+        if applied_migrations[migration_path.name] != migration_checksum:
+            raise RuntimeError(
+                f"Applied migration was modified: {migration_path.name}",
+            )
+    return len(applied_migrations)
+
+
+_REQUIRED_RUNTIME_TABLES = (
+    "acceptance_state",
+    "application_classifier_promotion_attestations",
+    "application_classifier_promotion_gate_runs",
+    "application_classifier_promotion_replays",
+    "application_exact_repost_cluster_members",
+    "application_exact_repost_clusters",
+    "application_legacy_proposition_identity_compatibility",
+    "application_moderation_events",
+    "application_opportunities",
+    "application_proposition_identities",
+    "application_source_chat_lifecycle_events",
+    "application_source_data_audit",
+    "application_source_data_deletion_owner_acks",
+    "application_source_data_deletion_replay_barriers",
+    "application_source_data_deletion_requests",
+    "application_source_message_replay_barriers",
+    "application_source_message_retention",
+    "application_source_message_tombstones",
+    "bot_active_chat_views",
+    "bot_active_result_contexts",
+    "bot_api_checkpoints",
+    "bot_api_delivery_reconciliation",
+    "bot_api_retention_alerts",
+    "bot_api_updates",
+    "bot_assistant_failure_alarms",
+    "bot_assistant_failure_records",
+    "bot_assistant_operational_alerts",
+    "bot_callback_outbox",
+    "bot_delivery_alerts",
+    "bot_discovery_drafts",
+    "bot_geography_confirmation_events",
+    "bot_message_outbox",
+    "bot_old_chat_views",
+    "bot_required_date_confirmation_events",
+    "bot_result_conversation_messages",
+    "bot_search_presentations",
+    "bot_updates",
+    "bot_users",
+    "classification_attempts",
+    "classification_proof_work",
+    "classification_routing_outcomes",
+    "classifier_adapter_circuits",
+    "contract_inbox",
+    "contract_outbox",
+    "ingestion_failures",
+    "operator_alerts",
+    "protected_content_skips",
+    "recommendation_completed_searches",
+    "recommendation_opportunities",
+    "recommendation_results",
+    "source_chat_admission_requests",
+    "source_chat_lifecycle_origins",
+    "source_chat_registration_origins",
+    "source_chat_registry",
+    "source_event_records",
+    "source_message_revisions",
+    "source_messages",
+    "telegram_account_difference_checkpoints",
+    "telegram_channel_difference_checkpoints",
+    "telegram_presentations",
+    "telegram_source_chat_history_progress",
+)
+_MIGRATION_LEDGER_COLUMNS = (
+    ("migration_name", "text", True),
+    ("checksum", "text", True),
+    ("applied_at", "timestamp with time zone", True),
+)
+_CURRENT_SCHEMA_COLUMNS = (
+    ("source_event_records", "transport_event_id", "text"),
+    ("source_event_records", "transport_order", "bigint"),
+    ("source_message_revisions", "transport_event_id", "text"),
+    ("source_message_revisions", "transport_order", "bigint"),
+    ("bot_message_outbox", "originating_update_id", "text"),
+    ("source_chat_registration_origins", "originating_update_id", "text"),
+    ("source_chat_lifecycle_origins", "originating_update_id", "text"),
+)
 
 
 def _uuid_or_none(value: str) -> UUID | None:
@@ -327,6 +436,91 @@ _UNAVAILABLE_RESPONSE_ROUTE: dict[str, JsonValue] = {
 }
 
 
+_READINESS_QUERY = """
+WITH required_runtime_tables(table_name) AS (
+    SELECT unnest(%s::text[])
+), required_ledger_columns(column_name, type_name, required_not_null) AS (
+    SELECT * FROM unnest(%s::text[], %s::text[], %s::boolean[])
+), required_current_columns(table_name, column_name, type_name) AS (
+    SELECT * FROM unnest(%s::text[], %s::text[], %s::text[])
+)
+SELECT
+    SESSION_USER = %s,
+    EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_namespace
+        WHERE nspname = 'football_runtime'
+    ),
+    EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_namespace
+        WHERE nspname = 'football_migrations'
+    ),
+    EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_class AS relation
+        JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'football_migrations'
+          AND relation.relname = 'applied_migrations'
+          AND relation.relkind = 'r'
+    ),
+    (
+        SELECT count(*) = %s
+        FROM required_runtime_tables AS required
+        JOIN pg_catalog.pg_class AS relation
+          ON relation.relname = required.table_name
+         AND relation.relkind IN ('r', 'p')
+        JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+         AND namespace.nspname = 'football_runtime'
+    ),
+    (
+        SELECT count(*) = %s
+        FROM required_ledger_columns AS required
+        WHERE EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class AS relation
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = relation.oid
+            WHERE namespace.nspname = 'football_migrations'
+              AND relation.relname = 'applied_migrations'
+              AND relation.relkind = 'r'
+              AND attribute.attname = required.column_name
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+              AND attribute.attnotnull = required.required_not_null
+              AND pg_catalog.format_type(
+                      attribute.atttypid, attribute.atttypmod
+                  ) = required.type_name
+        )
+    ),
+    (
+        SELECT count(*) = %s
+        FROM required_current_columns AS required
+        WHERE EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class AS relation
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            JOIN pg_catalog.pg_attribute AS attribute
+              ON attribute.attrelid = relation.oid
+            WHERE namespace.nspname = 'football_runtime'
+              AND relation.relname = required.table_name
+              AND relation.relkind IN ('r', 'p')
+              AND attribute.attname = required.column_name
+              AND attribute.attnum > 0
+              AND NOT attribute.attisdropped
+              AND pg_catalog.format_type(
+                      attribute.atttypid, attribute.atttypmod
+                  ) = required.type_name
+        )
+    )
+"""
+
+
 _MATERIAL_SCHEMA_QUERY = """
 WITH runtime_roles AS (
     SELECT *
@@ -335,7 +529,7 @@ WITH runtime_roles AS (
 ), migration_owner AS (
     SELECT oid, rolname
     FROM pg_roles
-    WHERE rolname = current_user
+    WHERE rolname = COALESCE(%s::name, current_user)
 ), material AS (
     SELECT 'role'::text AS object_kind,
            role.rolname::text AS object_identity,
@@ -601,11 +795,15 @@ ORDER BY object_kind, object_identity, object_definition
 """
 
 
-def _material_schema_fingerprint(connection: psycopg.Connection[Any]) -> str:
+def _material_schema_fingerprint(
+    connection: psycopg.Connection[Any],
+    *,
+    migration_owner: str | None = None,
+) -> str:
     """Hash the complete migration-owned runtime schema contract."""
     rows = connection.execute(
         _MATERIAL_SCHEMA_QUERY,
-        (list(_RUNTIME_DATABASE_ROLES),),
+        (list(_RUNTIME_DATABASE_ROLES), migration_owner),
     ).fetchall()
     canonical = json.dumps(rows, ensure_ascii=True, separators=(",", ":"))
     return sha256(canonical.encode("utf-8")).hexdigest()
@@ -614,11 +812,16 @@ def _material_schema_fingerprint(connection: psycopg.Connection[Any]) -> str:
 def _assert_material_schema(
     connection: psycopg.Connection[Any],
     applied_count: int,
+    *,
+    migration_owner: str | None = None,
 ) -> None:
     if applied_count < 1:
         return
     expected = _MATERIAL_SCHEMA_FINGERPRINTS[applied_count - 1]
-    actual = _material_schema_fingerprint(connection)
+    actual = _material_schema_fingerprint(
+        connection,
+        migration_owner=migration_owner,
+    )
     if actual != expected:
         raise RuntimeError(f"Migration history has material schema drift: {actual}")
 
@@ -639,6 +842,51 @@ def _legacy_migration_prefix(
         ) from error
 
 
+_RUNTIME_MIGRATION_LEDGER_QUERY = """
+SELECT migration_name, checksum
+FROM football_runtime.read_runtime_applied_migrations()
+ORDER BY migration_name
+"""
+_RUNTIME_MIGRATION_OWNER_QUERY = """
+SELECT football_runtime.read_runtime_migration_owner()
+"""
+
+
+def _assert_runtime_migration_integrity(
+    connection: psycopg.Connection[Any],
+) -> None:
+    """Require the runtime-visible ledger and material schema to agree."""
+    rows = connection.execute(_RUNTIME_MIGRATION_LEDGER_QUERY).fetchall()
+    if any(
+        not isinstance(row, (tuple, list))
+        or len(row) != 2
+        or not isinstance(row[0], str)
+        or not isinstance(row[1], str)
+        or not row[0]
+        or not row[1]
+        for row in rows
+    ):
+        raise RuntimeError("Runtime migration ledger is malformed")
+    applied_migrations = {row[0]: row[1] for row in rows}
+    if len(applied_migrations) != len(rows):
+        raise RuntimeError("Runtime migration ledger contains duplicate entries")
+    migration_paths = _repository_migration_paths()
+    applied_count = _validate_applied_migrations(
+        applied_migrations,
+        migration_paths,
+    )
+    if applied_count != len(migration_paths):
+        raise RuntimeError("Runtime migration ledger is incomplete")
+    owner_row = connection.execute(_RUNTIME_MIGRATION_OWNER_QUERY).fetchone()
+    if owner_row is None or not isinstance(owner_row[0], str) or not owner_row[0]:
+        raise RuntimeError("Runtime migration owner is unavailable")
+    _assert_material_schema(
+        connection,
+        applied_count,
+        migration_owner=owner_row[0],
+    )
+
+
 class PostgresAcceptanceMigrator:
     """Administrative schema setup kept outside every runtime process."""
 
@@ -647,8 +895,7 @@ class PostgresAcceptanceMigrator:
 
     def migrate(self) -> None:
         """Apply each immutable repository migration exactly once."""
-        migration_root = Path(__file__).resolve().parents[2] / "db" / "migrations"
-        migration_paths = sorted(migration_root.glob("*.sql"))
+        migration_paths = _repository_migration_paths()
         migration_names = tuple(path.name for path in migration_paths)
         with psycopg.connect(self._admin_database_url) as connection:
             connection.execute(
@@ -721,20 +968,17 @@ class PostgresAcceptanceMigrator:
                         (migration_path.name, migration_checksum),
                     )
                     applied_migrations[migration_path.name] = migration_checksum
-            expected_applied_names = set(migration_names[: len(applied_migrations)])
-            if set(applied_migrations) != expected_applied_names:
-                raise RuntimeError("Migration history is not a contiguous prefix")
+            applied_count = _validate_applied_migrations(
+                applied_migrations,
+                migration_paths,
+            )
             if not adopted_untracked_schema:
-                _assert_material_schema(connection, len(applied_migrations))
+                _assert_material_schema(connection, applied_count)
             for migration_path in migration_paths:
                 migration_bytes = migration_path.read_bytes()
                 migration_checksum = sha256(migration_bytes).hexdigest()
                 applied_checksum = applied_migrations.get(migration_path.name)
                 if applied_checksum is not None:
-                    if applied_checksum != migration_checksum:
-                        raise RuntimeError(
-                            f"Applied migration was modified: {migration_path.name}",
-                        )
                     continue
                 connection.execute(migration_bytes.decode("utf-8"))
                 applied_count = migration_names.index(migration_path.name) + 1
@@ -2759,6 +3003,14 @@ class PostgresAcceptanceObserver:
         )
 
 
+class PostgresRoleReadinessError(RuntimeError):
+    """A redacted database-role startup check failed."""
+
+    def __init__(self, *, status: str) -> None:
+        self.status = status
+        super().__init__(f"PostgreSQL role readiness {status}")
+
+
 class PostgresRoleStore:
     """Persistence capability scoped to one runtime credential and owner."""
 
@@ -2789,6 +3041,40 @@ class PostgresRoleStore:
         """Return whether every classifier publication needs promotion evidence."""
         return self._require_classifier_promotion
 
+    def check_startup_readiness(self) -> None:
+        """Check database availability, role identity, and migrated schema."""
+        try:
+            with psycopg.connect(self._database_url) as connection:
+                row = connection.execute(
+                    _READINESS_QUERY,
+                    (
+                        list(_REQUIRED_RUNTIME_TABLES),
+                        [column[0] for column in _MIGRATION_LEDGER_COLUMNS],
+                        [column[1] for column in _MIGRATION_LEDGER_COLUMNS],
+                        [column[2] for column in _MIGRATION_LEDGER_COLUMNS],
+                        [column[0] for column in _CURRENT_SCHEMA_COLUMNS],
+                        [column[1] for column in _CURRENT_SCHEMA_COLUMNS],
+                        [column[2] for column in _CURRENT_SCHEMA_COLUMNS],
+                        self._role.database_role,
+                        len(_REQUIRED_RUNTIME_TABLES),
+                        len(_MIGRATION_LEDGER_COLUMNS),
+                        len(_CURRENT_SCHEMA_COLUMNS),
+                    ),
+                ).fetchone()
+                if row is None or len(row) != 7:
+                    raise PostgresRoleReadinessError(status="schema_not_ready")
+                if row[0] is not True:
+                    raise PostgresRoleReadinessError(status="identity_mismatch")
+                if any(value is not True for value in row[1:]):
+                    raise PostgresRoleReadinessError(status="schema_not_ready")
+                _assert_runtime_migration_integrity(connection)
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            raise PostgresRoleReadinessError(status="database_unavailable") from None
+        except PostgresRoleReadinessError:
+            raise
+        except Exception:
+            raise PostgresRoleReadinessError(status="schema_not_ready") from None
+
     def commit_initial(
         self,
         *,
@@ -2815,6 +3101,59 @@ class PostgresRoleStore:
             ).fetchone()
             if inserted is not None:
                 _insert_outbox(connection, envelope)
+
+    def publish_source_chat_seed_resolution(
+        self,
+        *,
+        envelope: ContractEnvelope,
+    ) -> None:
+        """Publish one validated tracked-seed admission idempotently."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise RuntimeError("only Ingestion publishes Source Chat seed admissions")
+        from modules.source_chat_bootstrap import (
+            validate_source_chat_seed_resolution,
+        )
+
+        validate_source_chat_seed_resolution(envelope)
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.contract_outbox (
+                    message_id, producer_role, consumer_role, contract_name,
+                    contract_version, subject_id, subject_revision,
+                    idempotency_key, causation_id, correlation_id, recorded_at,
+                    payload, source_chat_admission_provenance_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL)
+                ON CONFLICT (producer_role, idempotency_key) DO NOTHING
+                RETURNING message_id
+                """,
+                (
+                    envelope.message_id,
+                    envelope.producer.value,
+                    envelope.consumer.value if envelope.consumer else None,
+                    envelope.contract_name.value,
+                    envelope.contract_version,
+                    envelope.subject_id,
+                    envelope.subject_revision,
+                    envelope.idempotency_key,
+                    envelope.causation_id,
+                    envelope.correlation_id,
+                    envelope.recorded_at,
+                    json.dumps(envelope.json_payload()),
+                ),
+            ).fetchone()
+            if inserted is not None:
+                return
+            existing = connection.execute(
+                """
+                SELECT message_id
+                FROM football_runtime.contract_outbox
+                WHERE producer_role = %s AND idempotency_key = %s
+                """,
+                (envelope.producer.value, envelope.idempotency_key),
+            ).fetchone()
+            if existing is None or existing[0] != envelope.message_id:
+                raise RuntimeError("Source Chat seed identity conflicts with outbox")
 
     def source_stream_is_stopped(
         self,
@@ -3068,8 +3407,8 @@ class PostgresRoleStore:
         *,
         incoming: RawContractEnvelope,
         entry: SourceChatRegistryEntry,
-        outgoing: ContractEnvelope,
-        stale_outgoing: ContractEnvelope,
+        outgoing: ContractEnvelope | None,
+        stale_outgoing: ContractEnvelope | None,
         activation_outgoing: ContractEnvelope | None,
         received_at: datetime,
     ) -> ConsumeResult:
@@ -3232,12 +3571,16 @@ class PostgresRoleStore:
             effective_outgoing = outgoing
             if address_change:
                 assert latest_generation is not None
-                if not isinstance(outgoing.payload, dict):
+                if effective_outgoing is None:
+                    raise RuntimeError(
+                        "Source Chat address changes require a registry result"
+                    )
+                if not isinstance(effective_outgoing.payload, dict):
                     raise TypeError("Source Chat result payload must be an object")
-                effective_payload = dict(outgoing.payload)
+                effective_payload = dict(effective_outgoing.payload)
                 effective_payload["registry_generation"] = latest_generation[0]
                 effective_outgoing = replace(
-                    outgoing,
+                    effective_outgoing,
                     subject_revision=latest_generation[0],
                     payload=effective_payload,
                 )
@@ -3248,10 +3591,9 @@ class PostgresRoleStore:
                 received_at=received_at,
             )
             try:
-                _insert_outbox(
-                    connection,
-                    stale_outgoing if is_stale else effective_outgoing,
-                )
+                result_outgoing = stale_outgoing if is_stale else effective_outgoing
+                if result_outgoing is not None:
+                    _insert_outbox(connection, result_outgoing)
                 if (
                     activation_outgoing is not None
                     and not is_stale
@@ -3808,6 +4150,89 @@ class PostgresRoleStore:
         if type(generation) is not int or generation < 1:
             raise ValueError("Source Chat ingestion generation is invalid")
         return generation
+
+    def source_chat_ingestion_activation_boundary(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> tuple[datetime, str] | None:
+        """Read the current enabled generation's consent boundary for T2."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT context.processing_started_at, context.transport_boundary
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                ) AS context
+                WHERE football_runtime.read_current_source_chat_ingestion_generation(
+                    %s, %s
+                ) = %s
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        processing_started_at, transport_boundary = row
+        if (
+            not isinstance(processing_started_at, datetime)
+            or processing_started_at.tzinfo is None
+            or not isinstance(transport_boundary, str)
+            or not transport_boundary
+        ):
+            raise ValueError("Source Chat activation boundary is invalid")
+        return processing_started_at, transport_boundary
+
+    def source_chat_ingestion_bootstrap_required(self) -> bool:
+        """Return whether the T2 registry is still empty for initial bootstrap."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT football_runtime.read_source_chat_ingestion_bootstrap_required()
+                """
+            ).fetchone()
+        if row is None or type(row[0]) is not bool:
+            raise ValueError("Source Chat bootstrap state is invalid")
+        return row[0]
+
+    def active_source_chat_ingestion_scope(
+        self,
+    ) -> tuple[tuple[TelegramPeerIdentity, int], ...]:
+        """Read only active typed Telegram identities and generations through T2."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            rows = connection.execute(
+                """
+                SELECT peer_kind, telegram_chat_id, registry_generation
+                FROM football_runtime.read_active_source_chat_ingestion_scope()
+                """
+            ).fetchall()
+        scope: list[tuple[TelegramPeerIdentity, int]] = []
+        for row in rows:
+            generation = row["registry_generation"]
+            if type(generation) is not int or generation < 1:
+                raise ValueError("Source Chat ingestion generation is invalid")
+            scope.append(
+                (
+                    TelegramPeerIdentity(
+                        kind=TelegramPeerKind(row["peer_kind"]),
+                        telegram_id=row["telegram_chat_id"],
+                    ),
+                    generation,
+                )
+            )
+        return tuple(scope)
 
     def ensure_source_chat_history_progress(
         self,
@@ -6870,7 +7295,7 @@ class PostgresRoleStore:
     def remind_source_data_deletion_requests(
         self, *, as_of: datetime, administrator_id: int | None = None
     ) -> int:
-        """Deliver due body-free reminders without changing workflow state."""
+        """Queue due body-free reminders for Bot Assistant delivery."""
         if self._role is not RuntimeRole.APPLICATION:
             raise ConversationAccessDeniedError
         if as_of.tzinfo is None:
@@ -6907,18 +7332,17 @@ class PostgresRoleStore:
             )
             rows = result.fetchall()
             for row in rows:
-                if administrator_id is not None:
-                    _insert_outbox(
-                        connection,
-                        _source_data_deletion_reminder_envelope(
-                            request_id=row["request_id"],
-                            administrator_id=administrator_id,
-                            status=row["status"],
-                            reminder_at=as_of,
-                            deadline_at=row["deadline_at"],
-                            reminder_count=row["reminder_count"],
-                        ),
-                    )
+                _insert_outbox(
+                    connection,
+                    _source_data_deletion_reminder_envelope(
+                        request_id=row["request_id"],
+                        administrator_id=administrator_id,
+                        status=row["status"],
+                        reminder_at=as_of,
+                        deadline_at=row["deadline_at"],
+                        reminder_count=row["reminder_count"],
+                    ),
+                )
                 _record_source_data_deletion_audit(
                     connection,
                     request_id=row["request_id"],
@@ -7109,8 +7533,9 @@ class PostgresRoleStore:
         *,
         incoming: ContractEnvelope,
         received_at: datetime,
+        administrator_id: int | None = None,
     ) -> ConsumeResult:
-        """Queue one body-free reminder for the configured administrator."""
+        """Queue one reminder for the T1-configured administrator destination."""
         if self._role is not RuntimeRole.BOT_ASSISTANT:
             raise ConversationAccessDeniedError
         if incoming.contract_name is not ContractName.SOURCE_DATA_DELETION_REMINDER:
@@ -7119,7 +7544,13 @@ class PostgresRoleStore:
         if not isinstance(payload, dict):
             raise TypeError("Source Data Deletion reminder payload is invalid")
         request_id = cast(str, payload["request_id"])
-        administrator_id = cast(int, payload["telegram_admin_user_id"])
+        if type(administrator_id) is not int or administrator_id < 1:
+            raise ValueError("Source Data Deletion administrator is unavailable")
+        if (
+            incoming.contract_version == 1
+            and payload.get("telegram_admin_user_id") != administrator_id
+        ):
+            raise ValueError("Source Data Deletion administrator identity mismatch")
         reminder_count = cast(int, payload["reminder_count"])
         with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
             if not _begin_owned_contract(
@@ -11378,7 +11809,7 @@ class PostgresRoleStore:
                 """
                 SELECT command_message_id, request_message_id, telegram_user_id,
                        origin_subject_id, origin_subject_revision,
-                       registry_generation
+                       registry_generation, originating_update_id
                 FROM football_runtime.source_chat_registration_origins
                 WHERE correlation_id = %s
                 """,
@@ -11393,6 +11824,7 @@ class PostgresRoleStore:
             subject_id,
             subject_revision,
             registry_generation,
+            originating_update_id,
         ) = row
         if (
             not isinstance(command_message_id, UUID)
@@ -11406,6 +11838,13 @@ class PostgresRoleStore:
             or isinstance(telegram_user_id, bool)
             or not isinstance(registry_generation, int)
             or isinstance(registry_generation, bool)
+            or (
+                originating_update_id is not None
+                and (
+                    not isinstance(originating_update_id, str)
+                    or not originating_update_id
+                )
+            )
         ):
             raise RuntimeError("Bot registration context is invalid")
         return SourceChatRegistrationContext(
@@ -11415,6 +11854,7 @@ class PostgresRoleStore:
             origin_subject_id=subject_id,
             origin_subject_revision=subject_revision,
             registry_generation=registry_generation,
+            originating_update_id=originating_update_id,
         )
 
     def source_chat_registration_origin_for_terminal(
@@ -11429,7 +11869,8 @@ class PostgresRoleStore:
                 """
                 SELECT correlation_id, command_message_id, request_message_id,
                        telegram_user_id, origin_subject_id,
-                       origin_subject_revision, registry_generation
+                       origin_subject_revision, registry_generation,
+                       originating_update_id
                 FROM football_runtime.source_chat_registration_origins
                 """
             ).fetchall()
@@ -11444,6 +11885,7 @@ class PostgresRoleStore:
                 subject_id,
                 subject_revision,
                 registry_generation,
+                originating_update_id,
             ) = row
             if (
                 not isinstance(correlation_id, UUID)
@@ -11458,6 +11900,13 @@ class PostgresRoleStore:
                 or isinstance(telegram_user_id, bool)
                 or not isinstance(registry_generation, int)
                 or isinstance(registry_generation, bool)
+                or (
+                    originating_update_id is not None
+                    and (
+                        not isinstance(originating_update_id, str)
+                        or not originating_update_id
+                    )
+                )
             ):
                 raise RuntimeError("Bot registration context is invalid")
             resolved_message_id = derive_contract_message_id(
@@ -11486,6 +11935,7 @@ class PostgresRoleStore:
                 origin_subject_id=subject_id,
                 origin_subject_revision=subject_revision,
                 registry_generation=registry_generation,
+                originating_update_id=originating_update_id,
             )
             expected_messages = tuple(
                 derive_contract_message_id(cause, incoming.contract_name)
@@ -11512,7 +11962,7 @@ class PostgresRoleStore:
                 """
                 SELECT command_message_id, correlation_id, telegram_user_id,
                        source_chat_key, telegram_peer_kind, telegram_chat_id,
-                       registry_generation, action
+                       registry_generation, action, originating_update_id
                 FROM football_runtime.source_chat_lifecycle_origins
                 WHERE correlation_id = %s
                 """,
@@ -11529,6 +11979,7 @@ class PostgresRoleStore:
             telegram_chat_id,
             registry_generation,
             action,
+            originating_update_id,
         ) = row
         if (
             not isinstance(command_message_id, UUID)
@@ -11544,6 +11995,13 @@ class PostgresRoleStore:
             or not isinstance(registry_generation, int)
             or isinstance(registry_generation, bool)
             or action not in {item.value for item in SourceChatLifecycleAction}
+            or (
+                originating_update_id is not None
+                and (
+                    not isinstance(originating_update_id, str)
+                    or not originating_update_id
+                )
+            )
         ):
             raise RuntimeError("Bot Source Chat lifecycle context is invalid")
         return SourceChatLifecycleContext(
@@ -11557,6 +12015,7 @@ class PostgresRoleStore:
             ),
             registry_generation=registry_generation,
             action=SourceChatLifecycleAction(action),
+            originating_update_id=originating_update_id,
         )
 
     def source_chat_lifecycle_origin_for_terminal(
@@ -11573,7 +12032,7 @@ class PostgresRoleStore:
                 """
                 SELECT command_message_id, correlation_id, telegram_user_id,
                        source_chat_key, telegram_peer_kind, telegram_chat_id,
-                       registry_generation, action
+                       registry_generation, action, originating_update_id
                 FROM football_runtime.source_chat_lifecycle_origins
                 """
             ).fetchall()
@@ -11589,7 +12048,12 @@ class PostgresRoleStore:
                 telegram_chat_id,
                 registry_generation,
                 action,
+                originating_update_id,
             ) = row
+            if originating_update_id is not None and (
+                not isinstance(originating_update_id, str) or not originating_update_id
+            ):
+                raise RuntimeError("Bot Source Chat lifecycle context is invalid")
             context = SourceChatLifecycleContext(
                 correlation_id=correlation_id,
                 command_message_id=command_message_id,
@@ -11601,6 +12065,7 @@ class PostgresRoleStore:
                 ),
                 registry_generation=registry_generation,
                 action=SourceChatLifecycleAction(action),
+                originating_update_id=originating_update_id,
             )
             expected_message_id = derive_contract_message_id(
                 command_message_id,
@@ -12179,8 +12644,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -12191,6 +12656,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -12257,8 +12723,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -12269,6 +12735,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -12460,8 +12927,9 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, telegram_message_id, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, telegram_message_id,
+                    originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -12473,6 +12941,7 @@ class PostgresRoleStore:
                     message.reply_button,
                     message.reply_keyboard_action.value,
                     telegram_message_id,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -12513,7 +12982,8 @@ class PostgresRoleStore:
                        presentation.completed_search_id,
                        presentation.current_result_id,
                        presentation.absolute_position,
-                       outbox.superseded_at
+                       outbox.superseded_at,
+                       outbox.originating_update_id
                 FROM football_runtime.bot_message_outbox AS outbox
                 JOIN football_runtime.bot_search_presentations AS presentation
                   ON presentation.delivery_id = outbox.delivery_id
@@ -12558,8 +13028,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 """,
                 (
@@ -12571,6 +13041,7 @@ class PostgresRoleStore:
                     row[4],
                     row[5],
                     row[6],
+                    row[11],
                     recorded_at,
                 ),
             )
@@ -12922,8 +13393,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     assistant_message.delivery_id,
@@ -12934,6 +13405,7 @@ class PostgresRoleStore:
                     json.dumps(assistant_message.button_rows, ensure_ascii=False),
                     assistant_message.reply_button,
                     assistant_message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13068,8 +13540,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13080,6 +13552,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13097,8 +13570,9 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.source_chat_registration_origins (
                     command_message_id, correlation_id, request_message_id,
                     telegram_user_id, origin_subject_id,
-                    origin_subject_revision, registry_generation, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    origin_subject_revision, registry_generation,
+                    originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     command.message_id,
@@ -13108,6 +13582,7 @@ class PostgresRoleStore:
                     command.subject_id,
                     command.subject_revision,
                     registry_generation,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13195,8 +13670,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13207,6 +13682,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13215,8 +13691,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.source_chat_lifecycle_origins (
                     command_message_id, correlation_id, telegram_user_id,
                     source_chat_key, telegram_peer_kind, telegram_chat_id,
-                    registry_generation, action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    registry_generation, action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     command.message_id,
@@ -13227,6 +13703,7 @@ class PostgresRoleStore:
                     telegram_chat_id,
                     registry_generation,
                     action,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13308,8 +13785,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13320,6 +13797,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    update_id,
                     recorded_at,
                 ),
             )
@@ -13450,8 +13928,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13462,6 +13940,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    message.originating_update_id,
                     received_at,
                 ),
             )
@@ -13578,8 +14057,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13590,6 +14069,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    message.originating_update_id,
                     received_at,
                 ),
             )
@@ -13781,8 +14261,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13793,6 +14273,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    message.originating_update_id,
                     received_at,
                 ),
             )
@@ -13939,8 +14420,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -13951,6 +14432,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    message.originating_update_id,
                     received_at,
                 ),
             )
@@ -14832,6 +15314,7 @@ class PostgresRoleStore:
                           bot_message_outbox.button_rows,
                           bot_message_outbox.reply_button,
                           bot_message_outbox.reply_keyboard_action,
+                          bot_message_outbox.originating_update_id,
                           bot_message_outbox.telegram_message_id,
                           candidate.delivery_status AS prior_delivery_status
                 """,
@@ -14939,8 +15422,8 @@ class PostgresRoleStore:
                 INSERT INTO football_runtime.bot_message_outbox (
                     delivery_id, telegram_user_id, display_locale, screen_revision,
                     message_text, button_rows, reply_button,
-                    reply_keyboard_action, recorded_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    reply_keyboard_action, originating_update_id, recorded_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     message.delivery_id,
@@ -14951,6 +15434,7 @@ class PostgresRoleStore:
                     json.dumps(message.button_rows, ensure_ascii=False),
                     message.reply_button,
                     message.reply_keyboard_action.value,
+                    message.originating_update_id,
                     recorded_at,
                 ),
             )
@@ -15410,6 +15894,7 @@ def _telegram_message(row: dict[str, Any] | None) -> TelegramMessage | None:
         ),
         reply_button=row.get("reply_button"),
         reply_keyboard_action=ReplyKeyboardAction(row["reply_keyboard_action"]),
+        originating_update_id=row.get("originating_update_id"),
     )
 
 
@@ -18811,7 +19296,7 @@ def _record_source_data_deletion_audit(
 def _source_data_deletion_reminder_envelope(
     *,
     request_id: str,
-    administrator_id: int,
+    administrator_id: int | None,
     status: str,
     reminder_at: datetime,
     deadline_at: datetime,
@@ -18824,7 +19309,7 @@ def _source_data_deletion_reminder_envelope(
     )
     return ContractEnvelope(
         contract_name=ContractName.SOURCE_DATA_DELETION_REMINDER,
-        contract_version=1,
+        contract_version=1 if administrator_id is not None else 2,
         message_id=message_id,
         producer=RuntimeRole.APPLICATION,
         consumer=RuntimeRole.BOT_ASSISTANT,
@@ -18838,11 +19323,15 @@ def _source_data_deletion_reminder_envelope(
         recorded_at=reminder_at,
         payload={
             "request_id": request_id,
-            "telegram_admin_user_id": administrator_id,
             "status": status,
             "reminder_at": reminder_at.isoformat(),
             "deadline_at": deadline_at.isoformat(),
             "reminder_count": reminder_count,
+            **(
+                {"telegram_admin_user_id": administrator_id}
+                if administrator_id is not None
+                else {}
+            ),
         },
     )
 

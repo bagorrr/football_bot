@@ -123,16 +123,8 @@ class BotAssistantSdkSettings:
         """Parse exactly the stable T3 keys and reject broader app settings."""
         if set(projection) - T3_BOT_ASSISTANT_CONFIG_KEYS:
             raise ValueError("T3 Bot Assistant projection contains an unknown key")
-        model = _projection_string(
-            projection,
-            BOT_ASSISTANT_MODEL_KEY,
-            DEFAULT_BOT_ASSISTANT_MODEL,
-        )
-        effort = _projection_string(
-            projection,
-            BOT_ASSISTANT_REASONING_EFFORT_KEY,
-            DEFAULT_BOT_ASSISTANT_REASONING_EFFORT,
-        )
+        model = _projection_string(projection, BOT_ASSISTANT_MODEL_KEY)
+        effort = _projection_string(projection, BOT_ASSISTANT_REASONING_EFFORT_KEY)
         slot_value = _projection_string(projection, BOT_ASSISTANT_SDK_SLOTS_KEY, "1")
         if (
             not slot_value.isascii()
@@ -363,8 +355,12 @@ class CodexSdkBotAssistantAdapter(BotAssistantModelAdapter):
             self._slots.release()
 
 
-def _projection_string(projection: Mapping[str, object], key: str, default: str) -> str:
+def _projection_string(
+    projection: Mapping[str, object], key: str, default: str | None = None
+) -> str:
     if key not in projection:
+        if default is None:
+            raise ValueError(f"missing T3 Bot Assistant setting: {key}")
         return default
     value = projection[key]
     if not isinstance(value, str) or not value or value.strip() != value:

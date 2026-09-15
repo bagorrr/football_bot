@@ -779,7 +779,16 @@ class TelethonProvider:
             if isinstance(entry, SourceChatRegistryEntry):
                 generations[identity] = entry.registry_generation
             elif isinstance(entry, TelegramPeerIdentity):
-                generations[identity] = 1
+                generation = (
+                    self._source_scope_generation_lookup(identity)
+                    if self._source_scope_generation_lookup is not None
+                    else 1
+                )
+                if type(generation) is not int or generation < 1:
+                    raise TelethonConformanceError(
+                        key="APPROVED_SOURCE_CHATS", status="scope_invalid"
+                    )
+                generations[identity] = generation
             else:
                 raise TelethonConformanceError(
                     key="APPROVED_SOURCE_CHATS", status="scope_invalid"
@@ -3257,7 +3266,20 @@ class TelethonProvider:
                 try:
                     asyncio.get_running_loop()
                 except RuntimeError:
-                    result = asyncio.run(cast(Coroutine[Any, Any, Any], result))
+                    client_loop = getattr(self._client, "loop", None)
+                    if (
+                        isinstance(client_loop, asyncio.AbstractEventLoop)
+                        and client_loop.is_running()
+                    ):
+
+                        async def await_result() -> Any:
+                            return await result
+
+                        result = asyncio.run_coroutine_threadsafe(
+                            await_result(), client_loop
+                        ).result()
+                    else:
+                        result = asyncio.run(cast(Coroutine[Any, Any, Any], result))
                 else:
                     raise RuntimeError("Telethon provider cannot block a running loop")
             return result
@@ -3307,12 +3329,15 @@ class TelethonIngestionAdapter:
         live_update_callback: Callable[[TelegramPeerIdentity], None] | None = None,
         message_identity_lookup: Callable[[int], TelegramPeerIdentity | None]
         | None = None,
+        source_scope_generation_lookup: Callable[[TelegramPeerIdentity], int | None]
+        | None = None,
     ) -> TelethonIngestionAdapter:
         """Compose and verify the concrete provider at the T2 boundary."""
         scope = tuple(approved_source_chats)
         source = runtime.create_production_provider(
             approved_source_chats=scope,
             message_identity_lookup=message_identity_lookup,
+            source_scope_generation_lookup=source_scope_generation_lookup,
         )
         runtime.verify_conformance(
             transport=source,
@@ -3349,6 +3374,9 @@ class TelethonIngestionAdapter:
         self._live_update_callback = live_update_callback
         self._source_scope_generation_lookup: (
             Callable[[TelegramPeerIdentity], int | None] | None
+        ) = None
+        self._source_scope_activation_lookup: (
+            Callable[[TelegramPeerIdentity, int], tuple[datetime, str] | None] | None
         ) = None
 
     def source_event_id(self, probe_id: str) -> str:
@@ -3435,6 +3463,18 @@ class TelethonIngestionAdapter:
                 scope=IngestionFailureScope.ACCOUNT_STREAM,
             ) from None
         self._source_scope_generation_lookup = lookup
+
+    def configure_source_scope_activation_lookup(
+        self,
+        lookup: Callable[[TelegramPeerIdentity, int], tuple[datetime, str] | None],
+    ) -> None:
+        """Bind the durable current activation boundary for scope admission."""
+        self._runtime.require_ready()
+        if not callable(lookup):
+            raise TelethonConformanceError(
+                key="SOURCE_SCOPE_ACTIVATION_LOOKUP", status="scope_invalid"
+            )
+        self._source_scope_activation_lookup = lookup
 
     def configure_source_message_revision_lookup(
         self,
@@ -3530,6 +3570,17 @@ class TelethonIngestionAdapter:
             raise TelethonConformanceError(
                 key="APPROVED_SOURCE_CHATS", status="scope_invalid"
             )
+        lookup = self._source_scope_activation_lookup
+        if lookup is None:
+            raise TelethonConformanceError(
+                key="SOURCE_SCOPE_ACTIVATION_LOOKUP",
+                status="provider_boundary_unavailable",
+            )
+        if lookup(resolution.identity, registry_generation) != (
+            processing_started_at,
+            transport_boundary,
+        ):
+            return
         entry = SourceChatRegistryEntry(
             identity=resolution.identity,
             registry_generation=registry_generation,

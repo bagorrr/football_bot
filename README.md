@@ -40,6 +40,7 @@ Location Resolver, or other provider calls.
 - [Source Chat consent basis](docs/product/source-consent.md)
 - [Source Chat and data-request administration](docs/product/source-chat-administration.md)
 - [Source Author data lifecycle](docs/product/source-author-data-lifecycle.md)
+- [Six-role runtime operations](docs/operations/six-role-runtime.md)
 - [Repository structure](docs/product/repository-structure.md)
 - [Architecture decisions](docs/adr/)
 - [Agent workflow](AGENTS.md)

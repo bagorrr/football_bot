@@ -226,6 +226,42 @@ def test_reminder_contract_is_canonical_and_body_free() -> None:
     ContractEnvelope.from_raw(command)
 
 
+def test_reminder_v2_keeps_administrator_destination_out_of_application_payload() -> (
+    None
+):
+    request_id = "support-case:reminder-v2"
+    count = 2
+    message_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:source-data-deletion:reminder:{request_id}:{count}",
+    )
+    command = ContractEnvelope(
+        contract_name=ContractName.SOURCE_DATA_DELETION_REMINDER,
+        contract_version=2,
+        message_id=message_id,
+        producer=RuntimeRole.APPLICATION,
+        consumer=RuntimeRole.BOT_ASSISTANT,
+        subject_id=request_id,
+        subject_revision=count,
+        idempotency_key=f"source-data-deletion-reminder:{request_id}:{count}",
+        causation_id=message_id,
+        correlation_id=uuid5(
+            NAMESPACE_URL,
+            f"football-bot:source-deletion:{request_id}",
+        ),
+        recorded_at=datetime(2026, 9, 6, tzinfo=UTC),
+        payload={
+            "request_id": request_id,
+            "status": "pending_decision",
+            "reminder_at": "2026-09-06T00:00:00+00:00",
+            "deadline_at": "2026-09-07T00:00:00+00:00",
+            "reminder_count": count,
+        },
+    )
+
+    ContractEnvelope.from_raw(command)
+
+
 @pytest.mark.parametrize("value", (1, 7_001, 2**63 - 1))
 def test_source_author_identity_accepts_only_positive_telegram_ids(value: int) -> None:
     assert is_valid_source_author_telegram_id(value)

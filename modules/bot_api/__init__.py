@@ -2058,6 +2058,13 @@ class BotApiIngress:
         finally:
             self.store.release_poll_lease(claim_token=lease_token)
 
+    def verify_readiness(self) -> BotApiIdentity:
+        """Verify Bot API identity and the private admin destination read-only."""
+        self._ensure_ready()
+        if self._bot_identity is None:
+            raise BotApiIdentityMismatchError("authenticated bot identity unavailable")
+        return self._bot_identity
+
     def _ensure_ready(self) -> None:
         identity = self.transport.get_me()
         if (

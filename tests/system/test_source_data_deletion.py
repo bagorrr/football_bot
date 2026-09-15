@@ -1,5 +1,7 @@
 """Source Author and Source Chat deletion through the public acceptance seam."""
 
+# ruff: noqa: RUF001 -- reviewed multilingual interface copy is intentional.
+
 from __future__ import annotations
 
 import json
@@ -15,6 +17,7 @@ import pytest
 from modules.contracts import RuntimeRole
 from modules.domain import (
     ConversationStage,
+    LanguageSelection,
     SourceEventKind,
     TelegramAccountCheckpoint,
     TelegramMessage,
@@ -24,6 +27,7 @@ from modules.domain import (
 from modules.postgres_adapter import PostgresRoleStore, _scrub_source_scope_outbox
 from modules.testkit import (
     AcceptanceSpine,
+    ControlledConversationLanguageAdapter,
     ControlledLocationResolverAdapter,
     ControlledModelAdapter,
     ControlledTelegramDeliveryAdapter,
@@ -192,6 +196,311 @@ def test_source_data_deletion_ui_is_bounded_and_revision_bound() -> None:
         for event in system.source_data_audit()
     )
     assert all("source body" not in message.text for message in delivery.messages)
+
+
+class _GuardedConversationLanguageAdapter(ControlledConversationLanguageAdapter):
+    def __init__(self) -> None:
+        self.render_update_ids: list[str | None] = []
+        self.rendering_forbidden = False
+
+    def render(
+        self, locale: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
+        if self.rendering_forbidden:
+            raise AssertionError(
+                "fixed administration/deletion presentation rendered dynamic language"
+            )
+        self.render_update_ids.append(update_id)
+        return super().render(locale, update_id=update_id)
+
+
+@pytest.mark.parametrize(
+    (
+        "locale",
+        "language_text",
+        "review_heading",
+        "review_explanation",
+        "intake_prompt",
+        "reject_prompt",
+        "completion_prompt",
+    ),
+    (
+        pytest.param(
+            "en",
+            None,
+            "🛡️ **Review Source Data Deletion target**",
+            "This starts request-scoped suppression and deletion. Confirm explicitly.",
+            "Enter exactly request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Do not include a body.",
+            "Enter one bounded rejection reason without whitespace.",
+            "Enter body-free completion proof pointer for outcome completed.",
+        ),
+        pytest.param(
+            "ru",
+            None,
+            "🛡️ **Проверка цели удаления Source Data**",
+            "Эта операция запускает подавление и удаление в рамках запроса. "
+            "Явно подтвердите действие.",
+            "Введите ровно request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Не включайте тело данных.",
+            "Введите одну ограниченную причину отклонения без пробелов.",
+            "Введите указатель на подтверждение выполнения без тела для результата "
+            "completed.",
+        ),
+        pytest.param(
+            "es",
+            None,
+            "🛡️ **Revisar el objetivo de eliminación de Source Data**",
+            "Esta operación inicia la supresión y eliminación limitada a la solicitud. "
+            "Confirme explícitamente.",
+            "Introduzca exactamente request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "No incluya ningún cuerpo.",
+            "Introduzca un motivo de rechazo acotado, sin espacios.",
+            "Introduzca el puntero de prueba de finalización sin cuerpo para el "
+            "resultado completed.",
+        ),
+        pytest.param(
+            "fr",
+            None,
+            "🛡️ **Vérifier la cible de suppression de Source Data**",
+            "Cette opération lance la suppression et l’effacement "
+            "limités à la demande. "
+            "Confirmez explicitement.",
+            "Entrez exactement request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "N’incluez aucun corps.",
+            "Entrez un motif de rejet délimité, sans espace.",
+            "Entrez le pointeur de preuve d’achèvement sans corps pour le résultat "
+            "completed.",
+        ),
+        pytest.param(
+            "de",
+            "Deutsch",
+            "🛡️ **Review Source Data Deletion target**",
+            "This starts request-scoped suppression and deletion. Confirm explicitly.",
+            "Enter exactly request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Do not include a body.",
+            "Enter one bounded rejection reason without whitespace.",
+            "Enter body-free completion proof pointer for outcome completed.",
+        ),
+    ),
+)
+def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
+    locale: str,
+    language_text: str | None,
+    review_heading: str,
+    review_explanation: str,
+    intake_prompt: str,
+    reject_prompt: str,
+    completion_prompt: str,
+) -> None:
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    administrator_id = 46_804
+    delivery = ControlledTelegramDeliveryAdapter()
+    language_adapter = _GuardedConversationLanguageAdapter()
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=ControlledTelegramIngestionAdapter(),
+        telegram_delivery=delivery,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        conversation_language=language_adapter,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id=f"start:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    if language_text is None:
+        system.select_fixed_language(
+            update_id=f"language:fixed-deletion:{locale}",
+            telegram_user_id=administrator_id,
+            locale=locale,
+        )
+    else:
+        system.open_language_input(
+            update_id=f"language-input:fixed-deletion:{locale}",
+            telegram_user_id=administrator_id,
+        )
+        system.submit_language_text(
+            update_id=f"language:fixed-deletion:{locale}",
+            telegram_user_id=administrator_id,
+            text=language_text,
+        )
+    clock.advance_to(datetime(2026, 9, 1, 12, 0, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id=f"menu:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id=f"settings:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    settings = delivery.messages[-1]
+    assert settings.display_locale == locale
+    if locale == "de":
+        assert "Verwaltung" in tuple(
+            button[0] for row in settings.button_rows for button in row
+        )
+    render_count_before_fixed_screens = len(language_adapter.render_update_ids)
+    language_adapter.rendering_forbidden = True
+
+    system.select_settings_action(
+        update_id=f"administration:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    administration = delivery.messages[-1]
+    assert administration.display_locale == locale
+    assert (
+        administration.text
+        == {
+            "en": "⚙️ **Administration**",
+            "ru": "⚙️ **Администрирование**",
+            "es": "⚙️ **Administración**",
+            "fr": "⚙️ **Administration**",
+            "de": "⚙️ **Administration**",
+        }[locale]
+    )
+    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+
+    system.select_administration_action(
+        update_id=f"source-data-deletion:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action="source-data-deletion",
+    )
+    deletion = delivery.messages[-1]
+    assert deletion.display_locale == locale
+    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+
+    pending = system.create_source_data_deletion_request(
+        request_id=f"deletion-request:pending:{locale}",
+        source_author_telegram_id=78_904,
+        source_chat_key="source-chat:chat:4680404",
+        support_case_pointer=f"support-case:pending:{locale}",
+    )
+    approved = system.create_source_data_deletion_request(
+        request_id=f"deletion-request:approved:{locale}",
+        source_author_telegram_id=78_905,
+        source_chat_key="source-chat:channel:4680405",
+        support_case_pointer=f"support-case:approved:{locale}",
+    )
+    assert system.decide_source_data_deletion_request(
+        request_id=approved.request_id,
+        decision="approve",
+        decision_reason=None,
+        decided_by=administrator_id,
+    )
+    approved = next(
+        request
+        for request in system.source_data_deletion_requests()
+        if request.request_id == approved.request_id
+    )
+
+    system.select_source_data_deletion_action(
+        update_id=f"intake:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action=_callback(deletion, "sdd:intake:"),
+    )
+    assert delivery.messages[-1].text == intake_prompt
+    intake = delivery.messages[-1]
+    system.go_back(
+        update_id=f"intake-back:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        screen_revision=intake.screen_revision,
+    )
+
+    deletion = delivery.messages[-1]
+    system.select_source_data_deletion_action(
+        update_id=f"reject:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action=_callback(deletion, "sdd:reject:"),
+    )
+    assert delivery.messages[-1].text == (
+        f"request={pending.request_id}\n\n{reject_prompt}"
+    )
+    reject_input = delivery.messages[-1]
+    system.go_back(
+        update_id=f"reject-back:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        screen_revision=reject_input.screen_revision,
+    )
+
+    deletion = delivery.messages[-1]
+    system.select_source_data_deletion_action(
+        update_id=f"review:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action=_callback(deletion, "sdd:review:"),
+    )
+    review = delivery.messages[-1]
+    assert review.text == (
+        f"{review_heading}\n\n"
+        f"request={approved.request_id}\n"
+        f"source_author={approved.source_author_telegram_id}\n"
+        f"source_chat={approved.source_chat_key}\n"
+        f"support_case={approved.support_case_pointer}\n"
+        f"status={approved.status.value}\n\n"
+        f"{review_explanation}"
+    )
+
+    assert system.begin_source_data_deletion_request(
+        request_id=approved.request_id,
+        effective_at=clock.now(),
+    )
+    system.process_source_data_deletion_until_idle()
+    approved_after_start = next(
+        request
+        for request in system.source_data_deletion_requests()
+        if request.request_id == approved.request_id
+    )
+    assert approved_after_start.status.value == "awaiting_completion"
+    assert system.record_source_data_deletion_notification(
+        request_id=approved.request_id,
+        notified_at=clock.now(),
+    )
+    system.go_back(
+        update_id=f"completion-back:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        screen_revision=review.screen_revision,
+    )
+    deletion = delivery.messages[-1]
+    system.select_source_data_deletion_action(
+        update_id=f"completion:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action=_callback(deletion, "sdd:complete:"),
+    )
+    completion_input = delivery.messages[-1]
+    assert completion_input.text == (
+        f"request={approved.request_id}\n\n{completion_prompt}"
+    )
+    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+    assert system._conversation_onboarding().handle_message(
+        update_id=f"completion-submit:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        text=f"support-proof:{locale}",
+        telegram_language_hint=None,
+    )
+    assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert (
+        next(
+            request
+            for request in system.source_data_deletion_requests()
+            if request.request_id == approved.request_id
+        ).status.value
+        == "completed"
+    )
+    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+    system.reset()
+    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
 
 
 def test_source_data_deletion_captures_pending_and_racing_ingestion() -> None:
@@ -1124,6 +1433,38 @@ def test_source_data_deletion_reminder_delivery_and_failure_rearm(
     assert failed.next_reminder_at == clock.now()
 
 
+def test_source_data_deletion_reminder_uses_bot_assistant_identity_only() -> None:
+    clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
+    administrator_id = 46_805
+    delivery = ControlledTelegramDeliveryAdapter()
+    system = _new_system(
+        clock=clock,
+        administrator_id=administrator_id,
+        telegram_delivery=delivery,
+        application_uses_admin_config=False,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id="isolated-reminder:start",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    request = system.create_source_data_deletion_request(
+        request_id="deletion-request:isolated-reminder",
+        source_author_telegram_id=78_906,
+        source_chat_key="source-chat:chat:4680106",
+        support_case_pointer="support-case:isolated-reminder",
+    )
+    assert request.next_reminder_at is not None
+    clock.advance_to(request.next_reminder_at)
+
+    assert system.remind_source_data_deletion_requests() == 1
+    assert system.process_next_contract_handoff(RuntimeRole.BOT_ASSISTANT)
+    assert system.deliver_next_bot_message()
+
+    assert delivery.messages[-1].telegram_user_id == administrator_id
+
+
 def test_bot_source_data_cleanup_removes_result_context_and_retained_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1570,6 +1911,7 @@ def _new_system(
     administrator_id: int,
     telegram_ingestion: ControlledTelegramIngestionAdapter | None = None,
     telegram_delivery: ControlledTelegramDeliveryAdapter | None = None,
+    application_uses_admin_config: bool = True,
 ) -> AcceptanceSpine:
     return boot_legacy_acceptance_spine(
         admin_database_url=os.environ["TEST_DATABASE_URL"],
@@ -1579,6 +1921,14 @@ def _new_system(
         model=ControlledModelAdapter(),
         location_resolver=ControlledLocationResolverAdapter(),
         telegram_admin_user_id=administrator_id,
+        telegram_admin_user_ids=(
+            {
+                RuntimeRole.APPLICATION: None,
+                RuntimeRole.BOT_ASSISTANT: administrator_id,
+            }
+            if not application_uses_admin_config
+            else None
+        ),
     )
 
 

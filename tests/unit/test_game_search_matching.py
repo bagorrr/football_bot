@@ -446,6 +446,7 @@ def test_same_type_place_ids_need_resolver_backed_disjointness() -> None:
         "neighborhood",
         "locality",
         "landmark",
+        "street",
         "address",
     ):
         selected_id = f"{geographic_type}:selected"

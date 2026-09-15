@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from modules.application import _refereeing_result_message
+from modules.application import _refereeing_result_message, _render_result_presentation
 from modules.domain import SearchResult
 from modules.postgres_adapter import _result_card_facts_with_current_publication_state
 
@@ -94,6 +94,62 @@ def test_referee_result_card_uses_fixed_fields_and_excludes_non_selectable_facts
     assert "Venue" not in message.text
     assert "surface" not in message.text.lower()
     assert "Contact: @referee_contact" in message.text
+
+
+def test_geonames_attribution_is_visible_in_final_result_presentation() -> None:
+    result = _result()
+    facts = dict(result.card_facts)
+    facts["city_id"] = "geonames:200"
+    facts["place_id"] = "geonames:300"
+    result = SearchResult(
+        result_id=result.result_id,
+        completed_search_id=result.completed_search_id,
+        absolute_position=result.absolute_position,
+        result_class=result.result_class,
+        card_facts=tuple(sorted(facts.items())),
+    )
+
+    message = _render_result_presentation(
+        delivery_id="delivery:referee-geonames",
+        telegram_user_id=49_100,
+        locale="en",
+        screen_revision=2,
+        result=result,
+        result_count=1,
+        context_token="context:referee-geonames",
+    )
+
+    assert message.text.endswith("© GeoNames — https://www.geonames.org/")
+
+
+def test_locationiq_address_attribution_is_visible_in_final_result_presentation() -> (
+    None
+):
+    result = _result()
+    facts = dict(result.card_facts)
+    facts["city_id"] = "geonames:200"
+    facts["place_id"] = "osm:way:12345"
+    result = SearchResult(
+        result_id=result.result_id,
+        completed_search_id=result.completed_search_id,
+        absolute_position=result.absolute_position,
+        result_class=result.result_class,
+        card_facts=tuple(sorted(facts.items())),
+    )
+
+    message = _render_result_presentation(
+        delivery_id="delivery:referee-address",
+        telegram_user_id=49_100,
+        locale="en",
+        screen_revision=2,
+        result=result,
+        result_count=1,
+        context_token="context:referee-address",
+    )
+
+    assert "Search by LocationIQ.com" in message.text
+    assert "© OpenStreetMap contributors" in message.text
+    assert message.text.endswith("https://www.openstreetmap.org/copyright")
 
 
 def test_standing_referee_availability_card_explains_unknown_date() -> None:

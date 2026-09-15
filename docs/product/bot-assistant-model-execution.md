@@ -3,8 +3,11 @@
 Status: Confirmed MVP baseline on 2026-08-01. The originating Wayfinder
 decision is
 [Define Bot Assistant model execution and conversation boundaries](https://github.com/bagorrr/football_bot/issues/35).
-The durable architectural boundary is recorded in
-[ADR 0009](../adr/0009-keep-bot-assistant-execution-direct-and-application-authoritative.md).
+ADR 0009 records the direct-execution, no-durable-queue, and application-authority
+boundaries. The current T3 Python SDK implementation and model policy are
+specified by [Ticket #102](https://github.com/bagorrr/football_bot/issues/102);
+the six-role/five-service topology is confirmed by the
+[2026-09-14 owner amendment](https://github.com/bagorrr/football_bot/issues/99#issuecomment-5664415306).
 
 Free-form response style is canonical in
 [`bot-assistant-conversation-style.md`](bot-assistant-conversation-style.md).
@@ -146,8 +149,9 @@ cost, latency, retention, and failure behavior.
 ## Direct execution and adapters
 
 Bot Assistant model work uses the direct request path inside the Bot Assistant
-runtime boundary. Do not add a conversation worker or durable model queue for
-the MVP:
+runtime boundary. Do not add a persistent conversation worker or durable model
+queue for the MVP. T3 is a synchronous one-shot child process, not a separate
+service:
 
 1. Deduplicate the incoming Telegram update and establish one Turn ID.
 2. Read the current application state and assemble the permitted input bundle.
@@ -156,39 +160,59 @@ the MVP:
    action.
 5. Apply one accepted action idempotently and render the final reply.
 
-Free-form replies use `gpt-5.6-sol` with reasoning effort `high`. Runtime
-configuration sets both values explicitly and records the requested and
-effective values. There is no fallback model.
+Free-form replies use `gpt-5.6-luna` with reasoning effort `high`, as specified
+by #102. Runtime configuration sets both values explicitly and records the
+requested and effective values. Unsupported or unvalidated policy fails closed;
+there is no fallback model.
 
-The test-MVP adapter runs one isolated `codex exec --ephemeral` process per
-turn using the dedicated ChatGPT-authenticated service identity. It uses a
-minimal empty workspace, ignores personal configuration and rules, exposes no
-web search or other tools, and receives no repository, database credential,
-Telegram credential, application secret, or deployment secret. The final
-response uses a versioned structured envelope containing the free-form reply
-and at most one proposed application action.
+For each permitted semantic or free-form turn, the current test-MVP adapter
+starts a fresh, isolated Python Codex SDK worker process under Bot Assistant.
+It authenticates through its dedicated ChatGPT-subscription `CODEX_HOME`, not an
+OpenAI Platform API key. The worker receives one versioned envelope, an explicit
+T3 configuration projection, and a sanitized environment; it uses an empty
+temporary workspace and an ephemeral SDK thread, then returns one bounded
+versioned success or failure envelope and exits. A permitted retry starts a
+new one-shot worker process. No SDK process or provider conversation state
+persists between attempts or turns.
+
+The worker ignores personal Codex configuration and rules, exposes no web
+search or other tools, and receives no repository, database credential,
+Telegram credential, application secret, or deployment secret. The application
+validates the complete response before applying at most one proposed action.
+It remains authoritative for all state and effects.
 
 The invocation explicitly sets the model and reasoning effort, uses the
 versioned output schema, applies read-only sandboxing, and sets Codex web search
 to `disabled`; it never inherits the default cached-search setting or an
 operator's tool configuration.
 
-The production-oriented adapter is a direct Responses API request using a
-project service credential, `store=false`, the same explicit model policy, and
-the same versioned response contract. Adapter migration must preserve the
+A separately approved future production adapter may use a direct Responses API
+request with a project service credential, `store=false`, the explicit
+application model policy, and the same versioned response contract. This is not
+the current #102 implementation. Any adapter migration must preserve the
 authority, context, privacy, reliability, and evaluation boundaries in this
 document. Provider-side conversation state is not the system of record.
 
 ## Deadline, retry, and unavailable behavior
 
 One Bot User turn has a 60-second wall-clock budget covering input assembly,
-model execution, validation, and final response preparation.
+SDK-slot waiting, all model execution attempts (including any allowed retry),
+response validation, and final response preparation.
 
 Allow at most one automatic retry after a quick technical failure, such as a
 connection failure, transient provider error, or early process failure, and
-only while the same 60-second budget remains. Do not retry a timeout. Do not
-switch models. An invalid final response, exhausted budget, unavailable model,
-or validation failure is terminal for that turn.
+only while the same 60-second budget remains. The retry launches a fresh
+one-shot worker with the same model, reasoning effort, provider, and remaining
+deadline. Do not retry a timeout, authentication, quota, subscription-renewal,
+malformed-output, or configuration failure. Do not switch models. An invalid
+final response, exhausted budget, unavailable model, or validation failure is
+terminal for that turn.
+
+The Bot Assistant service owns worker lifetime. Deadline expiry terminates the
+worker process group; stopping or restarting the service also stops its child
+worker. No partial or late result can be accepted after cancellation, crash, or
+restart; the existing #67 state-preserving failure and idempotency behavior
+applies.
 
 On terminal failure:
 

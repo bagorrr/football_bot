@@ -306,6 +306,7 @@ def test_long_term_transfer_direction_persists_and_matches_only_its_target(
         telegram_user_id=bot_user_id,
         text="from 1 September",
     )
+    assert date_interpretation.queries[-1].update_id == f"start-date-value:{direction}"
     draft = system.discovery_draft(bot_user_id)
     assert draft is not None
     assert draft.transfer_search_detail_draft == ("start_local_date:2026-09-01",)

@@ -233,6 +233,84 @@ def test_natural_language_whole_city_scope_completes_the_search_area() -> None:
     )
 
 
+def test_verified_address_timezone_survives_search_area_persistence() -> None:
+    telegram_delivery = ControlledTelegramDeliveryAdapter()
+    resolver = ControlledLocationResolverAdapter()
+    resolver.return_for(
+        stage=ConversationStage.SEARCH_AREA,
+        text="221B Baker Street",
+        resolution=LocationResolution(
+            interpretations=(
+                LocationInterpretation(
+                    glossary_version="controlled-glossary-v1",
+                    places=(
+                        LocationCandidate(
+                            place_id="osm:way:12345",
+                            display_name="221B Baker Street, Saint Petersburg",
+                            geographic_type=GeographicType.ADDRESS,
+                            country_id="country:ru",
+                            city_id="city:ru:saint-petersburg",
+                            verified_parent_ids=(
+                                "city:ru:saint-petersburg",
+                                "country:ru",
+                            ),
+                            parent_display_names=("Saint Petersburg", "Russia"),
+                            iana_timezone="Europe/Moscow",
+                            resolver_version="locationiq-osm-v1",
+                            glossary_version="controlled-glossary-v1",
+                            localized_display_names=_all_locale_labels(
+                                "221B Baker Street, Saint Petersburg"
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=FrozenClock(datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
+        telegram_delivery=telegram_delivery,
+        location_resolver=resolver,
+    )
+    system.reset()
+    user_id = 42_006
+    system.start_bot_user(
+        update_id="start-address-timezone",
+        telegram_user_id=user_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="select-address-timezone-language",
+        telegram_user_id=user_id,
+        locale="en",
+    )
+    system.select_direction(
+        update_id="select-address-timezone-intent",
+        telegram_user_id=user_id,
+        direction="game_search",
+    )
+    system.submit_location_text(
+        update_id="resolve-address-timezone-country",
+        telegram_user_id=user_id,
+        text="Russia",
+    )
+    system.submit_location_text(
+        update_id="resolve-address-timezone-city",
+        telegram_user_id=user_id,
+        text="Saint Petersburg",
+    )
+    system.submit_location_text(
+        update_id="resolve-address-timezone-area",
+        telegram_user_id=user_id,
+        text="221B Baker Street",
+    )
+
+    draft = system.discovery_draft(user_id)
+    assert len(draft.sub_city_areas) == 1
+    assert draft.sub_city_areas[0].iana_timezone == "Europe/Moscow"
+
+
 def test_one_answer_accepts_several_typed_areas_with_verified_hierarchy() -> None:
     telegram_delivery = ControlledTelegramDeliveryAdapter()
     system = boot_legacy_acceptance_spine(

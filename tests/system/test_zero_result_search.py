@@ -126,6 +126,7 @@ def test_successful_zero_result_search_closes_the_draft_and_restores_menu() -> N
     assert context.absolute_position is None
 
     result_message = telegram.messages[-1]
+    assert result_message.originating_update_id == "submit-zero-result-search"
     assert result_message.text == (
         "🔎 **No matches found**\n\n"
         "No suitable options match your current criteria.\n"
