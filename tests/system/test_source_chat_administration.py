@@ -1,5 +1,7 @@
 """Source Chat administration behavior at the approved PostgreSQL-backed seam."""
 
+# ruff: noqa: RUF001 -- reviewed multilingual interface copy is intentional.
+
 from __future__ import annotations
 
 import os
@@ -8,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import psycopg
 import pytest
@@ -3938,6 +3940,168 @@ def test_source_chat_lifecycle_requires_confirmation_and_remove_is_one_way() -> 
     system.process_source_chat_registrations_until_idle()
     assert system.source_chats() == (removed,)
     assert "Source Chat re-enable complete: removed." in telegram.messages[-1].text
+    system.reset()
+
+
+@pytest.mark.parametrize(
+    ("locale", "language_text", "expected_failure"),
+    (
+        pytest.param(
+            "en",
+            None,
+            "Source Chat pause failed. Please try again.",
+        ),
+        pytest.param(
+            "ru",
+            None,
+            "Не удалось выполнить действие «приостановить» для Source Chat. "
+            "Попробуйте ещё раз.",
+        ),
+        pytest.param(
+            "es",
+            None,
+            "No se pudo completar la acción pausar del Source Chat. "
+            "Inténtelo de nuevo.",
+        ),
+        pytest.param(
+            "fr",
+            None,
+            "Impossible de terminer l’action « mettre en pause » du Source Chat. "
+            "Réessayez.",
+        ),
+        pytest.param(
+            "de",
+            "Deutsch",
+            "Source Chat pause failed. Please try again.",
+        ),
+    ),
+)
+def test_malformed_source_chat_lifecycle_terminal_uses_fixed_localized_copy(
+    locale: str,
+    language_text: str | None,
+    expected_failure: str,
+) -> None:
+    telegram = ControlledTelegramDeliveryAdapter()
+    telethon = ControlledTelegramIngestionAdapter()
+    language_adapter = _CountingConversationLanguageAdapter()
+    clock = FrozenClock(datetime(2026, 8, 20, 10, 0, tzinfo=UTC))
+    administrator_id = 46_510
+    identity = TelegramPeerIdentity(
+        kind=TelegramPeerKind.CHANNEL,
+        telegram_id=4_651_000,
+    )
+    address = f"@synthetic_malformed_lifecycle_{locale}"
+    telethon.allow_public_username(
+        address=address,
+        identity=identity,
+        transport_boundary="channel-pts:6510",
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        conversation_language=language_adapter,
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+    system.start_bot_user(
+        update_id=f"start:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    if language_text is None:
+        system.select_fixed_language(
+            update_id=f"language:malformed-lifecycle:{locale}",
+            telegram_user_id=administrator_id,
+            locale=locale,
+        )
+    else:
+        system.open_language_input(
+            update_id=f"language-input:malformed-lifecycle:{locale}",
+            telegram_user_id=administrator_id,
+        )
+        system.submit_language_text(
+            update_id=f"language:malformed-lifecycle:{locale}",
+            telegram_user_id=administrator_id,
+            text=language_text,
+        )
+    clock.advance_to(datetime(2026, 9, 20, 10, 0, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id=f"menu:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id=f"settings:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id=f"administration:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id=f"source-chats:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    system.select_source_chats_action(
+        update_id=f"add:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="add",
+    )
+    system.submit_source_chat_address(
+        update_id=f"address:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        address=address,
+    )
+    system.process_source_chat_registrations_until_idle()
+
+    render_count_before_lifecycle_terminal = len(language_adapter.render_update_ids)
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id=f"pause-request:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="pause",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id=f"pause-confirm:malformed-lifecycle:{locale}",
+        telegram_user_id=administrator_id,
+        action="pause",
+        confirm=True,
+    )
+    confirm_update_id = f"pause-confirm:malformed-lifecycle:{locale}"
+    assert system.process_next_source_chat_change_request()
+    lifecycle_correlation_id = uuid5(
+        NAMESPACE_URL,
+        f"football-bot:{confirm_update_id}:"
+        f"{ContractName.CHANGE_SOURCE_CHAT_REGISTRY.value}:pause",
+    )
+    malformed = system._observer.invalidate_source_chat_contract(
+        lifecycle_correlation_id,
+        contract_name=ContractName.SOURCE_CHAT_GENERATION_CHANGED,
+        payload_updates={"unknown_fact": "must-not-reach-fixed-copy"},
+    )
+
+    assert system.process_next_source_chat_bot_result()
+    message = telegram.messages[-1]
+    assert message.display_locale == locale
+    assert message.text.startswith(expected_failure)
+    assert message.originating_update_id == confirm_update_id
+    assert system.operator_alert(malformed.message_id).failure_code is (
+        FailureCode.INVALID_CONTRACT
+    )
+    assert (
+        len(language_adapter.render_update_ids)
+        == render_count_before_lifecycle_terminal
+    )
     system.reset()
 
 

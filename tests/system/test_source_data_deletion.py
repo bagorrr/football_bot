@@ -1,5 +1,7 @@
 """Source Author and Source Chat deletion through the public acceptance seam."""
 
+# ruff: noqa: RUF001 -- reviewed multilingual interface copy is intentional.
+
 from __future__ import annotations
 
 import json
@@ -212,7 +214,90 @@ class _GuardedConversationLanguageAdapter(ControlledConversationLanguageAdapter)
         return super().render(locale, update_id=update_id)
 
 
-def test_deletion_screen_uses_fixed_copy_for_unsupported_language() -> None:
+@pytest.mark.parametrize(
+    (
+        "locale",
+        "language_text",
+        "review_heading",
+        "review_explanation",
+        "intake_prompt",
+        "reject_prompt",
+        "completion_prompt",
+    ),
+    (
+        pytest.param(
+            "en",
+            None,
+            "🛡️ **Review Source Data Deletion target**",
+            "This starts request-scoped suppression and deletion. Confirm explicitly.",
+            "Enter exactly request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Do not include a body.",
+            "Enter one bounded rejection reason without whitespace.",
+            "Enter body-free completion proof pointer for outcome completed.",
+        ),
+        pytest.param(
+            "ru",
+            None,
+            "🛡️ **Проверка цели удаления Source Data**",
+            "Эта операция запускает подавление и удаление в рамках запроса. "
+            "Явно подтвердите действие.",
+            "Введите ровно request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Не включайте тело данных.",
+            "Введите одну ограниченную причину отклонения без пробелов.",
+            "Введите указатель на подтверждение выполнения без тела для результата "
+            "completed.",
+        ),
+        pytest.param(
+            "es",
+            None,
+            "🛡️ **Revisar el objetivo de eliminación de Source Data**",
+            "Esta operación inicia la supresión y eliminación limitada a la solicitud. "
+            "Confirme explícitamente.",
+            "Introduzca exactamente request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "No incluya ningún cuerpo.",
+            "Introduzca un motivo de rechazo acotado, sin espacios.",
+            "Introduzca el puntero de prueba de finalización sin cuerpo para el "
+            "resultado completed.",
+        ),
+        pytest.param(
+            "fr",
+            None,
+            "🛡️ **Vérifier la cible de suppression de Source Data**",
+            "Cette opération lance la suppression et l’effacement "
+            "limités à la demande. "
+            "Confirmez explicitement.",
+            "Entrez exactement request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "N’incluez aucun corps.",
+            "Entrez un motif de rejet délimité, sans espace.",
+            "Entrez le pointeur de preuve d’achèvement sans corps pour le résultat "
+            "completed.",
+        ),
+        pytest.param(
+            "de",
+            "Deutsch",
+            "🛡️ **Review Source Data Deletion target**",
+            "This starts request-scoped suppression and deletion. Confirm explicitly.",
+            "Enter exactly request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Do not include a body.",
+            "Enter one bounded rejection reason without whitespace.",
+            "Enter body-free completion proof pointer for outcome completed.",
+        ),
+    ),
+)
+def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
+    locale: str,
+    language_text: str | None,
+    review_heading: str,
+    review_explanation: str,
+    intake_prompt: str,
+    reject_prompt: str,
+    completion_prompt: str,
+) -> None:
     clock = FrozenClock(datetime(2026, 8, 1, 12, 0, tzinfo=UTC))
     administrator_id = 46_804
     delivery = ControlledTelegramDeliveryAdapter()
@@ -229,60 +314,192 @@ def test_deletion_screen_uses_fixed_copy_for_unsupported_language() -> None:
     )
     system.reset()
     system.start_bot_user(
-        update_id="start:german-deletion",
+        update_id=f"start:fixed-deletion:{locale}",
         telegram_user_id=administrator_id,
         telegram_language_hint="en",
     )
-    system.open_language_input(
-        update_id="language-input:german-deletion",
-        telegram_user_id=administrator_id,
-    )
-    system.submit_language_text(
-        update_id="language:german-deletion",
-        telegram_user_id=administrator_id,
-        text="Deutsch",
-    )
+    if language_text is None:
+        system.select_fixed_language(
+            update_id=f"language:fixed-deletion:{locale}",
+            telegram_user_id=administrator_id,
+            locale=locale,
+        )
+    else:
+        system.open_language_input(
+            update_id=f"language-input:fixed-deletion:{locale}",
+            telegram_user_id=administrator_id,
+        )
+        system.submit_language_text(
+            update_id=f"language:fixed-deletion:{locale}",
+            telegram_user_id=administrator_id,
+            text=language_text,
+        )
     clock.advance_to(datetime(2026, 9, 1, 12, 0, tzinfo=UTC))
     system.expire_inactive_discovery_drafts()
     system.open_main_menu(
-        update_id="menu:german-deletion",
+        update_id=f"menu:fixed-deletion:{locale}",
         telegram_user_id=administrator_id,
     )
     system.select_main_menu_action(
-        update_id="settings:german-deletion",
+        update_id=f"settings:fixed-deletion:{locale}",
         telegram_user_id=administrator_id,
         action="settings",
     )
     settings = delivery.messages[-1]
-    assert settings.display_locale == "de"
-    assert "Verwaltung" in tuple(
-        button[0] for row in settings.button_rows for button in row
-    )
+    assert settings.display_locale == locale
+    if locale == "de":
+        assert "Verwaltung" in tuple(
+            button[0] for row in settings.button_rows for button in row
+        )
     render_count_before_fixed_screens = len(language_adapter.render_update_ids)
     language_adapter.rendering_forbidden = True
 
     system.select_settings_action(
-        update_id="administration:german-deletion",
+        update_id=f"administration:fixed-deletion:{locale}",
         telegram_user_id=administrator_id,
         action="administration",
     )
     administration = delivery.messages[-1]
-    assert administration.display_locale == "de"
-    assert administration.text == "⚙️ **Administration**"
+    assert administration.display_locale == locale
+    assert (
+        administration.text
+        == {
+            "en": "⚙️ **Administration**",
+            "ru": "⚙️ **Администрирование**",
+            "es": "⚙️ **Administración**",
+            "fr": "⚙️ **Administration**",
+            "de": "⚙️ **Administration**",
+        }[locale]
+    )
     assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
 
     system.select_administration_action(
-        update_id="source-data-deletion:german-deletion",
+        update_id=f"source-data-deletion:fixed-deletion:{locale}",
         telegram_user_id=administrator_id,
         action="source-data-deletion",
     )
     deletion = delivery.messages[-1]
-    assert deletion.display_locale == "de"
-    assert deletion.text == (
-        "🗑️ **Source Data Deletion Requests**\n\n"
-        "Exact Source Author and Source Chat requests. The view is body-free."
+    assert deletion.display_locale == locale
+    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+
+    pending = system.create_source_data_deletion_request(
+        request_id=f"deletion-request:pending:{locale}",
+        source_author_telegram_id=78_904,
+        source_chat_key="source-chat:chat:4680404",
+        support_case_pointer=f"support-case:pending:{locale}",
     )
-    assert deletion.button_rows[0][0][0] == "Add Request"
+    approved = system.create_source_data_deletion_request(
+        request_id=f"deletion-request:approved:{locale}",
+        source_author_telegram_id=78_905,
+        source_chat_key="source-chat:channel:4680405",
+        support_case_pointer=f"support-case:approved:{locale}",
+    )
+    assert system.decide_source_data_deletion_request(
+        request_id=approved.request_id,
+        decision="approve",
+        decision_reason=None,
+        decided_by=administrator_id,
+    )
+    approved = next(
+        request
+        for request in system.source_data_deletion_requests()
+        if request.request_id == approved.request_id
+    )
+
+    system.select_source_data_deletion_action(
+        update_id=f"intake:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action=_callback(deletion, "sdd:intake:"),
+    )
+    assert delivery.messages[-1].text == intake_prompt
+    intake = delivery.messages[-1]
+    system.go_back(
+        update_id=f"intake-back:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        screen_revision=intake.screen_revision,
+    )
+
+    deletion = delivery.messages[-1]
+    system.select_source_data_deletion_action(
+        update_id=f"reject:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action=_callback(deletion, "sdd:reject:"),
+    )
+    assert delivery.messages[-1].text == (
+        f"request={pending.request_id}\n\n{reject_prompt}"
+    )
+    reject_input = delivery.messages[-1]
+    system.go_back(
+        update_id=f"reject-back:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        screen_revision=reject_input.screen_revision,
+    )
+
+    deletion = delivery.messages[-1]
+    system.select_source_data_deletion_action(
+        update_id=f"review:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action=_callback(deletion, "sdd:review:"),
+    )
+    review = delivery.messages[-1]
+    assert review.text == (
+        f"{review_heading}\n\n"
+        f"request={approved.request_id}\n"
+        f"source_author={approved.source_author_telegram_id}\n"
+        f"source_chat={approved.source_chat_key}\n"
+        f"support_case={approved.support_case_pointer}\n"
+        f"status={approved.status.value}\n\n"
+        f"{review_explanation}"
+    )
+
+    assert system.begin_source_data_deletion_request(
+        request_id=approved.request_id,
+        effective_at=clock.now(),
+    )
+    system.process_source_data_deletion_until_idle()
+    approved_after_start = next(
+        request
+        for request in system.source_data_deletion_requests()
+        if request.request_id == approved.request_id
+    )
+    assert approved_after_start.status.value == "awaiting_completion"
+    assert system.record_source_data_deletion_notification(
+        request_id=approved.request_id,
+        notified_at=clock.now(),
+    )
+    system.go_back(
+        update_id=f"completion-back:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        screen_revision=review.screen_revision,
+    )
+    deletion = delivery.messages[-1]
+    system.select_source_data_deletion_action(
+        update_id=f"completion:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        action=_callback(deletion, "sdd:complete:"),
+    )
+    completion_input = delivery.messages[-1]
+    assert completion_input.text == (
+        f"request={approved.request_id}\n\n{completion_prompt}"
+    )
+    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+    assert system._conversation_onboarding().handle_message(
+        update_id=f"completion-submit:fixed-deletion:{locale}",
+        telegram_user_id=administrator_id,
+        text=f"support-proof:{locale}",
+        telegram_language_hint=None,
+    )
+    assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+    assert (
+        next(
+            request
+            for request in system.source_data_deletion_requests()
+            if request.request_id == approved.request_id
+        ).status.value
+        == "completed"
+    )
+    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+    system.reset()
     assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
 
 

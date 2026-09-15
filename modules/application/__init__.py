@@ -1881,32 +1881,130 @@ _ADMINISTRATION_COPY = {
     ),
 }
 
-_SOURCE_DATA_DELETION_COPY = {
-    "en": (
-        "🗑️ **Source Data Deletion Requests**\n\n"
-        "Exact Source Author and Source Chat requests. The view is body-free.",
-        "Back",
-        "Menu",
-    ),
-    "ru": (
-        "🗑️ **Запросы на удаление Source Data**\n\n"
-        "Точные запросы Source Author и Source Chat. Просмотр не содержит тела.",
-        "Назад",
-        "Меню",
-    ),
-    "es": (
-        "🗑️ **Solicitudes de eliminación de Source Data**\n\n"
-        "Solicitudes exactas de Source Author y Source Chat. "
-        "La vista no contiene cuerpos.",
-        "Atrás",
-        "Menú",
-    ),
-    "fr": (
-        "🗑️ **Demandes de suppression de Source Data**\n\n"
-        "Demandes exactes de Source Author et Source Chat. La vue est sans corps.",
-        "Retour",
-        "Menu",
-    ),
+
+class _SourceDataDeletionCopy(TypedDict):
+    heading: str
+    back: str
+    menu: str
+    review: str
+    intake: str
+    reject: str
+    completion: str
+
+
+_SOURCE_DATA_DELETION_COPY: dict[str, _SourceDataDeletionCopy] = {
+    "en": {
+        "heading": (
+            "🗑️ **Source Data Deletion Requests**\n\n"
+            "Exact Source Author and Source Chat requests. The view is body-free."
+        ),
+        "back": "Back",
+        "menu": "Menu",
+        "review": (
+            "🛡️ **Review Source Data Deletion target**\n\n"
+            "request={request}\n"
+            "source_author={source_author}\n"
+            "source_chat={source_chat}\n"
+            "support_case={support_case}\n"
+            "status={status}\n\n"
+            "This starts request-scoped suppression and deletion. Confirm explicitly."
+        ),
+        "intake": (
+            "Enter exactly request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Do not include a body."
+        ),
+        "reject": "Enter one bounded rejection reason without whitespace.",
+        "completion": (
+            "Enter body-free completion proof pointer for outcome {outcome}."
+        ),
+    },
+    "ru": {
+        "heading": (
+            "🗑️ **Запросы на удаление Source Data**\n\n"
+            "Точные запросы Source Author и Source Chat. Просмотр не содержит тела."
+        ),
+        "back": "Назад",
+        "menu": "Меню",
+        "review": (
+            "🛡️ **Проверка цели удаления Source Data**\n\n"
+            "request={request}\n"
+            "source_author={source_author}\n"
+            "source_chat={source_chat}\n"
+            "support_case={support_case}\n"
+            "status={status}\n\n"
+            "Эта операция запускает подавление и удаление в рамках запроса. "
+            "Явно подтвердите действие."
+        ),
+        "intake": (
+            "Введите ровно request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "Не включайте тело данных."
+        ),
+        "reject": "Введите одну ограниченную причину отклонения без пробелов.",
+        "completion": (
+            "Введите указатель на подтверждение выполнения без тела для результата "
+            "{outcome}."
+        ),
+    },
+    "es": {
+        "heading": (
+            "🗑️ **Solicitudes de eliminación de Source Data**\n\n"
+            "Solicitudes exactas de Source Author y Source Chat. "
+            "La vista no contiene cuerpos."
+        ),
+        "back": "Atrás",
+        "menu": "Menú",
+        "review": (
+            "🛡️ **Revisar el objetivo de eliminación de Source Data**\n\n"
+            "request={request}\n"
+            "source_author={source_author}\n"
+            "source_chat={source_chat}\n"
+            "support_case={support_case}\n"
+            "status={status}\n\n"
+            "Esta operación inicia la supresión y eliminación limitada a la solicitud. "
+            "Confirme explícitamente."
+        ),
+        "intake": (
+            "Introduzca exactamente request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "No incluya ningún cuerpo."
+        ),
+        "reject": "Introduzca un motivo de rechazo acotado, sin espacios.",
+        "completion": (
+            "Introduzca el puntero de prueba de finalización sin cuerpo para el "
+            "resultado {outcome}."
+        ),
+    },
+    "fr": {
+        "heading": (
+            "🗑️ **Demandes de suppression de Source Data**\n\n"
+            "Demandes exactes de Source Author et Source Chat. La vue est sans corps."
+        ),
+        "back": "Retour",
+        "menu": "Menu",
+        "review": (
+            "🛡️ **Vérifier la cible de suppression de Source Data**\n\n"
+            "request={request}\n"
+            "source_author={source_author}\n"
+            "source_chat={source_chat}\n"
+            "support_case={support_case}\n"
+            "status={status}\n\n"
+            "Cette opération lance la suppression et l’effacement "
+            "limités à la demande. "
+            "Confirmez explicitement."
+        ),
+        "intake": (
+            "Entrez exactement request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque>. "
+            "N’incluez aucun corps."
+        ),
+        "reject": "Entrez un motif de rejet délimité, sans espace.",
+        "completion": (
+            "Entrez le pointeur de preuve d’achèvement sans corps pour le résultat "
+            "{outcome}."
+        ),
+    },
 }
 
 _SOURCE_DATA_DELETION_ACTION_COPY = {
@@ -2037,6 +2135,7 @@ class _SourceChatLifecycleCopy(TypedDict):
     confirm: str
     pending: str
     result: str
+    failed: str
     confirm_button: str
     cancel_button: str
     menu_button: str
@@ -2049,6 +2148,7 @@ _SOURCE_CHAT_LIFECYCLE_COPY: dict[str, _SourceChatLifecycleCopy] = {
         "confirm": "Confirm {action} for {address}?",
         "pending": "Applying Source Chat {action}...",
         "result": "Source Chat {action} complete: {state}.",
+        "failed": "Source Chat {action} failed. Please try again.",
         "confirm_button": "Confirm",
         "cancel_button": "Cancel",
         "menu_button": "Menu",
@@ -2067,6 +2167,10 @@ _SOURCE_CHAT_LIFECYCLE_COPY: dict[str, _SourceChatLifecycleCopy] = {
         "confirm": "Подтвердить действие «{action}» для {address}?",
         "pending": "Применяю действие «{action}» к Source Chat…",
         "result": "Действие «{action}» для Source Chat завершено: {state}.",
+        "failed": (
+            "Не удалось выполнить действие «{action}» для Source Chat. "
+            "Попробуйте ещё раз."
+        ),
         "confirm_button": "Подтвердить",
         "cancel_button": "Отмена",
         "menu_button": "Меню",
@@ -2077,6 +2181,10 @@ _SOURCE_CHAT_LIFECYCLE_COPY: dict[str, _SourceChatLifecycleCopy] = {
         "confirm": "¿Confirma {action} el Source Chat {address}?",
         "pending": "Aplicando {action} el Source Chat…",
         "result": "Source Chat {action} completado: {state}.",
+        "failed": (
+            "No se pudo completar la acción {action} del Source Chat. "
+            "Inténtelo de nuevo."
+        ),
         "confirm_button": "Confirmar",
         "cancel_button": "Cancelar",
         "menu_button": "Menú",
@@ -2091,6 +2199,9 @@ _SOURCE_CHAT_LIFECYCLE_COPY: dict[str, _SourceChatLifecycleCopy] = {
         "confirm": "Confirmer {action} pour le Source Chat {address} ?",
         "pending": "Application de l’action « {action} » au Source Chat…",
         "result": "Action « {action} » du Source Chat terminée : {state}.",
+        "failed": (
+            "Impossible de terminer l’action « {action} » du Source Chat. Réessayez."
+        ),
         "confirm_button": "Confirmer",
         "cancel_button": "Annuler",
         "menu_button": "Menu",
@@ -4685,10 +4796,9 @@ class ConversationOnboarding:
                     telegram_user_id=lifecycle_origin.telegram_user_id,
                     locale=presentation_locale,
                     screen_revision=state.screen_revision,
-                    text=(
-                        "Source Chat "
-                        f"{lifecycle_origin.action.value.replace('_', ' ')} "
-                        "failed. Please try again."
+                    text=_source_chat_lifecycle_failed_text(
+                        lifecycle_origin.action,
+                        presentation_locale,
                     ),
                     entries=self._store.source_chat_administration_views(),
                 )
@@ -16406,13 +16516,13 @@ def _source_data_deletion_message(
     screen_revision: int,
     requests: tuple[SourceDataDeletionRequest, ...] = (),
 ) -> TelegramMessage:
-    text, back, menu = _SOURCE_DATA_DELETION_COPY.get(
+    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
         locale, _SOURCE_DATA_DELETION_COPY["en"]
     )
     actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
         locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
     )
-    lines = [text]
+    lines = [deletion_copy["heading"]]
     button_rows: list[tuple[tuple[str, str], ...]] = [
         ((actions["add"], f"sdd:intake:{screen_revision}"),),
     ]
@@ -16479,7 +16589,7 @@ def _source_data_deletion_message(
                         ),
                     )
                 )
-    button_rows.append(((back, f"sdd:back:{screen_revision}"),))
+    button_rows.append(((deletion_copy["back"], f"sdd:back:{screen_revision}"),))
     return TelegramMessage(
         delivery_id=f"source-data-deletion:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -16487,7 +16597,7 @@ def _source_data_deletion_message(
         screen_revision=screen_revision,
         text="\n\n".join(lines),
         button_rows=tuple(button_rows),
-        reply_button=menu or actions["menu"],
+        reply_button=deletion_copy["menu"] or actions["menu"],
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
 
@@ -16501,18 +16611,19 @@ def _source_data_deletion_review_message(
     request: SourceDataDeletionRequest,
 ) -> TelegramMessage:
     """Render a body-free exact author/chat scope before execution."""
+    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_COPY["en"]
+    )
     actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
         locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
     )
     token = _source_data_deletion_callback_token(request.request_id)
-    text = (
-        "🛡️ **Review Source Data Deletion target**\n\n"
-        f"request={request.request_id}\n"
-        f"source_author={request.source_author_telegram_id}\n"
-        f"source_chat={request.source_chat_key}\n"
-        f"support_case={request.support_case_pointer}\n"
-        f"status={request.status.value}\n\n"
-        "This starts request-scoped suppression and deletion. Confirm explicitly."
+    text = deletion_copy["review"].format(
+        request=request.request_id,
+        source_author=request.source_author_telegram_id,
+        source_chat=request.source_chat_key,
+        support_case=request.support_case_pointer,
+        status=request.status.value,
     )
     menu = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
     return TelegramMessage(
@@ -16546,20 +16657,19 @@ def _source_data_deletion_input_message(
     completion_outcome: str | None = None,
 ) -> TelegramMessage:
     """Render a fixed prompt for structured administrator input."""
+    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_COPY["en"]
+    )
     actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
         locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
     )
     if operation == "intake":
-        prompt = (
-            "Enter exactly request_id=<opaque> source_author=<numeric> "
-            "source_chat=<exact Source Chat key> support_case=<opaque>. "
-            "Do not include a body."
-        )
+        prompt = deletion_copy["intake"]
     elif operation == "reject":
-        prompt = "Enter one bounded rejection reason without whitespace."
+        prompt = deletion_copy["reject"]
     else:
         outcome = completion_outcome or "completed"
-        prompt = f"Enter body-free completion proof pointer for outcome {outcome}."
+        prompt = deletion_copy["completion"].format(outcome=outcome)
     if request is not None:
         prompt = f"request={request.request_id}\n\n{prompt}"
     menu = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
@@ -16859,6 +16969,19 @@ def _source_chat_lifecycle_result_text(
     return lifecycle_copy["result"].format(
         action=lifecycle_copy["actions"][action.value],
         state=lifecycle_copy["states"][state.value],
+    )
+
+
+def _source_chat_lifecycle_failed_text(
+    action: SourceChatLifecycleAction,
+    locale: str,
+) -> str:
+    """Render the fixed administrator error for one malformed terminal."""
+    lifecycle_copy = _SOURCE_CHAT_LIFECYCLE_COPY.get(
+        locale, _SOURCE_CHAT_LIFECYCLE_COPY["en"]
+    )
+    return lifecycle_copy["failed"].format(
+        action=lifecycle_copy["actions"][action.value],
     )
 
 
@@ -23515,26 +23638,24 @@ def _source_data_deletion_input_operation(
     ):
         return None
     prompt = current_message.text
-    if prompt.startswith("Enter exactly request_id=<opaque>"):
+    locale = current.locale or "en"
+    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
+        locale, _SOURCE_DATA_DELETION_COPY["en"]
+    )
+    prompt_copies = (deletion_copy, _SOURCE_DATA_DELETION_COPY["en"])
+    if any(prompt == copy["intake"] for copy in prompt_copies):
         return "intake", None, None
     request_id = current.source_data_deletion_request_id
     if request_id is None:
         return None
-    escaped_request_id = re.escape(request_id)
-    if re.fullmatch(
-        rf"request={escaped_request_id}\n\nEnter one bounded rejection reason "
-        rf"without whitespace\.",
-        prompt,
-    ):
-        return "reject", request_id, None
-    completion = re.fullmatch(
-        rf"request={escaped_request_id}\n\nEnter body-free completion proof "
-        rf"pointer for outcome "
-        rf"(completed|data_not_found)\.",
-        prompt,
-    )
-    if completion is not None:
-        return "complete", request_id, completion.group(1)
+    for copy in prompt_copies:
+        if prompt == f"request={request_id}\n\n{copy['reject']}":
+            return "reject", request_id, None
+        for outcome in ("completed", "data_not_found"):
+            if prompt == (
+                f"request={request_id}\n\n{copy['completion'].format(outcome=outcome)}"
+            ):
+                return "complete", request_id, outcome
     return None
 
 
