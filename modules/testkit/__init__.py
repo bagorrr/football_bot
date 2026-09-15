@@ -404,6 +404,13 @@ class ControlledTelegramIngestionAdapter:
         """Accept the production scope lookup without making controlled data live."""
         del lookup
 
+    def configure_source_scope_activation_lookup(
+        self,
+        lookup: Callable[[TelegramPeerIdentity, int], tuple[datetime, str] | None],
+    ) -> None:
+        """Accept the production activation lookup without making data live."""
+        del lookup
+
     def configure_source_message_revision_lookup(
         self,
         lookup: Callable[

@@ -137,10 +137,8 @@ def build_runtime_service(
             TelethonRuntime,
         )
 
-        seed_catalog = load_source_chat_seed_catalog(
-            repository_root / "config" / "source-chats.yaml"
-        )
         persisted_scope = store.active_source_chat_ingestion_scope()
+        bootstrap_required = store.source_chat_ingestion_bootstrap_required()
         approved_source_chats = tuple(
             identity for identity, _generation in persisted_scope
         )
@@ -166,16 +164,20 @@ def build_runtime_service(
             approved_source_chats=approved_source_chats,
         )
         source.refresh_source_scope(approved_source_chats)
-        recorded_at = clock.now()
-        resolutions = bootstrap_source_chat_catalog(
-            seed_catalog,
-            ingestion=source,
-            publisher=store,
-            telegram_user_id=int(telethon_values["TELEGRAM_ADMIN_USER_ID"]),
-            recorded_at=recorded_at,
-        )
-        if not resolutions or len(resolutions) != len(seed_catalog.seeds):
-            raise RuntimeError("T2 bootstrap scope is incomplete")
+        if bootstrap_required:
+            seed_catalog = load_source_chat_seed_catalog(
+                repository_root / "config" / "source-chats.yaml"
+            )
+            recorded_at = clock.now()
+            resolutions = bootstrap_source_chat_catalog(
+                seed_catalog,
+                ingestion=source,
+                publisher=store,
+                telegram_user_id=int(telethon_values["TELEGRAM_ADMIN_USER_ID"]),
+                recorded_at=recorded_at,
+            )
+            if not resolutions or len(resolutions) != len(seed_catalog.seeds):
+                raise RuntimeError("T2 bootstrap scope is incomplete")
         current_scope = store.active_source_chat_ingestion_scope()
         if current_scope != persisted_scope:
             approved_source_chats = tuple(
@@ -478,6 +480,14 @@ def _run_ingestion(service: RuntimeService) -> None:
                 TelethonTransportError(
                     "Telegram live ingestion failed",
                     reason=IngestionFailureReason.ACCESS_LOST,
+                    scope=IngestionFailureScope.INGESTION_ROLE,
+                )
+            )
+        else:
+            live_transport_failure.append(
+                TelethonTransportError(
+                    "Telegram live ingestion disconnected",
+                    reason=IngestionFailureReason.AUTHENTICATION_LOST,
                     scope=IngestionFailureScope.INGESTION_ROLE,
                 )
             )

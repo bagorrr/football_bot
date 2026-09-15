@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -215,6 +215,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0061_telethon_event_identity_and_progress_retention.sql",
     "0062_telethon_active_ingestion_scope.sql",
     "0063_semantic_origin_update_id.sql",
+    "0064_runtime_readiness_and_ingestion_bootstrap.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -282,6 +283,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "ae782f526807bf08c2daee9fe523ef72f0d17c8b6f335061597147af659db559",
     "bf3dbc633756c1d7264d7a447eea530c4daefb0f81b57ab08880ae44fd46699b",
     "b543c9190bafe36a006c0ce01eb2224c19f9a0e760132bf0d967b58d487c921b",
+    "daa33b855d2ccc7ea94d72df15b6c2638a75a9807bba1200bf1d50651c19504a",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -305,6 +307,31 @@ ALTER TABLE football_runtime.bot_message_outbox
 """
 
 _RUNTIME_DATABASE_ROLES = tuple(role.database_role for role in RuntimeRole)
+
+
+def _repository_migration_paths() -> tuple[Path, ...]:
+    """Return the ordered migration files used by every schema boundary."""
+    migration_root = Path(__file__).resolve().parents[2] / "db" / "migrations"
+    return tuple(sorted(migration_root.glob("*.sql")))
+
+
+def _validate_applied_migrations(
+    applied_migrations: Mapping[str, str],
+    migration_paths: Sequence[Path],
+) -> int:
+    """Validate the immutable, contiguous migration prefix and its checksums."""
+    migration_names = tuple(path.name for path in migration_paths)
+    expected_names = migration_names[: len(applied_migrations)]
+    if tuple(sorted(applied_migrations)) != expected_names:
+        raise RuntimeError("Migration history is not a contiguous prefix")
+    for migration_path in migration_paths[: len(applied_migrations)]:
+        migration_checksum = sha256(migration_path.read_bytes()).hexdigest()
+        if applied_migrations[migration_path.name] != migration_checksum:
+            raise RuntimeError(
+                f"Applied migration was modified: {migration_path.name}",
+            )
+    return len(applied_migrations)
+
 
 _REQUIRED_RUNTIME_TABLES = (
     "acceptance_state",
@@ -502,7 +529,7 @@ WITH runtime_roles AS (
 ), migration_owner AS (
     SELECT oid, rolname
     FROM pg_roles
-    WHERE rolname = current_user
+    WHERE rolname = COALESCE(%s::name, current_user)
 ), material AS (
     SELECT 'role'::text AS object_kind,
            role.rolname::text AS object_identity,
@@ -768,11 +795,15 @@ ORDER BY object_kind, object_identity, object_definition
 """
 
 
-def _material_schema_fingerprint(connection: psycopg.Connection[Any]) -> str:
+def _material_schema_fingerprint(
+    connection: psycopg.Connection[Any],
+    *,
+    migration_owner: str | None = None,
+) -> str:
     """Hash the complete migration-owned runtime schema contract."""
     rows = connection.execute(
         _MATERIAL_SCHEMA_QUERY,
-        (list(_RUNTIME_DATABASE_ROLES),),
+        (list(_RUNTIME_DATABASE_ROLES), migration_owner),
     ).fetchall()
     canonical = json.dumps(rows, ensure_ascii=True, separators=(",", ":"))
     return sha256(canonical.encode("utf-8")).hexdigest()
@@ -781,11 +812,16 @@ def _material_schema_fingerprint(connection: psycopg.Connection[Any]) -> str:
 def _assert_material_schema(
     connection: psycopg.Connection[Any],
     applied_count: int,
+    *,
+    migration_owner: str | None = None,
 ) -> None:
     if applied_count < 1:
         return
     expected = _MATERIAL_SCHEMA_FINGERPRINTS[applied_count - 1]
-    actual = _material_schema_fingerprint(connection)
+    actual = _material_schema_fingerprint(
+        connection,
+        migration_owner=migration_owner,
+    )
     if actual != expected:
         raise RuntimeError(f"Migration history has material schema drift: {actual}")
 
@@ -806,6 +842,51 @@ def _legacy_migration_prefix(
         ) from error
 
 
+_RUNTIME_MIGRATION_LEDGER_QUERY = """
+SELECT migration_name, checksum
+FROM football_runtime.read_runtime_applied_migrations()
+ORDER BY migration_name
+"""
+_RUNTIME_MIGRATION_OWNER_QUERY = """
+SELECT football_runtime.read_runtime_migration_owner()
+"""
+
+
+def _assert_runtime_migration_integrity(
+    connection: psycopg.Connection[Any],
+) -> None:
+    """Require the runtime-visible ledger and material schema to agree."""
+    rows = connection.execute(_RUNTIME_MIGRATION_LEDGER_QUERY).fetchall()
+    if any(
+        not isinstance(row, (tuple, list))
+        or len(row) != 2
+        or not isinstance(row[0], str)
+        or not isinstance(row[1], str)
+        or not row[0]
+        or not row[1]
+        for row in rows
+    ):
+        raise RuntimeError("Runtime migration ledger is malformed")
+    applied_migrations = {row[0]: row[1] for row in rows}
+    if len(applied_migrations) != len(rows):
+        raise RuntimeError("Runtime migration ledger contains duplicate entries")
+    migration_paths = _repository_migration_paths()
+    applied_count = _validate_applied_migrations(
+        applied_migrations,
+        migration_paths,
+    )
+    if applied_count != len(migration_paths):
+        raise RuntimeError("Runtime migration ledger is incomplete")
+    owner_row = connection.execute(_RUNTIME_MIGRATION_OWNER_QUERY).fetchone()
+    if owner_row is None or not isinstance(owner_row[0], str) or not owner_row[0]:
+        raise RuntimeError("Runtime migration owner is unavailable")
+    _assert_material_schema(
+        connection,
+        applied_count,
+        migration_owner=owner_row[0],
+    )
+
+
 class PostgresAcceptanceMigrator:
     """Administrative schema setup kept outside every runtime process."""
 
@@ -814,8 +895,7 @@ class PostgresAcceptanceMigrator:
 
     def migrate(self) -> None:
         """Apply each immutable repository migration exactly once."""
-        migration_root = Path(__file__).resolve().parents[2] / "db" / "migrations"
-        migration_paths = sorted(migration_root.glob("*.sql"))
+        migration_paths = _repository_migration_paths()
         migration_names = tuple(path.name for path in migration_paths)
         with psycopg.connect(self._admin_database_url) as connection:
             connection.execute(
@@ -888,20 +968,17 @@ class PostgresAcceptanceMigrator:
                         (migration_path.name, migration_checksum),
                     )
                     applied_migrations[migration_path.name] = migration_checksum
-            expected_applied_names = set(migration_names[: len(applied_migrations)])
-            if set(applied_migrations) != expected_applied_names:
-                raise RuntimeError("Migration history is not a contiguous prefix")
+            applied_count = _validate_applied_migrations(
+                applied_migrations,
+                migration_paths,
+            )
             if not adopted_untracked_schema:
-                _assert_material_schema(connection, len(applied_migrations))
+                _assert_material_schema(connection, applied_count)
             for migration_path in migration_paths:
                 migration_bytes = migration_path.read_bytes()
                 migration_checksum = sha256(migration_bytes).hexdigest()
                 applied_checksum = applied_migrations.get(migration_path.name)
                 if applied_checksum is not None:
-                    if applied_checksum != migration_checksum:
-                        raise RuntimeError(
-                            f"Applied migration was modified: {migration_path.name}",
-                        )
                     continue
                 connection.execute(migration_bytes.decode("utf-8"))
                 applied_count = migration_names.index(migration_path.name) + 1
@@ -2984,16 +3061,19 @@ class PostgresRoleStore:
                         len(_CURRENT_SCHEMA_COLUMNS),
                     ),
                 ).fetchone()
+                if row is None or len(row) != 7:
+                    raise PostgresRoleReadinessError(status="schema_not_ready")
+                if row[0] is not True:
+                    raise PostgresRoleReadinessError(status="identity_mismatch")
+                if any(value is not True for value in row[1:]):
+                    raise PostgresRoleReadinessError(status="schema_not_ready")
+                _assert_runtime_migration_integrity(connection)
         except (psycopg.OperationalError, psycopg.InterfaceError):
             raise PostgresRoleReadinessError(status="database_unavailable") from None
+        except PostgresRoleReadinessError:
+            raise
         except Exception:
             raise PostgresRoleReadinessError(status="schema_not_ready") from None
-        if row is None or len(row) != 7:
-            raise PostgresRoleReadinessError(status="schema_not_ready")
-        if row[0] is not True:
-            raise PostgresRoleReadinessError(status="identity_mismatch")
-        if any(value is not True for value in row[1:]):
-            raise PostgresRoleReadinessError(status="schema_not_ready")
 
     def commit_initial(
         self,
@@ -4070,6 +4150,60 @@ class PostgresRoleStore:
         if type(generation) is not int or generation < 1:
             raise ValueError("Source Chat ingestion generation is invalid")
         return generation
+
+    def source_chat_ingestion_activation_boundary(
+        self,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> tuple[datetime, str] | None:
+        """Read the current enabled generation's consent boundary for T2."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT context.processing_started_at, context.transport_boundary
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                ) AS context
+                WHERE football_runtime.read_current_source_chat_ingestion_generation(
+                    %s, %s
+                ) = %s
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        processing_started_at, transport_boundary = row
+        if (
+            not isinstance(processing_started_at, datetime)
+            or processing_started_at.tzinfo is None
+            or not isinstance(transport_boundary, str)
+            or not transport_boundary
+        ):
+            raise ValueError("Source Chat activation boundary is invalid")
+        return processing_started_at, transport_boundary
+
+    def source_chat_ingestion_bootstrap_required(self) -> bool:
+        """Return whether the T2 registry is still empty for initial bootstrap."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT football_runtime.read_source_chat_ingestion_bootstrap_required()
+                """
+            ).fetchone()
+        if row is None or type(row[0]) is not bool:
+            raise ValueError("Source Chat bootstrap state is invalid")
+        return row[0]
 
     def active_source_chat_ingestion_scope(
         self,

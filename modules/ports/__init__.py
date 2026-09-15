@@ -143,6 +143,13 @@ class TelegramIngestionAdapter(Protocol):
         """Bind the durable active-generation lookup for account pages."""
         ...
 
+    def configure_source_scope_activation_lookup(
+        self,
+        lookup: Callable[[TelegramPeerIdentity, int], tuple[datetime, str] | None],
+    ) -> None:
+        """Bind the durable current activation boundary for scope admission."""
+        ...
+
     def configure_source_message_revision_lookup(
         self,
         lookup: Callable[
@@ -1270,6 +1277,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read the current eligible generation and durable difference cursor."""
         ...
 
+    def source_chat_ingestion_activation_boundary(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> tuple[datetime, str] | None:
+        """Read the current enabled generation's processing boundary."""
+        ...
+
     def source_chat_ingestion_generation(
         self, identity: TelegramPeerIdentity
     ) -> int | None:
@@ -1280,6 +1296,10 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         self,
     ) -> tuple[tuple[TelegramPeerIdentity, int], ...]:
         """Read only active Source Chat identities and generations for T2."""
+        ...
+
+    def source_chat_ingestion_bootstrap_required(self) -> bool:
+        """Read whether the T2 registry is empty and needs initial bootstrap."""
         ...
 
     def initialize_account_ingestion_checkpoint(

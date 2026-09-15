@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -53,12 +54,13 @@ class _RecordingTelethonSource:
         self.account_result: TelegramDifferenceResult | None = None
         self.history_calls = 0
         self.raise_on_history = False
+        self.scope_refreshes: list[tuple[object, ...]] = []
 
     def refresh_source_scope(
         self,
-        approved_source_chats: object,
+        approved_source_chats: Iterable[object],
     ) -> None:
-        del approved_source_chats
+        self.scope_refreshes.append(tuple(approved_source_chats))
 
     def configure_clock(self, clock: object) -> None:
         del clock
@@ -2336,6 +2338,15 @@ def test_admitted_source_chat_refreshes_active_scope_and_runtime_conformance() -
         approved_source_chats=(initial_identity,),
         live_update_callback=callback_identities.append,
     )
+    processing_started_at = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+    transport_boundary = "channel-pts:10"
+    adapter.configure_source_scope_activation_lookup(
+        lambda identity, generation: (
+            (processing_started_at, transport_boundary)
+            if identity == new_identity and generation == 2
+            else None
+        )
+    )
     resolution = SourceChatAdmissionResolution(
         identity=new_identity,
         address_kind=SourceChatAddressKind.PUBLIC_USERNAME,
@@ -2345,13 +2356,60 @@ def test_admitted_source_chat_refreshes_active_scope_and_runtime_conformance() -
     adapter.admit_source_chat(
         resolution,
         registry_generation=2,
-        processing_started_at=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
-        transport_boundary="channel-pts:10",
+        processing_started_at=processing_started_at,
+        transport_boundary=transport_boundary,
     )
 
     assert new_identity in runtime.conformance_scope
     adapter.notify_live_update(new_identity)
     assert callback_identities == [new_identity]
+
+
+@pytest.mark.parametrize(
+    "current_boundary",
+    (None, (datetime(2026, 9, 1, 10, 0, tzinfo=UTC), "channel-pts:9")),
+)
+def test_admitted_source_chat_does_not_refresh_stale_scope(
+    current_boundary: tuple[datetime, str] | None,
+) -> None:
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "789012",
+    }
+    initial_identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    stale_identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 43)
+    runtime = TelethonRuntime.from_mapping(values, client_factory=lambda _: object())
+    runtime.verify_conformance(
+        transport=ControlledTelethonTransport(),
+        approved_source_chats=(initial_identity,),
+    )
+    source = _RecordingTelethonSource()
+    adapter = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=source,
+        approved_source_chats=(initial_identity,),
+    )
+    adapter.configure_source_scope_activation_lookup(
+        lambda identity, generation: (
+            current_boundary if identity == stale_identity and generation == 2 else None
+        )
+    )
+
+    adapter.admit_source_chat(
+        SourceChatAdmissionResolution(
+            identity=stale_identity,
+            address_kind=SourceChatAddressKind.PUBLIC_USERNAME,
+            current_address="@stale_source",
+        ),
+        registry_generation=2,
+        processing_started_at=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        transport_boundary="channel-pts:10",
+    )
+
+    assert source.scope_refreshes == []
+    assert stale_identity not in runtime.conformance_scope
 
 
 def test_history_uses_ascending_lower_boundary_and_stops_at_upper_boundary() -> None:

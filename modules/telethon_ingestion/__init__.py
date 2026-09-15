@@ -3375,6 +3375,9 @@ class TelethonIngestionAdapter:
         self._source_scope_generation_lookup: (
             Callable[[TelegramPeerIdentity], int | None] | None
         ) = None
+        self._source_scope_activation_lookup: (
+            Callable[[TelegramPeerIdentity, int], tuple[datetime, str] | None] | None
+        ) = None
 
     def source_event_id(self, probe_id: str) -> str:
         """Return a synthetic identity for the application probe seam."""
@@ -3460,6 +3463,18 @@ class TelethonIngestionAdapter:
                 scope=IngestionFailureScope.ACCOUNT_STREAM,
             ) from None
         self._source_scope_generation_lookup = lookup
+
+    def configure_source_scope_activation_lookup(
+        self,
+        lookup: Callable[[TelegramPeerIdentity, int], tuple[datetime, str] | None],
+    ) -> None:
+        """Bind the durable current activation boundary for scope admission."""
+        self._runtime.require_ready()
+        if not callable(lookup):
+            raise TelethonConformanceError(
+                key="SOURCE_SCOPE_ACTIVATION_LOOKUP", status="scope_invalid"
+            )
+        self._source_scope_activation_lookup = lookup
 
     def configure_source_message_revision_lookup(
         self,
@@ -3555,6 +3570,17 @@ class TelethonIngestionAdapter:
             raise TelethonConformanceError(
                 key="APPROVED_SOURCE_CHATS", status="scope_invalid"
             )
+        lookup = self._source_scope_activation_lookup
+        if lookup is None:
+            raise TelethonConformanceError(
+                key="SOURCE_SCOPE_ACTIVATION_LOOKUP",
+                status="provider_boundary_unavailable",
+            )
+        if lookup(resolution.identity, registry_generation) != (
+            processing_started_at,
+            transport_boundary,
+        ):
+            return
         entry = SourceChatRegistryEntry(
             identity=resolution.identity,
             registry_generation=registry_generation,

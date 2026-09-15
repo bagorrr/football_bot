@@ -6,12 +6,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from apps import runtime_service
-from modules.contracts import RuntimeRole
+from modules.contracts import ContractEnvelope, ContractName, RuntimeRole
 from modules.domain import (
     IngestionFailureReason,
     IngestionFailureScope,
@@ -35,6 +35,18 @@ class _ReadyStore:
         return ()
 
     def source_chat_ingestion_generation(self, _identity: object) -> int | None:
+        return None
+
+    def source_chat_ingestion_bootstrap_required(self) -> bool:
+        return True
+
+    def source_chat_ingestion_activation_boundary(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> tuple[datetime, str] | None:
+        del identity, registry_generation
         return None
 
 
@@ -245,6 +257,9 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
                 None,
             )
 
+        def source_chat_ingestion_bootstrap_required(self) -> bool:
+            return False
+
     class _RecordingRuntime:
         def __init__(self) -> None:
             self.source = _RecordingSource()
@@ -322,6 +337,87 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
         service.store.source_chat_ingestion_generation
     )
     assert service.telethon_ingestion.started is True
+
+
+def test_ingestion_restart_does_not_rebootstrap_paused_or_removed_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modules import postgres_adapter, source_chat_bootstrap, telethon_ingestion
+    from modules.telethon_ingestion import TelethonRuntime
+
+    class _ExistingRegistryStore(_ReadyStore):
+        def source_chat_ingestion_bootstrap_required(self) -> bool:
+            return False
+
+    class _Source:
+        def __init__(self) -> None:
+            self.refreshes: list[tuple[object, ...]] = []
+
+        def refresh_source_scope(self, scope: Iterable[object]) -> None:
+            self.refreshes.append(tuple(scope))
+
+    class _Runtime:
+        def __init__(self) -> None:
+            self.source = _Source()
+
+        def create_production_provider(self, **_kwargs: object) -> _Source:
+            return self.source
+
+        def verify_conformance(
+            self,
+            *,
+            transport: _Source,
+            approved_source_chats: Iterable[object],
+        ) -> None:
+            assert transport is self.source
+            assert tuple(approved_source_chats) == ()
+
+    class _Adapter:
+        def __init__(self, **_kwargs: object) -> None:
+            self.started = False
+
+        def start_live_ingestion(self) -> None:
+            self.started = True
+
+    adapter_runtime = _Runtime()
+
+    def unexpected_seed_load(_path: Path) -> object:
+        raise AssertionError("YAML seeds must not be loaded for an existing registry")
+
+    monkeypatch.setattr(postgres_adapter, "PostgresRoleStore", _ExistingRegistryStore)
+    monkeypatch.setattr(
+        source_chat_bootstrap,
+        "load_source_chat_seed_catalog",
+        unexpected_seed_load,
+    )
+    monkeypatch.setattr(
+        source_chat_bootstrap,
+        "bootstrap_source_chat_catalog",
+        lambda *_args, **_kwargs: pytest.fail("existing registry must not bootstrap"),
+    )
+    monkeypatch.setattr(
+        TelethonRuntime,
+        "from_projection",
+        staticmethod(lambda _projection: adapter_runtime),
+    )
+    monkeypatch.setattr(telethon_ingestion, "TelethonIngestionAdapter", _Adapter)
+
+    service = runtime_service.build_runtime_service(
+        "ingestion",
+        {
+            "DATABASE_URL_INGESTION": (
+                "postgresql://football_ingestion:controlled@db/football"
+            ),
+            "TELEGRAM_API_ID": "123456",
+            "TELEGRAM_API_HASH": "controlled-api-hash",
+            "TELEGRAM_SESSION_STRING": "controlled-session",
+            "TELEGRAM_ADMIN_USER_ID": "123456",
+        },
+        repository_root=Path("/srv/football-bot/current"),
+    )
+
+    assert adapter_runtime.source.refreshes == [()]
+    assert service.telethon_ingestion is service.application.telegram_ingestion
 
 
 def test_ingestion_bootstraps_only_after_telethon_authentication(
@@ -502,6 +598,118 @@ def test_run_ingestion_routes_typed_live_failure_to_durable_stop(
     assert len(service.application.stopped) == 1
     assert isinstance(service.application.stopped[0], TelethonTransportError)
     assert service.application.process_calls == 0
+
+
+def test_run_ingestion_routes_normal_disconnect_to_durable_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modules.telethon_ingestion import TelethonTransportError
+
+    class _Adapter:
+        def run_live_ingestion(self) -> None:
+            return None
+
+    class _ImmediateThread:
+        def __init__(self, target: Callable[[], None], *, daemon: bool) -> None:
+            assert daemon is True
+            self._target = target
+            self._alive = True
+
+        def start(self) -> None:
+            self._target()
+            self._alive = False
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+    class _Application:
+        def __init__(self) -> None:
+            self.stopped: list[Exception] = []
+
+        def _stop_telethon_transport_failure(self, error: Exception) -> bool:
+            self.stopped.append(error)
+            return True
+
+    application = _Application()
+    service = runtime_service.RuntimeService(
+        role=RuntimeRole.INGESTION,
+        application=application,
+        store=object(),
+        telethon_ingestion=_Adapter(),
+        wake_event=Event(),
+    )
+    monkeypatch.setattr(runtime_service, "Thread", _ImmediateThread)
+
+    with pytest.raises(RuntimeError, match="T2 live transport stopped"):
+        runtime_service._run_ingestion(service)
+
+    assert len(application.stopped) == 1
+    error = application.stopped[0]
+    assert isinstance(error, TelethonTransportError)
+    assert error.reason is IngestionFailureReason.AUTHENTICATION_LOST
+    assert error.scope is IngestionFailureScope.INGESTION_ROLE
+
+
+def test_ingestion_discards_scope_activation_after_registry_change() -> None:
+    from modules.application import RuntimeApplication
+
+    processing_started_at = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+
+    class _Store:
+        def __init__(self) -> None:
+            self.consumed: list[object] = []
+
+        def source_chat_ingestion_activation_boundary(
+            self,
+            *,
+            identity: TelegramPeerIdentity,
+            registry_generation: int,
+        ) -> tuple[datetime, str] | None:
+            del identity, registry_generation
+            return None
+
+        def consume(self, **kwargs: object) -> None:
+            self.consumed.append(kwargs["incoming"])
+
+    class _Adapter:
+        def __init__(self) -> None:
+            self.admitted = False
+
+        def admit_source_chat(self, **_kwargs: object) -> None:
+            self.admitted = True
+
+    store = _Store()
+    adapter = _Adapter()
+    application = RuntimeApplication(
+        role=RuntimeRole.INGESTION,
+        store=cast(Any, store),
+        clock=cast(Any, SimpleNamespace(now=lambda: processing_started_at)),
+        telegram_ingestion=cast(Any, adapter),
+    )
+    incoming = cast(
+        ContractEnvelope,
+        SimpleNamespace(
+            contract_name=ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+            payload={
+                "telegram_peer_kind": "channel",
+                "telegram_chat_id": 42,
+                "registry_generation": 3,
+                "address_kind": "public_username",
+                "current_address": "@stale_source",
+                "processing_started_at": processing_started_at.isoformat(),
+                "transport_boundary": "channel-pts:10",
+                "source_chat_key": "source-chat:channel:42",
+            },
+        ),
+    )
+
+    RuntimeApplication._activate_source_chat_scope(
+        application,
+        incoming,
+    )
+
+    assert adapter.admitted is False
+    assert store.consumed == [incoming]
 
 
 def test_classification_production_composition_uses_primary_codex_adapter(

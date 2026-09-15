@@ -17448,6 +17448,20 @@ class RuntimeApplication:
                 scope_generation_lookup
             ):
                 configure_scope_generation(scope_generation_lookup)
+            configure_scope_activation = getattr(
+                self.telegram_ingestion,
+                "configure_source_scope_activation_lookup",
+                None,
+            )
+            scope_activation_lookup = getattr(
+                self.store,
+                "source_chat_ingestion_activation_boundary",
+                None,
+            )
+            if callable(configure_scope_activation) and callable(
+                scope_activation_lookup
+            ):
+                configure_scope_activation(scope_activation_lookup)
             configure_revision_history = getattr(
                 self.telegram_ingestion,
                 "configure_source_message_revision_lookup",
@@ -22904,6 +22918,25 @@ class RuntimeApplication:
         started_at = datetime.fromisoformat(processing_started_at)
         if started_at.tzinfo is None:
             raise ValueError("SourceChatScopeActivated time must be timezone-aware")
+        current_boundary = getattr(
+            self.store, "source_chat_ingestion_activation_boundary", None
+        )
+        if not callable(current_boundary):
+            raise RuntimeError("Source Chat activation lookup is unavailable")
+        if current_boundary(
+            identity=resolution.identity,
+            registry_generation=registry_generation,
+        ) != (started_at, transport_boundary):
+            try:
+                self.store.consume(
+                    incoming=incoming,
+                    supported_versions=self.versions_for(incoming.contract_name),
+                    received_at=self.clock.now(),
+                    outgoing=None,
+                )
+            except OutboxConflictError as error:
+                raise RuntimeProcessingError from error
+            return
         self.telegram_ingestion.admit_source_chat(
             resolution,
             registry_generation=registry_generation,
