@@ -126,14 +126,19 @@ def build_runtime_service(
 
     if role is RuntimeRole.INGESTION:
         from modules.application import RuntimeApplication
+        from modules.source_chat_bootstrap import (
+            bootstrap_source_chat_catalog,
+            load_source_chat_seed_catalog,
+        )
         from modules.telethon_ingestion import (
             T2TelethonProjection,
             TelethonIngestionAdapter,
             TelethonRuntime,
         )
 
-        scope_rows = store.active_source_chat_ingestion_scope()
-        approved_source_chats = tuple(identity for identity, _ in scope_rows)
+        seed_catalog = load_source_chat_seed_catalog(
+            repository_root / "config" / "source-chats.yaml"
+        )
         wake_event = Event()
         telethon_values = {
             key: values[key]
@@ -149,9 +154,16 @@ def build_runtime_service(
         )
         adapter = TelethonIngestionAdapter.from_runtime(
             runtime=telethon_runtime,
-            approved_source_chats=approved_source_chats,
+            approved_source_chats=(),
             live_update_callback=lambda _identity: wake_event.set(),
             source_scope_generation_lookup=store.source_chat_ingestion_generation,
+        )
+        bootstrap_source_chat_catalog(
+            seed_catalog,
+            ingestion=adapter,
+            publisher=store,
+            telegram_user_id=int(telethon_values["TELEGRAM_ADMIN_USER_ID"]),
+            recorded_at=clock.now(),
         )
         application = RuntimeApplication(
             role=role,
@@ -531,6 +543,7 @@ def _run(service: RuntimeService) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     from modules.postgres_adapter import PostgresRoleReadinessError
+    from modules.source_chat_bootstrap import SourceChatBootstrapError
     from modules.t5_runtime_configuration import (
         ROLE_CONFIGURATION_KEYS,
         ROLE_DATABASE_KEYS,
@@ -586,6 +599,16 @@ def main(argv: list[str] | None = None) -> int:
             reason=error.status,
         )
         _notify_systemd("STATUS=Runtime database readiness failed")
+        return 78
+    except SourceChatBootstrapError as error:
+        _emit_readiness(
+            role,
+            configuration=("failed" if error.phase == "configuration" else "ready"),
+            dependencies=("not_checked" if error.phase == "configuration" else "ready"),
+            runtime="not_started",
+            reason="source_chat_bootstrap_failed",
+        )
+        _notify_systemd("STATUS=Source Chat seed bootstrap failed")
         return 78
     except Exception:
         _emit_readiness(

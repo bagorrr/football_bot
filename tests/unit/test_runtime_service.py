@@ -132,7 +132,7 @@ def test_bot_assistant_production_composition_uses_real_adapters_and_t1_boundary
 def test_ingestion_production_composition_uses_generation_scoped_telethon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from modules import postgres_adapter
+    from modules import postgres_adapter, source_chat_bootstrap
     from modules.telethon_ingestion import TelethonIngestionAdapter, TelethonRuntime
 
     captured: list[dict[str, object]] = []
@@ -143,6 +143,16 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
         return adapter
 
     monkeypatch.setattr(postgres_adapter, "PostgresRoleStore", _ReadyStore)
+    monkeypatch.setattr(
+        source_chat_bootstrap,
+        "load_source_chat_seed_catalog",
+        lambda _path: object(),
+    )
+    monkeypatch.setattr(
+        source_chat_bootstrap,
+        "bootstrap_source_chat_catalog",
+        lambda *args, **kwargs: (),
+    )
     monkeypatch.setattr(
         TelethonRuntime,
         "from_projection",

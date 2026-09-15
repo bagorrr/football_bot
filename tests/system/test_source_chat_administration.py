@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID
 
 import psycopg
@@ -35,6 +36,10 @@ from modules.domain import (
     TelegramPeerKind,
 )
 from modules.ports import ClassifierAdapterResult
+from modules.source_chat_bootstrap import (
+    bootstrap_source_chat_catalog,
+    load_source_chat_seed_catalog,
+)
 from modules.testkit import (
     AcceptanceSpine,
     ControlledBotAssistantModelAdapter,
@@ -49,6 +54,130 @@ from modules.testkit import (
     OwnershipViolationError,
     boot_legacy_acceptance_spine,
 )
+
+
+def test_tracked_source_chat_seeds_bootstrap_exactly_once_and_preserve_pause() -> None:
+    telethon = ControlledTelegramIngestionAdapter()
+    telegram = ControlledTelegramDeliveryAdapter()
+    administrator_id = 46_901
+    clock = FrozenClock(datetime(2026, 9, 15, 12, 0, tzinfo=UTC))
+    catalog = load_source_chat_seed_catalog(
+        Path(__file__).resolve().parents[2] / "config" / "source-chats.yaml"
+    )
+    identities = {
+        seed.address: TelegramPeerIdentity(TelegramPeerKind.CHANNEL, index)
+        for index, seed in enumerate(catalog.seeds, start=901)
+    }
+    for index, seed in enumerate(catalog.seeds, start=1):
+        telethon.allow_public_username(
+            address=seed.address,
+            identity=identities[seed.address],
+            transport_boundary=f"channel-pts:{index}",
+        )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=os.environ["TEST_DATABASE_URL"],
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=telegram,
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=administrator_id,
+    )
+    system.reset()
+
+    ingestion_role = system._roles[RuntimeRole.INGESTION]
+    assert ingestion_role.telegram_ingestion is telethon
+    bootstrap_source_chat_catalog(
+        catalog,
+        ingestion=telethon,
+        publisher=ingestion_role.store,
+        telegram_user_id=administrator_id,
+        recorded_at=clock.now(),
+    )
+    system.process_source_chat_registrations_until_idle()
+
+    initial_registry = system.source_chats()
+    assert len(initial_registry) == 4
+    assert {entry.current_address for entry in initial_registry} == {
+        seed.address for seed in catalog.seeds
+    }
+    assert all(entry.registry_generation == 1 for entry in initial_registry)
+    assert all(entry.enabled for entry in initial_registry)
+    assert len(telethon.admitted_source_chats) == 4
+
+    system.start_bot_user(
+        update_id="start:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        telegram_language_hint="en",
+    )
+    system.select_fixed_language(
+        update_id="language:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        locale="en",
+    )
+    clock.advance_to(datetime(2026, 10, 15, 12, 0, tzinfo=UTC))
+    system.expire_inactive_discovery_drafts()
+    system.open_main_menu(
+        update_id="menu:seed-bootstrap",
+        telegram_user_id=administrator_id,
+    )
+    system.select_main_menu_action(
+        update_id="settings:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        action="settings",
+    )
+    system.select_settings_action(
+        update_id="administration:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        action="administration",
+    )
+    system.select_administration_action(
+        update_id="source-chats:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        action="source-chats",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="pause:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        action="pause",
+    )
+    _click_source_chat_lifecycle_control(
+        system,
+        telegram,
+        update_id="confirm-pause:seed-bootstrap",
+        telegram_user_id=administrator_id,
+        action="pause",
+        confirm=True,
+    )
+    system.process_source_chat_registrations_until_idle()
+    paused_registry = system.source_chats()
+    paused_entry = next(entry for entry in paused_registry if not entry.enabled)
+
+    for index, seed in enumerate(catalog.seeds, start=11):
+        telethon.allow_public_username(
+            address=seed.address,
+            identity=identities[seed.address],
+            transport_boundary=f"channel-pts:{index}",
+        )
+    system.restart(RuntimeRole.INGESTION)
+    restarted_ingestion = system._roles[RuntimeRole.INGESTION]
+    assert restarted_ingestion.telegram_ingestion is telethon
+    bootstrap_source_chat_catalog(
+        catalog,
+        ingestion=telethon,
+        publisher=restarted_ingestion.store,
+        telegram_user_id=administrator_id,
+        recorded_at=clock.now(),
+    )
+    system.process_source_chat_registrations_until_idle()
+
+    assert system.source_chats() == paused_registry
+    assert next(entry for entry in system.source_chats() if not entry.enabled) == (
+        paused_entry
+    )
+    assert len(telethon.admitted_source_chats) == 4
 
 
 def test_administration_requires_the_exact_configured_telegram_user_id() -> None:

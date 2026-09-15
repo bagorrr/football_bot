@@ -3022,6 +3022,59 @@ class PostgresRoleStore:
             if inserted is not None:
                 _insert_outbox(connection, envelope)
 
+    def publish_source_chat_seed_resolution(
+        self,
+        *,
+        envelope: ContractEnvelope,
+    ) -> None:
+        """Publish one validated tracked-seed admission idempotently."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise RuntimeError("only Ingestion publishes Source Chat seed admissions")
+        from modules.source_chat_bootstrap import (
+            validate_source_chat_seed_resolution,
+        )
+
+        validate_source_chat_seed_resolution(envelope)
+        with psycopg.connect(self._database_url) as connection:
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.contract_outbox (
+                    message_id, producer_role, consumer_role, contract_name,
+                    contract_version, subject_id, subject_revision,
+                    idempotency_key, causation_id, correlation_id, recorded_at,
+                    payload, source_chat_admission_provenance_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL)
+                ON CONFLICT (producer_role, idempotency_key) DO NOTHING
+                RETURNING message_id
+                """,
+                (
+                    envelope.message_id,
+                    envelope.producer.value,
+                    envelope.consumer.value if envelope.consumer else None,
+                    envelope.contract_name.value,
+                    envelope.contract_version,
+                    envelope.subject_id,
+                    envelope.subject_revision,
+                    envelope.idempotency_key,
+                    envelope.causation_id,
+                    envelope.correlation_id,
+                    envelope.recorded_at,
+                    json.dumps(envelope.json_payload()),
+                ),
+            ).fetchone()
+            if inserted is not None:
+                return
+            existing = connection.execute(
+                """
+                SELECT message_id
+                FROM football_runtime.contract_outbox
+                WHERE producer_role = %s AND idempotency_key = %s
+                """,
+                (envelope.producer.value, envelope.idempotency_key),
+            ).fetchone()
+            if existing is None or existing[0] != envelope.message_id:
+                raise RuntimeError("Source Chat seed identity conflicts with outbox")
+
     def source_stream_is_stopped(
         self,
         *,
@@ -3274,8 +3327,8 @@ class PostgresRoleStore:
         *,
         incoming: RawContractEnvelope,
         entry: SourceChatRegistryEntry,
-        outgoing: ContractEnvelope,
-        stale_outgoing: ContractEnvelope,
+        outgoing: ContractEnvelope | None,
+        stale_outgoing: ContractEnvelope | None,
         activation_outgoing: ContractEnvelope | None,
         received_at: datetime,
     ) -> ConsumeResult:
@@ -3438,12 +3491,16 @@ class PostgresRoleStore:
             effective_outgoing = outgoing
             if address_change:
                 assert latest_generation is not None
-                if not isinstance(outgoing.payload, dict):
+                if effective_outgoing is None:
+                    raise RuntimeError(
+                        "Source Chat address changes require a registry result"
+                    )
+                if not isinstance(effective_outgoing.payload, dict):
                     raise TypeError("Source Chat result payload must be an object")
-                effective_payload = dict(outgoing.payload)
+                effective_payload = dict(effective_outgoing.payload)
                 effective_payload["registry_generation"] = latest_generation[0]
                 effective_outgoing = replace(
-                    outgoing,
+                    effective_outgoing,
                     subject_revision=latest_generation[0],
                     payload=effective_payload,
                 )
@@ -3454,10 +3511,9 @@ class PostgresRoleStore:
                 received_at=received_at,
             )
             try:
-                _insert_outbox(
-                    connection,
-                    stale_outgoing if is_stale else effective_outgoing,
-                )
+                result_outgoing = stale_outgoing if is_stale else effective_outgoing
+                if result_outgoing is not None:
+                    _insert_outbox(connection, result_outgoing)
                 if (
                     activation_outgoing is not None
                     and not is_stale

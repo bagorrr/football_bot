@@ -164,6 +164,11 @@ from modules.proposition_graph import (
     PropositionState,
     canonical_proposition_graph_from_wire,
 )
+from modules.source_chat_bootstrap import (
+    SourceChatBootstrapError,
+    is_source_chat_seed_bootstrap,
+    validate_source_chat_seed_resolution,
+)
 
 SUPPORTED_LOCALES = frozenset({"en", "es", "fr", "ru"})
 APPLICATION_LOCALES = frozenset(
@@ -19236,10 +19241,19 @@ class RuntimeApplication:
             incoming.contract_name is ContractName.SOURCE_CHAT_ADMISSION_RESOLVED
             and supported_incoming is not None
         ):
-            self._register_source_chat(
-                supported_incoming,
-                inject_outbox_conflict=inject_outbox_conflict,
-            )
+            if is_source_chat_seed_bootstrap(incoming):
+                try:
+                    self._register_source_chat_seed(supported_incoming)
+                except (SourceChatBootstrapError, TypeError, ValueError):
+                    self.store.reject_invalid_contract(
+                        incoming=incoming,
+                        received_at=self.clock.now(),
+                    )
+            else:
+                self._register_source_chat(
+                    supported_incoming,
+                    inject_outbox_conflict=inject_outbox_conflict,
+                )
             return True
         if (
             incoming.contract_name is ContractName.SOURCE_CHAT_SCOPE_ACTIVATED
@@ -22951,6 +22965,93 @@ class RuntimeApplication:
                 supported_versions=self.versions_for(incoming.contract_name),
                 received_at=recorded_at,
                 outgoing=outgoing,
+            )
+        except OutboxConflictError as error:
+            raise RuntimeProcessingError from error
+
+    def _register_source_chat_seed(self, incoming: ContractEnvelope) -> None:
+        """Commit one tracked seed without creating a Bot administration result."""
+        if self.role is not RuntimeRole.APPLICATION:
+            raise RuntimeError("only Application owns the Source Chat registry")
+        validate_source_chat_seed_resolution(incoming)
+        payload = incoming.payload
+        if not isinstance(payload, dict):
+            raise TypeError("SourceChatAdmissionResolved payload must be an object")
+        telegram_user_id = payload.get("telegram_user_id")
+        telegram_peer_kind = payload.get("telegram_peer_kind")
+        telegram_chat_id = payload.get("telegram_chat_id")
+        address_kind = payload.get("address_kind")
+        current_address = payload.get("current_address")
+        transport_boundary = payload.get("transport_boundary")
+        registry_generation = payload.get("registry_generation")
+        source_chat_key = payload.get("source_chat_key")
+        if not isinstance(telegram_user_id, int) or isinstance(telegram_user_id, bool):
+            raise TypeError("SourceChatAdmissionResolved requires telegram_user_id")
+        if not isinstance(telegram_peer_kind, str):
+            raise TypeError("SourceChatAdmissionResolved requires telegram_peer_kind")
+        if not isinstance(telegram_chat_id, int) or isinstance(telegram_chat_id, bool):
+            raise TypeError("SourceChatAdmissionResolved requires telegram_chat_id")
+        if not isinstance(address_kind, str):
+            raise TypeError("SourceChatAdmissionResolved requires address_kind")
+        if not isinstance(current_address, str) or not current_address:
+            raise ValueError("SourceChatAdmissionResolved requires current_address")
+        if not isinstance(transport_boundary, str) or not transport_boundary:
+            raise ValueError("SourceChatAdmissionResolved requires transport_boundary")
+        if not isinstance(registry_generation, int) or isinstance(
+            registry_generation, bool
+        ):
+            raise TypeError("SourceChatAdmissionResolved requires registry_generation")
+        if not isinstance(source_chat_key, str) or not source_chat_key:
+            raise ValueError("SourceChatAdmissionResolved requires source_chat_key")
+        registered_at = self.clock.now()
+        entry = SourceChatRegistryEntry(
+            identity=TelegramPeerIdentity(
+                kind=TelegramPeerKind(telegram_peer_kind),
+                telegram_id=telegram_chat_id,
+            ),
+            registry_generation=registry_generation,
+            address_kind=SourceChatAddressKind(address_kind),
+            current_address=current_address,
+            processing_started_at=registered_at,
+            transport_boundary=transport_boundary,
+            enabled=True,
+            initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
+            attested_at=registered_at,
+        )
+        activation_outgoing = ContractEnvelope(
+            contract_name=ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+            contract_version=1,
+            message_id=derive_contract_message_id(
+                incoming.message_id,
+                ContractName.SOURCE_CHAT_SCOPE_ACTIVATED,
+            ),
+            producer=RuntimeRole.APPLICATION,
+            consumer=RuntimeRole.INGESTION,
+            subject_id=source_chat_key,
+            subject_revision=registry_generation,
+            idempotency_key=(f"source-chat-scope-activated:{incoming.message_id}"),
+            causation_id=incoming.message_id,
+            correlation_id=incoming.correlation_id,
+            recorded_at=registered_at,
+            payload={
+                "source_chat_key": source_chat_key,
+                "telegram_peer_kind": telegram_peer_kind,
+                "telegram_chat_id": telegram_chat_id,
+                "registry_generation": registry_generation,
+                "address_kind": address_kind,
+                "current_address": current_address,
+                "processing_started_at": entry.processing_started_at.isoformat(),
+                "transport_boundary": transport_boundary,
+            },
+        )
+        try:
+            self.store.register_source_chat(
+                incoming=incoming,
+                entry=entry,
+                outgoing=None,
+                stale_outgoing=None,
+                activation_outgoing=activation_outgoing,
+                received_at=registered_at,
             )
         except OutboxConflictError as error:
             raise RuntimeProcessingError from error

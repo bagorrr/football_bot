@@ -1187,13 +1187,21 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Atomically commit initial owner state and its outbox."""
         ...
 
+    def publish_source_chat_seed_resolution(
+        self,
+        *,
+        envelope: ContractEnvelope,
+    ) -> None:
+        """Publish one deterministic tracked-seed admission resolution."""
+        ...
+
     def register_source_chat(
         self,
         *,
         incoming: RawContractEnvelope,
         entry: SourceChatRegistryEntry,
-        outgoing: ContractEnvelope,
-        stale_outgoing: ContractEnvelope,
+        outgoing: ContractEnvelope | None,
+        stale_outgoing: ContractEnvelope | None,
         activation_outgoing: ContractEnvelope | None,
         received_at: datetime,
     ) -> ConsumeResult:
