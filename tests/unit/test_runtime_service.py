@@ -15,8 +15,8 @@ from modules.contracts import RuntimeRole
 from modules.domain import (
     IngestionFailureReason,
     IngestionFailureScope,
-    SourceChatRegistryEntry,
     TelegramPeerIdentity,
+    TelegramPeerKind,
 )
 from modules.geonames_location_resolver import GeoNamesLocationResolverAdapter
 
@@ -199,6 +199,8 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
 
     captured: list[dict[str, object]] = []
     recorded_at = datetime(2026, 1, 1, tzinfo=UTC)
+    active_identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 1000)
+    persisted_scope = ((active_identity, 7),)
 
     envelopes = tuple(
         SimpleNamespace(
@@ -222,19 +224,32 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
 
     class _RecordingSource:
         def __init__(self) -> None:
-            self.refreshes: list[tuple[SourceChatRegistryEntry, ...]] = []
+            self.refreshes: list[tuple[object, ...]] = []
 
-        def refresh_source_scope(
-            self, entries: Iterable[SourceChatRegistryEntry]
-        ) -> None:
+        def refresh_source_scope(self, entries: Iterable[object]) -> None:
             self.refreshes.append(tuple(entries))
+
+    class _PersistedScopeStore(_ReadyStore):
+        def active_source_chat_ingestion_scope(
+            self,
+        ) -> tuple[tuple[TelegramPeerIdentity, int], ...]:
+            return persisted_scope
+
+        def source_chat_ingestion_generation(self, identity: object) -> int | None:
+            return next(
+                (
+                    generation
+                    for persisted_identity, generation in persisted_scope
+                    if persisted_identity == identity
+                ),
+                None,
+            )
 
     class _RecordingRuntime:
         def __init__(self) -> None:
             self.source = _RecordingSource()
             self.provider_kwargs: dict[str, object] = {}
-            self.conformance_scopes: list[tuple[SourceChatRegistryEntry, ...]] = []
-            self.conformance_scope: frozenset[TelegramPeerIdentity] = frozenset()
+            self.conformance_scopes: list[tuple[object, ...]] = []
 
         def create_production_provider(self, **kwargs: object) -> _RecordingSource:
             self.provider_kwargs = kwargs
@@ -244,12 +259,11 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
             self,
             *,
             transport: _RecordingSource,
-            approved_source_chats: Iterable[SourceChatRegistryEntry],
+            approved_source_chats: Iterable[object],
         ) -> None:
             assert transport is self.source
-            scope: tuple[SourceChatRegistryEntry, ...] = tuple(approved_source_chats)
+            scope: tuple[object, ...] = tuple(approved_source_chats)
             self.conformance_scopes.append(scope)
-            self.conformance_scope = frozenset(entry.identity for entry in scope)
 
     class _RecordingAdapter:
         def __init__(self, **kwargs: object) -> None:
@@ -261,7 +275,7 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
 
     adapter_runtime = _RecordingRuntime()
 
-    monkeypatch.setattr(postgres_adapter, "PostgresRoleStore", _ReadyStore)
+    monkeypatch.setattr(postgres_adapter, "PostgresRoleStore", _PersistedScopeStore)
     monkeypatch.setattr(
         source_chat_bootstrap,
         "load_source_chat_seed_catalog",
@@ -300,9 +314,7 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
     assert service.role is RuntimeRole.INGESTION
     assert service.telethon_ingestion is service.application.telegram_ingestion
     scope = captured[0]["approved_source_chats"]
-    assert isinstance(scope, tuple)
-    assert len(scope) == 4
-    assert all(isinstance(entry, SourceChatRegistryEntry) for entry in scope)
+    assert scope == (active_identity,)
     assert adapter_runtime.conformance_scopes == [scope]
     assert adapter_runtime.source.refreshes == [scope]
     assert captured[0]["source"] is adapter_runtime.source
@@ -310,6 +322,100 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
         service.store.source_chat_ingestion_generation
     )
     assert service.telethon_ingestion.started is True
+
+
+def test_ingestion_bootstraps_only_after_telethon_authentication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modules import postgres_adapter, source_chat_bootstrap, telethon_ingestion
+    from modules.telethon_ingestion import TelethonRuntime
+
+    events: list[str] = []
+
+    class _RecordingSource:
+        def __init__(self) -> None:
+            self.authenticated = False
+
+        def refresh_source_scope(self, _entries: object) -> None:
+            return None
+
+        def resolve_source_chat(self, _address: str) -> object:
+            assert self.authenticated
+            events.append("resolve_source_chat")
+            return object()
+
+    class _RecordingRuntime:
+        def __init__(self) -> None:
+            self.source = _RecordingSource()
+
+        def create_production_provider(self, **_kwargs: object) -> _RecordingSource:
+            return self.source
+
+        def verify_conformance(
+            self,
+            *,
+            transport: _RecordingSource,
+            approved_source_chats: Iterable[object],
+        ) -> None:
+            assert transport is self.source
+            assert tuple(approved_source_chats) == ()
+            events.append("authenticate")
+            self.source.authenticated = True
+
+    class _RecordingAdapter:
+        def __init__(self, **_kwargs: object) -> None:
+            self.started = False
+
+        def start_live_ingestion(self) -> None:
+            self.started = True
+
+    def bootstrap(
+        _catalog: object,
+        *,
+        ingestion: _RecordingSource,
+        **_kwargs: object,
+    ) -> tuple[object, ...]:
+        ingestion.resolve_source_chat("@piterfut")
+        return (object(), object(), object(), object())
+
+    adapter_runtime = _RecordingRuntime()
+    monkeypatch.setattr(postgres_adapter, "PostgresRoleStore", _ReadyStore)
+    monkeypatch.setattr(
+        source_chat_bootstrap,
+        "load_source_chat_seed_catalog",
+        lambda _path: SimpleNamespace(seeds=(1, 2, 3, 4)),
+    )
+    monkeypatch.setattr(
+        source_chat_bootstrap,
+        "bootstrap_source_chat_catalog",
+        bootstrap,
+    )
+    monkeypatch.setattr(
+        TelethonRuntime,
+        "from_projection",
+        staticmethod(lambda _projection: adapter_runtime),
+    )
+    monkeypatch.setattr(
+        telethon_ingestion,
+        "TelethonIngestionAdapter",
+        _RecordingAdapter,
+    )
+
+    runtime_service.build_runtime_service(
+        "ingestion",
+        {
+            "DATABASE_URL_INGESTION": (
+                "postgresql://football_ingestion:controlled@db/football"
+            ),
+            "TELEGRAM_API_ID": "123456",
+            "TELEGRAM_API_HASH": "controlled-api-hash",
+            "TELEGRAM_SESSION_STRING": "controlled-session",
+            "TELEGRAM_ADMIN_USER_ID": "123456",
+        },
+        repository_root=Path("/srv/football-bot/current"),
+    )
+
+    assert events[:2] == ["authenticate", "resolve_source_chat"]
 
 
 def test_ingestion_role_transport_failure_uses_role_stop_boundary() -> None:

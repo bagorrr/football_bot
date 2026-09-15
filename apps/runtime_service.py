@@ -127,13 +127,6 @@ def build_runtime_service(
 
     if role is RuntimeRole.INGESTION:
         from modules.application import RuntimeApplication
-        from modules.domain import (
-            InitialConsentAttestation,
-            SourceChatAddressKind,
-            SourceChatRegistryEntry,
-            TelegramPeerIdentity,
-            TelegramPeerKind,
-        )
         from modules.source_chat_bootstrap import (
             bootstrap_source_chat_catalog,
             load_source_chat_seed_catalog,
@@ -146,6 +139,10 @@ def build_runtime_service(
 
         seed_catalog = load_source_chat_seed_catalog(
             repository_root / "config" / "source-chats.yaml"
+        )
+        persisted_scope = store.active_source_chat_ingestion_scope()
+        approved_source_chats = tuple(
+            identity for identity, _generation in persisted_scope
         )
         wake_event = Event()
         telethon_values = {
@@ -161,9 +158,14 @@ def build_runtime_service(
             T2TelethonProjection.from_mapping(telethon_values)
         )
         source = telethon_runtime.create_production_provider(
-            approved_source_chats=(),
+            approved_source_chats=approved_source_chats,
             source_scope_generation_lookup=store.source_chat_ingestion_generation,
         )
+        telethon_runtime.verify_conformance(
+            transport=source,
+            approved_source_chats=approved_source_chats,
+        )
+        source.refresh_source_scope(approved_source_chats)
         recorded_at = clock.now()
         resolutions = bootstrap_source_chat_catalog(
             seed_catalog,
@@ -174,56 +176,20 @@ def build_runtime_service(
         )
         if not resolutions or len(resolutions) != len(seed_catalog.seeds):
             raise RuntimeError("T2 bootstrap scope is incomplete")
-        approved_source_chats: list[SourceChatRegistryEntry] = []
-        for envelope in resolutions:
-            payload = envelope.payload
-            if not isinstance(payload, dict):
-                raise RuntimeError("T2 bootstrap scope is invalid")
-            peer_kind = payload.get("telegram_peer_kind")
-            telegram_chat_id = payload.get("telegram_chat_id")
-            address_kind = payload.get("address_kind")
-            current_address = payload.get("current_address")
-            transport_boundary = payload.get("transport_boundary")
-            registry_generation = payload.get("registry_generation")
-            if (
-                not isinstance(peer_kind, str)
-                or type(telegram_chat_id) is not int
-                or not isinstance(address_kind, str)
-                or not isinstance(current_address, str)
-                or not isinstance(transport_boundary, str)
-                or not transport_boundary.strip()
-                or type(registry_generation) is not int
-            ):
-                raise RuntimeError("T2 bootstrap scope is invalid")
-            try:
-                approved_source_chats.append(
-                    SourceChatRegistryEntry(
-                        identity=TelegramPeerIdentity(
-                            kind=TelegramPeerKind(peer_kind),
-                            telegram_id=telegram_chat_id,
-                        ),
-                        registry_generation=registry_generation,
-                        address_kind=SourceChatAddressKind(address_kind),
-                        current_address=current_address,
-                        processing_started_at=envelope.recorded_at,
-                        transport_boundary=transport_boundary,
-                        enabled=True,
-                        initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
-                        attested_at=envelope.recorded_at,
-                    )
-                )
-            except (TypeError, ValueError):
-                raise RuntimeError("T2 bootstrap scope is invalid") from None
-        approved_scope = tuple(approved_source_chats)
-        telethon_runtime.verify_conformance(
-            transport=source,
-            approved_source_chats=approved_scope,
-        )
-        source.refresh_source_scope(approved_scope)
+        current_scope = store.active_source_chat_ingestion_scope()
+        if current_scope != persisted_scope:
+            approved_source_chats = tuple(
+                identity for identity, _generation in current_scope
+            )
+            telethon_runtime.verify_conformance(
+                transport=source,
+                approved_source_chats=approved_source_chats,
+            )
+            source.refresh_source_scope(approved_source_chats)
         adapter = TelethonIngestionAdapter(
             runtime=telethon_runtime,
             source=source,
-            approved_source_chats=approved_scope,
+            approved_source_chats=approved_source_chats,
             live_update_callback=lambda _identity: wake_event.set(),
         )
         adapter.start_live_ingestion()
