@@ -18520,6 +18520,8 @@ class RuntimeApplication:
             IngestionFailureReason.AUTHENTICATION_LOST,
         }:
             return self._stop_ingestion_role(reason)
+        if scope is IngestionFailureScope.INGESTION_ROLE:
+            return self._stop_ingestion_role(reason)
         if account_stream or scope is IngestionFailureScope.ACCOUNT_STREAM:
             return self._stop_account_stream_for_transport_failure(reason=reason)
         if identity is not None and registry_generation is not None:

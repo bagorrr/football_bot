@@ -39,6 +39,7 @@ class RuntimeService:
     bot_api_ingress: Any | None = None
     telethon_ingestion: Any | None = None
     wake_event: Event | None = None
+    bot_api_conformance: Any | None = None
 
 
 _PRIMARY_CLASSIFIER_SCHEMA = "source-message-classification-v5"
@@ -126,6 +127,13 @@ def build_runtime_service(
 
     if role is RuntimeRole.INGESTION:
         from modules.application import RuntimeApplication
+        from modules.domain import (
+            InitialConsentAttestation,
+            SourceChatAddressKind,
+            SourceChatRegistryEntry,
+            TelegramPeerIdentity,
+            TelegramPeerKind,
+        )
         from modules.source_chat_bootstrap import (
             bootstrap_source_chat_catalog,
             load_source_chat_seed_catalog,
@@ -152,19 +160,73 @@ def build_runtime_service(
         telethon_runtime = TelethonRuntime.from_projection(
             T2TelethonProjection.from_mapping(telethon_values)
         )
-        adapter = TelethonIngestionAdapter.from_runtime(
-            runtime=telethon_runtime,
+        source = telethon_runtime.create_production_provider(
             approved_source_chats=(),
-            live_update_callback=lambda _identity: wake_event.set(),
             source_scope_generation_lookup=store.source_chat_ingestion_generation,
         )
-        bootstrap_source_chat_catalog(
+        recorded_at = clock.now()
+        resolutions = bootstrap_source_chat_catalog(
             seed_catalog,
-            ingestion=adapter,
+            ingestion=source,
             publisher=store,
             telegram_user_id=int(telethon_values["TELEGRAM_ADMIN_USER_ID"]),
-            recorded_at=clock.now(),
+            recorded_at=recorded_at,
         )
+        if not resolutions or len(resolutions) != len(seed_catalog.seeds):
+            raise RuntimeError("T2 bootstrap scope is incomplete")
+        approved_source_chats: list[SourceChatRegistryEntry] = []
+        for envelope in resolutions:
+            payload = envelope.payload
+            if not isinstance(payload, dict):
+                raise RuntimeError("T2 bootstrap scope is invalid")
+            peer_kind = payload.get("telegram_peer_kind")
+            telegram_chat_id = payload.get("telegram_chat_id")
+            address_kind = payload.get("address_kind")
+            current_address = payload.get("current_address")
+            transport_boundary = payload.get("transport_boundary")
+            registry_generation = payload.get("registry_generation")
+            if (
+                not isinstance(peer_kind, str)
+                or type(telegram_chat_id) is not int
+                or not isinstance(address_kind, str)
+                or not isinstance(current_address, str)
+                or not isinstance(transport_boundary, str)
+                or not transport_boundary.strip()
+                or type(registry_generation) is not int
+            ):
+                raise RuntimeError("T2 bootstrap scope is invalid")
+            try:
+                approved_source_chats.append(
+                    SourceChatRegistryEntry(
+                        identity=TelegramPeerIdentity(
+                            kind=TelegramPeerKind(peer_kind),
+                            telegram_id=telegram_chat_id,
+                        ),
+                        registry_generation=registry_generation,
+                        address_kind=SourceChatAddressKind(address_kind),
+                        current_address=current_address,
+                        processing_started_at=envelope.recorded_at,
+                        transport_boundary=transport_boundary,
+                        enabled=True,
+                        initial_consent_attestation=InitialConsentAttestation.CONFIRMED,
+                        attested_at=envelope.recorded_at,
+                    )
+                )
+            except (TypeError, ValueError):
+                raise RuntimeError("T2 bootstrap scope is invalid") from None
+        approved_scope = tuple(approved_source_chats)
+        telethon_runtime.verify_conformance(
+            transport=source,
+            approved_source_chats=approved_scope,
+        )
+        source.refresh_source_scope(approved_scope)
+        adapter = TelethonIngestionAdapter(
+            runtime=telethon_runtime,
+            source=source,
+            approved_source_chats=approved_scope,
+            live_update_callback=lambda _identity: wake_event.set(),
+        )
+        adapter.start_live_ingestion()
         application = RuntimeApplication(
             role=role,
             store=store,
@@ -199,8 +261,6 @@ def build_runtime_service(
     if role is RuntimeRole.CLASSIFICATION:
         from modules.application import RuntimeApplication
         from modules.classifier_configuration import (
-            DEFAULT_CLASSIFIER_MODEL,
-            DEFAULT_CLASSIFIER_REASONING_EFFORT,
             T4ClassifierProjection,
         )
         from modules.codex_classification_adapter import (
@@ -213,12 +273,12 @@ def build_runtime_service(
         if executable_text is None:
             raise RuntimeError("T4 classifier dependency is unavailable")
         executable = Path(executable_text)
-        classifier_configuration = T4ClassifierProjection(
-            model=values.get("CLASSIFIER_MODEL", DEFAULT_CLASSIFIER_MODEL),
-            reasoning_effort=values.get(
-                "CLASSIFIER_REASONING_EFFORT",
-                DEFAULT_CLASSIFIER_REASONING_EFFORT,
-            ),
+        classifier_configuration = T4ClassifierProjection.from_t4_projection(
+            {
+                key: values[key]
+                for key in ("CLASSIFIER_MODEL", "CLASSIFIER_REASONING_EFFORT")
+                if key in values
+            }
         )
         schema_paths, prompt_paths = _classifier_artifacts(repository_root)
         model = CodexCliClassifierAdapter(
@@ -250,6 +310,7 @@ def build_runtime_service(
     if role is RuntimeRole.BOT_ASSISTANT:
         from modules.application import RuntimeApplication
         from modules.bot_api import (
+            BotApiConformance,
             BotApiConversationHandler,
             BotApiDeliveryAdapter,
             BotApiHttpTransport,
@@ -289,6 +350,11 @@ def build_runtime_service(
             ),
         )
         delivery = BotApiDeliveryAdapter(cast(Any, bot_api.transport))
+        conformance = BotApiConformance(
+            configuration=bot_api.configuration,
+            transport=cast(Any, bot_api.transport),
+            delivery=delivery,
+        )
         t3_projection = {
             BOT_ASSISTANT_MODEL_KEY: _required(values, BOT_ASSISTANT_MODEL_KEY),
             BOT_ASSISTANT_REASONING_EFFORT_KEY: _required(
@@ -345,6 +411,7 @@ def build_runtime_service(
             application,
             store,
             bot_api_ingress=ingress,
+            bot_api_conformance=conformance,
         )
 
     raise ValueError("runtime role is unsupported")
@@ -421,18 +488,33 @@ def _run_bot_assistant(service: RuntimeService) -> None:
 
 
 def _run_ingestion(service: RuntimeService) -> None:
-    from modules.domain import TelegramPeerKind
+    from modules.domain import (
+        IngestionFailureReason,
+        IngestionFailureScope,
+        TelegramPeerKind,
+    )
+    from modules.telethon_ingestion import TelethonTransportError
 
     adapter = service.telethon_ingestion
     wake_event = service.wake_event
     if adapter is None or wake_event is None:
         raise RuntimeError("T2 ingestion boundary is unavailable")
 
+    live_transport_failure: list[TelethonTransportError] = []
+
     def run_live_transport() -> None:
         try:
             adapter.run_live_ingestion()
+        except TelethonTransportError as error:
+            live_transport_failure.append(error)
         except Exception:
-            pass
+            live_transport_failure.append(
+                TelethonTransportError(
+                    "Telegram live ingestion failed",
+                    reason=IngestionFailureReason.ACCESS_LOST,
+                    scope=IngestionFailureScope.INGESTION_ROLE,
+                )
+            )
         finally:
             wake_event.set()
 
@@ -440,7 +522,11 @@ def _run_ingestion(service: RuntimeService) -> None:
     live_thread.start()
     last_notification = 0.0
     while True:
-        if not live_thread.is_alive():
+        if live_transport_failure or not live_thread.is_alive():
+            if live_transport_failure:
+                service.application._stop_telethon_transport_failure(
+                    live_transport_failure[0]
+                )
             raise RuntimeError("T2 live transport stopped")
         worked = service.application.process_next()
         worked = service.application.process_account_telegram_difference() or worked
@@ -493,6 +579,9 @@ def _run(service: RuntimeService) -> int:
             return 78
         if service.bot_api_ingress is not None:
             service.bot_api_ingress.verify_readiness()
+            if service.bot_api_conformance is None:
+                raise RuntimeError("T1 conformance boundary is unavailable")
+            service.bot_api_conformance.run()
         _emit_readiness(
             service.role.value,
             configuration="ready",

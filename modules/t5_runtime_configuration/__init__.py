@@ -135,7 +135,7 @@ ROLE_DATABASE_KEYS = {
 ROLE_REQUIRED_KEYS: dict[str, frozenset[str]] = {
     "ingestion": ROLE_CONFIGURATION_KEYS["ingestion"],
     "application": ROLE_CONFIGURATION_KEYS["application"],
-    "classification": frozenset({DATABASE_URL_CLASSIFICATION, CLASSIFIER_CODEX_HOME}),
+    "classification": ROLE_CONFIGURATION_KEYS["classification"],
     "recommendation": ROLE_CONFIGURATION_KEYS["recommendation"],
     "bot_assistant": frozenset(
         {
@@ -457,23 +457,14 @@ def _validate_t4_settings(
 
     model = projection.get(CLASSIFIER_MODEL)
     effort = projection.get(CLASSIFIER_REASONING_EFFORT)
-    if (
-        model is None
-        and effort is None
-        and CLASSIFIER_MODEL not in statuses
-        and CLASSIFIER_REASONING_EFFORT not in statuses
-    ):
-        statuses[CLASSIFIER_MODEL] = "defaulted"
-        statuses[CLASSIFIER_REASONING_EFFORT] = "defaulted"
-        return
-    if model is None and CLASSIFIER_MODEL not in statuses:
-        statuses[CLASSIFIER_MODEL] = "missing"
+    if model is None:
+        statuses.setdefault(CLASSIFIER_MODEL, "missing")
     elif statuses.get(CLASSIFIER_MODEL) in {"ready", "missing"} and model != (
         DEFAULT_CLASSIFIER_MODEL
     ):
         statuses[CLASSIFIER_MODEL] = "unsupported"
-    if effort is None and CLASSIFIER_REASONING_EFFORT not in statuses:
-        statuses[CLASSIFIER_REASONING_EFFORT] = "missing"
+    if effort is None:
+        statuses.setdefault(CLASSIFIER_REASONING_EFFORT, "missing")
     elif statuses.get(CLASSIFIER_REASONING_EFFORT) in {
         "ready",
         "missing",

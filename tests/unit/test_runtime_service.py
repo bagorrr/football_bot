@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Callable, Iterable
+from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from apps import runtime_service
 from modules.contracts import RuntimeRole
-from modules.domain import TelegramPeerIdentity
+from modules.domain import (
+    IngestionFailureReason,
+    IngestionFailureScope,
+    SourceChatRegistryEntry,
+    TelegramPeerIdentity,
+)
 from modules.geonames_location_resolver import GeoNamesLocationResolverAdapter
 
 
@@ -127,41 +137,150 @@ def test_bot_assistant_production_composition_uses_real_adapters_and_t1_boundary
     )
     assert service.application.telegram_admin_user_id == 123456
     assert service.application.telegram_ingestion is None
+    assert service.bot_api_conformance is not None
+
+
+def test_runtime_readiness_runs_bot_api_conformance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modules import t5_runtime_configuration
+
+    class _Ingress:
+        def __init__(self) -> None:
+            self.readiness_checks = 0
+
+        def verify_readiness(self) -> None:
+            self.readiness_checks += 1
+
+    class _Conformance:
+        def __init__(self) -> None:
+            self.probes = 0
+
+        def run(self) -> None:
+            self.probes += 1
+
+    class _ReadyReport:
+        configuration_ready = True
+
+    ingress = _Ingress()
+    conformance = _Conformance()
+    monkeypatch.setattr(
+        t5_runtime_configuration,
+        "preflight_role",
+        lambda _role, _projection: _ReadyReport(),
+    )
+    monkeypatch.setattr(
+        runtime_service, "_emit_readiness", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(runtime_service, "_notify_systemd", lambda _message: None)
+
+    def stop_runtime(_service: runtime_service.RuntimeService) -> None:
+        raise RuntimeError("controlled stop")
+
+    monkeypatch.setattr(runtime_service, "_run_bot_assistant", stop_runtime)
+    service = runtime_service.RuntimeService(
+        role=RuntimeRole.BOT_ASSISTANT,
+        application=object(),
+        store=object(),
+        bot_api_ingress=ingress,
+        bot_api_conformance=conformance,
+    )
+
+    assert runtime_service._run(service) == 1
+    assert ingress.readiness_checks == 1
+    assert conformance.probes == 1
 
 
 def test_ingestion_production_composition_uses_generation_scoped_telethon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from modules import postgres_adapter, source_chat_bootstrap
-    from modules.telethon_ingestion import TelethonIngestionAdapter, TelethonRuntime
+    from modules import postgres_adapter, source_chat_bootstrap, telethon_ingestion
+    from modules.telethon_ingestion import TelethonRuntime
 
     captured: list[dict[str, object]] = []
-    adapter = object()
+    recorded_at = datetime(2026, 1, 1, tzinfo=UTC)
 
-    def create_adapter(**kwargs: object) -> object:
-        captured.append(kwargs)
-        return adapter
+    envelopes = tuple(
+        SimpleNamespace(
+            recorded_at=recorded_at,
+            payload={
+                "source_chat_key": f"source-chat:channel:{1000 + index}",
+                "telegram_user_id": 123456,
+                "telegram_peer_kind": "channel",
+                "telegram_chat_id": 1000 + index,
+                "address_kind": "public_username",
+                "current_address": f"@{username}",
+                "transport_boundary": f"channel-pts:{index}",
+                "registry_generation": 1,
+                "registration_request_id": f"request-{index}",
+            },
+        )
+        for index, username in enumerate(
+            ("piterfut", "lovefootballspb", "fballer_spb", "spbfutbol")
+        )
+    )
+
+    class _RecordingSource:
+        def __init__(self) -> None:
+            self.refreshes: list[tuple[SourceChatRegistryEntry, ...]] = []
+
+        def refresh_source_scope(
+            self, entries: Iterable[SourceChatRegistryEntry]
+        ) -> None:
+            self.refreshes.append(tuple(entries))
+
+    class _RecordingRuntime:
+        def __init__(self) -> None:
+            self.source = _RecordingSource()
+            self.provider_kwargs: dict[str, object] = {}
+            self.conformance_scopes: list[tuple[SourceChatRegistryEntry, ...]] = []
+            self.conformance_scope: frozenset[TelegramPeerIdentity] = frozenset()
+
+        def create_production_provider(self, **kwargs: object) -> _RecordingSource:
+            self.provider_kwargs = kwargs
+            return self.source
+
+        def verify_conformance(
+            self,
+            *,
+            transport: _RecordingSource,
+            approved_source_chats: Iterable[SourceChatRegistryEntry],
+        ) -> None:
+            assert transport is self.source
+            scope: tuple[SourceChatRegistryEntry, ...] = tuple(approved_source_chats)
+            self.conformance_scopes.append(scope)
+            self.conformance_scope = frozenset(entry.identity for entry in scope)
+
+    class _RecordingAdapter:
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(kwargs)
+            self.started = False
+
+        def start_live_ingestion(self) -> None:
+            self.started = True
+
+    adapter_runtime = _RecordingRuntime()
 
     monkeypatch.setattr(postgres_adapter, "PostgresRoleStore", _ReadyStore)
     monkeypatch.setattr(
         source_chat_bootstrap,
         "load_source_chat_seed_catalog",
-        lambda _path: object(),
+        lambda _path: SimpleNamespace(seeds=(1, 2, 3, 4)),
     )
     monkeypatch.setattr(
         source_chat_bootstrap,
         "bootstrap_source_chat_catalog",
-        lambda *args, **kwargs: (),
+        lambda *args, **kwargs: envelopes,
     )
     monkeypatch.setattr(
         TelethonRuntime,
         "from_projection",
-        staticmethod(lambda _projection: object()),
+        staticmethod(lambda _projection: adapter_runtime),
     )
     monkeypatch.setattr(
-        TelethonIngestionAdapter,
-        "from_runtime",
-        staticmethod(create_adapter),
+        telethon_ingestion,
+        "TelethonIngestionAdapter",
+        _RecordingAdapter,
     )
 
     service = runtime_service.build_runtime_service(
@@ -179,12 +298,104 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
     )
 
     assert service.role is RuntimeRole.INGESTION
-    assert service.telethon_ingestion is adapter
-    assert service.application.telegram_ingestion is adapter
-    assert captured[0]["approved_source_chats"] == ()
-    assert captured[0]["source_scope_generation_lookup"] == (
+    assert service.telethon_ingestion is service.application.telegram_ingestion
+    scope = captured[0]["approved_source_chats"]
+    assert isinstance(scope, tuple)
+    assert len(scope) == 4
+    assert all(isinstance(entry, SourceChatRegistryEntry) for entry in scope)
+    assert adapter_runtime.conformance_scopes == [scope]
+    assert adapter_runtime.source.refreshes == [scope]
+    assert captured[0]["source"] is adapter_runtime.source
+    assert adapter_runtime.provider_kwargs["source_scope_generation_lookup"] == (
         service.store.source_chat_ingestion_generation
     )
+    assert service.telethon_ingestion.started is True
+
+
+def test_ingestion_role_transport_failure_uses_role_stop_boundary() -> None:
+    from modules.application import RuntimeApplication
+    from modules.telethon_ingestion import TelethonTransportError
+
+    class _FailureBoundary:
+        def __init__(self) -> None:
+            self.reason: IngestionFailureReason | None = None
+
+        def _stop_ingestion_role(self, reason: IngestionFailureReason) -> bool:
+            self.reason = reason
+            return True
+
+        def _stop_account_stream_for_transport_failure(
+            self, *, reason: IngestionFailureReason
+        ) -> bool:
+            raise AssertionError(f"unexpected account stop: {reason}")
+
+    boundary = _FailureBoundary()
+    error = TelethonTransportError(
+        "controlled live failure",
+        reason=IngestionFailureReason.ACCESS_LOST,
+        scope=IngestionFailureScope.INGESTION_ROLE,
+    )
+
+    assert RuntimeApplication._stop_telethon_transport_failure(
+        cast(RuntimeApplication, boundary), error
+    )
+    assert boundary.reason is IngestionFailureReason.ACCESS_LOST
+
+
+def test_run_ingestion_routes_typed_live_failure_to_durable_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modules.telethon_ingestion import TelethonTransportError
+
+    class _Adapter:
+        def run_live_ingestion(self) -> None:
+            raise TelethonTransportError(
+                "controlled live failure",
+                reason=IngestionFailureReason.ACCESS_LOST,
+                scope=IngestionFailureScope.INGESTION_ROLE,
+            )
+
+    class _ImmediateThread:
+        def __init__(self, target: Callable[[], None], *, daemon: bool) -> None:
+            assert daemon is True
+            self._target = target
+            self._alive = True
+
+        def start(self) -> None:
+            self._target()
+            self._alive = False
+
+        def is_alive(self) -> bool:
+            return self._alive
+
+    class _Application:
+        def __init__(self) -> None:
+            self.stopped: list[Exception] = []
+            self.process_calls = 0
+
+        def _stop_telethon_transport_failure(self, error: Exception) -> bool:
+            self.stopped.append(error)
+            return True
+
+        def process_next(self) -> bool:
+            self.process_calls += 1
+            return False
+
+    service = runtime_service.RuntimeService(
+        role=RuntimeRole.INGESTION,
+        application=_Application(),
+        store=object(),
+        telethon_ingestion=_Adapter(),
+        wake_event=Event(),
+    )
+    monkeypatch.setattr(runtime_service, "Thread", _ImmediateThread)
+
+    with pytest.raises(RuntimeError, match="T2 live transport stopped"):
+        runtime_service._run_ingestion(service)
+
+    assert len(service.application.stopped) == 1
+    assert isinstance(service.application.stopped[0], TelethonTransportError)
+    assert service.application.process_calls == 0
 
 
 def test_classification_production_composition_uses_primary_codex_adapter(
@@ -208,6 +419,8 @@ def test_classification_production_composition_uses_primary_codex_adapter(
                 "postgresql://football_classification:controlled@db/football"
             ),
             "CLASSIFIER_CODEX_HOME": "/var/lib/football-bot/classification/codex",
+            "CLASSIFIER_MODEL": "gpt-5.6-sol",
+            "CLASSIFIER_REASONING_EFFORT": "high",
         },
         repository_root=Path(__file__).resolve().parents[2],
     )
@@ -216,6 +429,31 @@ def test_classification_production_composition_uses_primary_codex_adapter(
     assert isinstance(service.application.model, CodexCliClassifierAdapter)
     assert service.application.telegram_ingestion is None
     assert service.application.telegram_delivery is None
+
+
+def test_classification_runtime_rejects_missing_model_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modules import postgres_adapter
+    from modules.classifier_configuration import ClassifierConfigurationError
+
+    monkeypatch.setattr(postgres_adapter, "PostgresRoleStore", _ReadyStore)
+    monkeypatch.setattr(shutil, "which", lambda _command: "/usr/bin/codex")
+
+    with pytest.raises(ClassifierConfigurationError) as error:
+        runtime_service.build_runtime_service(
+            "classification",
+            {
+                "DATABASE_URL_CLASSIFICATION": (
+                    "postgresql://football_classification:controlled@db/football"
+                ),
+                "CLASSIFIER_CODEX_HOME": "/var/lib/football-bot/classification/codex",
+            },
+            repository_root=Path(__file__).resolve().parents[2],
+        )
+
+    assert error.value.key == "CLASSIFIER_MODEL"
+    assert error.value.status == "missing"
 
 
 def test_recommendation_production_composition_uses_its_own_database_role(

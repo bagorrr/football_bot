@@ -176,6 +176,23 @@ def test_bot_assistant_policy_must_be_explicit_and_validated(
     assert not report.configuration_ready
 
 
+def test_classifier_policy_must_be_explicit() -> None:
+    report = preflight_role(
+        "classification",
+        {
+            "DATABASE_URL_CLASSIFICATION": (
+                "postgresql://football_classification:local@localhost/football"
+            ),
+            "CLASSIFIER_CODEX_HOME": "/var/lib/football-bot/classification/codex",
+        },
+        check_protected_paths=False,
+    )
+
+    assert report.key_statuses["CLASSIFIER_MODEL"] == "missing"
+    assert report.key_statuses["CLASSIFIER_REASONING_EFFORT"] == "missing"
+    assert not report.configuration_ready
+
+
 def test_project_role_rejects_unknown_role_without_exposing_values() -> None:
     with pytest.raises(T5ConfigurationError) as error:
         project_role({"TELEGRAM_BOT_TOKEN": "secret-token"}, "unknown")
