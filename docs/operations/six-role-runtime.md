@@ -249,24 +249,180 @@ the verification record.
 
 ## Database migrations, backup, rollback, and recovery
 
-Runtime database credentials cannot create or apply migrations. Use a separate
-operator-only PostgreSQL migration identity and a protected `PGPASSFILE` (or
-the host's approved secret manager); never put it in the T5 runtime master or
-on a command line. Before an authorized migration, stop all five services,
-take and verify a custom-format `pg_dump`, confirm restore capability in an
-isolated database, and run the repository's
-`PostgresAcceptanceMigrator.migrate()` from the exact candidate checkout. Its
-advisory lock and checksummed append-only migration ledger reject drift; do not
-edit or delete applied migration records.
+Runtime database credentials cannot create or apply migrations. Use the
+separate operator-only role `football_migrations`; it must remain
+`NOSUPERUSER`, `NOINHERIT`, `NOCREATEDB`, `NOCREATEROLE`, `NOREPLICATION`, and
+`NOBYPASSRLS`. The role receives only `CONNECT, CREATE` on
+`football_bot_staging` and one PostgreSQL 16 role membership for each runtime
+role. Each membership is explicitly `SET TRUE, INHERIT FALSE, ADMIN FALSE`.
+Those memberships are required because existing migrations execute
+`ALTER FUNCTION ... OWNER TO football_*`; they do not grant runtime data
+access to the migration role through inheritance. Do not grant `SUPERUSER`,
+`pg_monitor`, `pg_read_all_data`, `pg_write_all_data`, or any other unrelated
+role. During one migrator transaction, the runner uses those `SET` privileges
+to apply adjacent function ACL statements as their new owners. It also grants
+the migration role temporary `EXECUTE` on existing and newly created runtime
+functions and temporary `CREATE` on `football_runtime` while an owner transfer
+is in progress; both temporary grants are removed before the migration ledger
+commit and must not be provisioned as persistent access.
 
-There are no automatic down migrations. If a schema operation fails before
-commit, inspect the redacted migration ledger and stop; do not mark it applied
-or retry after an uncertain outcome until current database state is reconciled.
-Prefer a forward corrective migration. Restore a verified backup only with
-the services stopped, an explicit recovery decision, and an isolated restore
-validation; restoring an older snapshot discards later writes and is not a
-routine code rollback. A code rollback is safe only when the deployed schema
-remains compatible and the previous code passes its own readiness checks.
+Provision or reconcile the role as the local PostgreSQL administrator. The
+password is entered through psql's protected prompt or the approved secret
+manager; `<redacted>` is a placeholder and must never be committed or printed:
+
+```text
+sudo -u postgres psql --dbname=postgres --set=ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_roles WHERE rolname = 'football_migrations'
+    ) THEN
+        CREATE ROLE football_migrations LOGIN NOSUPERUSER NOINHERIT
+            NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    ELSE
+        ALTER ROLE football_migrations LOGIN NOSUPERUSER NOINHERIT
+            NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    END IF;
+END
+$$;
+SQL
+sudo -u postgres psql --dbname=postgres --set=ON_ERROR_STOP=1 \
+  --command='\password football_migrations'
+
+sudo -u postgres psql --dbname=postgres --set=ON_ERROR_STOP=1 <<'SQL'
+GRANT CONNECT, CREATE ON DATABASE football_bot_staging
+    TO football_migrations;
+GRANT football_ingestion,
+      football_application,
+      football_classification,
+      football_recommendation,
+      football_bot_assistant
+    TO football_migrations
+    WITH SET TRUE, INHERIT FALSE, ADMIN FALSE;
+SQL
+```
+
+Before each authorized migration, verify the candidate checkout and the
+redacted identity contract through the migration login. Store the password in
+an approved protected `PGPASSFILE` (or secret manager), never in the T5
+runtime master, a command line, shell history, or a log:
+
+```text
+test "$(git rev-parse HEAD)" = "<reviewed-candidate-sha>"
+export PGPASSFILE=/run/football-bot/migration.pgpass
+export MIGRATION_DATABASE_URL='postgresql://football_migrations@127.0.0.1/football_bot_staging'
+
+psql "${MIGRATION_DATABASE_URL}" -X --set=ON_ERROR_STOP=1 \
+  --tuples-only --no-align <<'SQL'
+WITH expected(role_name) AS (
+    VALUES ('football_ingestion'), ('football_application'),
+           ('football_classification'), ('football_recommendation'),
+           ('football_bot_assistant')
+), actual AS (
+    SELECT granted_role.rolname, membership.admin_option,
+           membership.inherit_option, membership.set_option
+    FROM pg_auth_members AS membership
+    JOIN pg_roles AS member ON member.oid = membership.member
+    JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+    WHERE member.rolname = current_user
+), role_state AS (
+    SELECT rolcanlogin, rolsuper, rolinherit, rolcreaterole,
+           rolcreatedb, rolreplication, rolbypassrls
+    FROM pg_roles
+    WHERE rolname = current_user
+)
+SELECT CASE WHEN current_user = 'football_migrations'
+    AND (SELECT rolcanlogin AND NOT rolsuper AND NOT rolinherit
+         AND NOT rolcreaterole AND NOT rolcreatedb
+         AND NOT rolreplication AND NOT rolbypassrls FROM role_state)
+    AND has_database_privilege(current_user, current_database(), 'CONNECT')
+    AND has_database_privilege(current_user, current_database(), 'CREATE')
+    AND (SELECT count(*) FROM actual) = (SELECT count(*) FROM expected)
+    AND NOT EXISTS (
+        SELECT 1 FROM actual
+        WHERE rolname NOT IN (SELECT role_name FROM expected)
+           OR admin_option IS NOT FALSE
+           OR inherit_option IS NOT FALSE
+           OR set_option IS NOT TRUE
+    )
+    THEN 'migration_identity=ready'
+    ELSE 'migration_identity=failed'
+END;
+SQL
+```
+
+Stop all five long-running services before changing the database. T3 is an
+ephemeral worker managed by Bot Assistant and has no separate unit. Take a
+custom-format backup and verify restore in an isolated database before the
+schema change:
+
+```text
+backup_path='/var/backups/football_bot_staging_<utc>.dump'
+restore_database='football_bot_restore_<run-id>'
+sudo -u postgres pg_dump --format=custom \
+  --file="${backup_path}" --dbname=football_bot_staging
+sudo -u postgres pg_restore --list "${backup_path}" >/dev/null
+sudo -u postgres createdb "${restore_database}"
+sudo -u postgres pg_restore --exit-on-error \
+  --dbname="${restore_database}" "${backup_path}"
+sudo -u postgres dropdb --if-exists "${restore_database}"
+```
+
+With services stopped and the exact checkout selected, run only the
+repository migrator through `MIGRATION_DATABASE_URL`:
+
+```text
+python3 - <<'PY'
+import os
+
+from modules.postgres_adapter import PostgresAcceptanceMigrator
+
+PostgresAcceptanceMigrator(os.environ['MIGRATION_DATABASE_URL']).migrate()
+print('migration_contract=applied')
+PY
+```
+
+The migrator's advisory lock, immutable checksums, and append-only ledger
+reject concurrent or drifted changes. Do not edit or delete applied migration
+records. There are no automatic down migrations. If the command fails or its
+outcome is uncertain, keep services stopped, record only redacted ledger and
+schema status, and reconcile the database before any retry. A failed DDL
+transaction must not be marked applied. Prefer a forward corrective migration.
+
+Restore a verified backup only after an explicit recovery decision, with
+services stopped and a second isolated restore validation. Restoring an older
+snapshot discards later writes and is not a routine code rollback. A code
+rollback is safe only when the deployed schema remains compatible and the
+previous code passes its own readiness checks.
+
+After a successful migration, remove the protected `PGPASSFILE`, unset
+`MIGRATION_DATABASE_URL`, and retain the role object and exact grants for the
+next separately authorized migration; it remains outside every runtime
+credential. When no migration window is active, set the role `NOLOGIN` and
+revoke its database `CONNECT, CREATE` privileges, then reconcile and restore
+the same contract before the next migration. For a temporary staging attempt
+that rolled back before creating the schemas, verify `football_runtime` and
+`football_migrations` are absent and the migration ledger is absent, revoke
+all five memberships and database privileges, and drop only that temporary
+`football_migrations` role. The redacted cleanup commands are:
+
+```text
+sudo -u postgres psql --dbname=postgres --set=ON_ERROR_STOP=1 <<'SQL'
+ALTER ROLE football_migrations NOLOGIN;
+REVOKE CONNECT, CREATE ON DATABASE football_bot_staging
+    FROM football_migrations;
+REVOKE football_ingestion,
+       football_application,
+       football_classification,
+       football_recommendation,
+       football_bot_assistant
+    FROM football_migrations;
+-- Only after the temporary database has no retained schemas or objects:
+DROP ROLE football_migrations;
+SQL
+```
+
+Never drop a role that owns a retained schema.
 
 ## Protected acceptance gate
 

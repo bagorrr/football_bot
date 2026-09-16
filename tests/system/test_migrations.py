@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from threading import Barrier
+from typing import cast
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
-from psycopg import sql
+from psycopg import conninfo, sql
 
 from modules.contracts import RuntimeRole, derive_source_event_message_id
 from modules.domain import (
@@ -42,6 +45,74 @@ from modules.testkit import (
 def _migration_paths() -> list[Path]:
     migration_root = Path(__file__).resolve().parents[2] / "db" / "migrations"
     return sorted(migration_root.glob("*.sql"))
+
+
+@pytest.fixture
+def separate_migration_database_login(
+    fresh_database_url: str,
+) -> Iterator[tuple[str, str]]:
+    """Provision one disposable NOSUPERUSER migration login for this database."""
+    admin_database_url = os.environ["TEST_DATABASE_URL"]
+    database_name = cast(
+        str,
+        conninfo.conninfo_to_dict(fresh_database_url)["dbname"],
+    )
+    role_name = f"football_migrations_test_{uuid4().hex}"
+    password = uuid4().hex
+    role_identifier = sql.Identifier(role_name)
+
+    with psycopg.connect(admin_database_url, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL(
+                "CREATE ROLE {} LOGIN NOSUPERUSER NOINHERIT NOCREATEDB "
+                "NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD {}"
+            ).format(role_identifier, sql.Literal(password)),
+        )
+        for runtime_role in RuntimeRole:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM pg_roles WHERE rolname = %s",
+                    (runtime_role.database_role,),
+                ).fetchone()
+                is None
+            ):
+                connection.execute(
+                    sql.SQL("CREATE ROLE {} NOLOGIN").format(
+                        sql.Identifier(runtime_role.database_role),
+                    ),
+                )
+            connection.execute(
+                sql.SQL(
+                    "GRANT {} TO {} WITH SET TRUE, INHERIT FALSE, ADMIN FALSE"
+                ).format(
+                    sql.Identifier(runtime_role.database_role),
+                    role_identifier,
+                ),
+            )
+        connection.execute(
+            sql.SQL("GRANT CONNECT, CREATE ON DATABASE {} TO {}").format(
+                sql.Identifier(database_name), role_identifier
+            ),
+        )
+
+    try:
+        yield (
+            conninfo.make_conninfo(
+                fresh_database_url,
+                user=role_name,
+                password=password,
+            ),
+            role_name,
+        )
+    finally:
+        with psycopg.connect(fresh_database_url, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL("DROP OWNED BY {} CASCADE").format(role_identifier),
+            )
+        with psycopg.connect(admin_database_url, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL("DROP ROLE {}").format(role_identifier),
+            )
 
 
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
@@ -673,6 +744,83 @@ def _assert_final_migration_state(database_url: str) -> None:
             "sequence_id",
         ),
     ]
+
+
+def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_memberships(
+    fresh_database_url: str,
+    separate_migration_database_login: tuple[str, str],
+) -> None:
+    migration_database_url, migration_role = separate_migration_database_login
+    migrator = PostgresAcceptanceMigrator(
+        fresh_database_url,
+        migration_database_url=migration_database_url,
+    )
+
+    migrator.migrate()
+    with psycopg.connect(migration_database_url) as connection:
+        identity = connection.execute(
+            """
+            SELECT rolcanlogin, rolsuper, rolinherit, rolcreaterole,
+                   rolcreatedb, rolreplication, rolbypassrls
+            FROM pg_roles
+            WHERE rolname = current_user
+            """,
+        ).fetchone()
+        memberships = connection.execute(
+            """
+            SELECT granted_role.rolname, membership.admin_option,
+                   membership.inherit_option, membership.set_option
+            FROM pg_auth_members AS membership
+            JOIN pg_roles AS member ON member.oid = membership.member
+            JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+            WHERE member.rolname = current_user
+            ORDER BY granted_role.rolname
+            """,
+        ).fetchall()
+        database_privileges = connection.execute(
+            """
+            SELECT has_database_privilege(current_user, current_database(), 'CONNECT'),
+                   has_database_privilege(current_user, current_database(), 'CREATE'),
+                   NOT EXISTS (
+                       SELECT 1
+                       FROM pg_database AS database_row
+                       CROSS JOIN LATERAL aclexplode(database_row.datacl) AS acl
+                       WHERE database_row.datname = current_database()
+                         AND acl.grantee = (
+                             SELECT oid
+                             FROM pg_roles
+                             WHERE rolname = current_user
+                         )
+                         AND acl.privilege_type = 'TEMPORARY'
+                   )
+            """,
+        ).fetchone()
+
+    assert identity == (True, False, False, False, False, False, False)
+    assert memberships == [
+        (role.database_role, False, False, True)
+        for role in sorted(RuntimeRole, key=lambda role: role.database_role)
+    ]
+    assert database_privileges == (True, True, True)
+
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            sql.SQL("GRANT pg_monitor TO {}").format(
+                sql.Identifier(migration_role),
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="material schema drift"):
+        migrator.migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            sql.SQL("REVOKE pg_monitor FROM {}").format(
+                sql.Identifier(migration_role),
+            ),
+        )
+
+    migrator.migrate()
 
 
 def test_bot_assistant_can_read_only_the_current_tournament_projection(

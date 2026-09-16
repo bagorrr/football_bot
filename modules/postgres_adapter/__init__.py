@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
@@ -307,12 +308,273 @@ ALTER TABLE football_runtime.bot_message_outbox
 """
 
 _RUNTIME_DATABASE_ROLES = tuple(role.database_role for role in RuntimeRole)
+_OWNER_TRANSFER_MARKER = b"OWNER TO football_"
+_FUNCTION_NAME_PATTERN = re.compile(
+    r"\b(?:FUNCTION|PROCEDURE)\s+"
+    r"(?P<schema>[a-z_][a-z0-9_]*)\.(?P<name>[a-z_][a-z0-9_]*)\s*\(",
+    re.IGNORECASE,
+)
+_OWNER_TRANSFER_PATTERN = re.compile(
+    r"^\s*ALTER\s+FUNCTION\b.*?\bOWNER\s+TO\s+"
+    r"(?P<role>football_[a-z0-9_]+)\s*;\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_FUNCTION_ACL_PATTERN = re.compile(
+    r"^\s*(?:GRANT|REVOKE)\b.*?\bON\s+FUNCTION\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _repository_migration_paths() -> tuple[Path, ...]:
     """Return the ordered migration files used by every schema boundary."""
     migration_root = Path(__file__).resolve().parents[2] / "db" / "migrations"
     return tuple(sorted(migration_root.glob("*.sql")))
+
+
+def _split_migration_sql(migration_sql: str) -> tuple[str, ...]:
+    """Split repository SQL while preserving dollar-quoted function bodies."""
+    statements: list[str] = []
+    statement_start = 0
+    quote: str | None = None
+    dollar_tag: str | None = None
+    line_comment = False
+    block_comment = False
+    index = 0
+    while index < len(migration_sql):
+        character = migration_sql[index]
+        next_character = (
+            migration_sql[index + 1] if index + 1 < len(migration_sql) else ""
+        )
+        if line_comment:
+            if character == "\n":
+                line_comment = False
+            index += 1
+            continue
+        if block_comment:
+            if character == "*" and next_character == "/":
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if dollar_tag is not None:
+            if migration_sql.startswith(dollar_tag, index):
+                index += len(dollar_tag)
+                dollar_tag = None
+            else:
+                index += 1
+            continue
+        if quote is not None:
+            if character == quote:
+                if next_character == quote:
+                    index += 2
+                    continue
+                quote = None
+            elif character == "\\" and quote == "'":
+                index += 2
+                continue
+            index += 1
+            continue
+        if character == "-" and next_character == "-":
+            line_comment = True
+            index += 2
+            continue
+        if character == "/" and next_character == "*":
+            block_comment = True
+            index += 2
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            index += 1
+            continue
+        if character == "$":
+            dollar_match = re.match(r"\$[A-Za-z_0-9]*\$", migration_sql[index:])
+            if dollar_match is not None:
+                dollar_tag = dollar_match.group(0)
+                index += len(dollar_tag)
+                continue
+        if character == ";":
+            statement = migration_sql[statement_start : index + 1].strip()
+            if statement:
+                statements.append(statement)
+            statement_start = index + 1
+        index += 1
+    trailing_statement = migration_sql[statement_start:].strip()
+    if trailing_statement:
+        statements.append(trailing_statement)
+    return tuple(statements)
+
+
+def _migration_function_identity(
+    connection: psycopg.Connection[Any],
+    statement: str,
+) -> tuple[str, str] | None:
+    match = _FUNCTION_NAME_PATTERN.search(statement)
+    if match is None:
+        return None
+    return match.group("schema"), match.group("name")
+
+
+def _existing_migration_function_owner(
+    connection: psycopg.Connection[Any],
+    statement: str,
+) -> str | None:
+    identity = _migration_function_identity(connection, statement)
+    if identity is None:
+        return None
+    owners: set[str] = {
+        row[0]
+        for row in connection.execute(
+            """
+            SELECT pg_get_userbyid(procedure.proowner)
+            FROM pg_proc AS procedure
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = procedure.pronamespace
+            WHERE namespace.nspname = %s
+              AND procedure.proname = %s
+            """,
+            identity,
+        ).fetchall()
+    }
+    if len(owners) == 1:
+        return next(iter(owners))
+    return None
+
+
+def _set_migration_session_role(
+    connection: psycopg.Connection[Any],
+    role: str | None,
+) -> None:
+    if role is None:
+        connection.execute("RESET ROLE")
+    else:
+        connection.execute(sql.SQL("SET ROLE {}").format(sql.Identifier(role)))
+
+
+def _revoke_migration_function_grants(
+    connection: psycopg.Connection[Any],
+    migration_role: str,
+) -> None:
+    """Remove only the temporary direct grants held by the migration role."""
+    rows = connection.execute(
+        """
+        SELECT namespace.nspname,
+               procedure.proname,
+               pg_get_function_identity_arguments(procedure.oid),
+               pg_get_userbyid(procedure.proowner)
+        FROM pg_proc AS procedure
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = procedure.pronamespace
+        CROSS JOIN LATERAL aclexplode(
+            COALESCE(
+                procedure.proacl,
+                acldefault('f', procedure.proowner)
+            )
+        ) AS acl
+        WHERE namespace.nspname = 'football_runtime'
+          AND acl.grantee = (
+              SELECT oid FROM pg_roles WHERE rolname = %s
+          )
+        """,
+        (migration_role,),
+    ).fetchall()
+    active_role: str | None = None
+    for schema_name, function_name, arguments, owner in rows:
+        desired_role = owner if owner in _RUNTIME_DATABASE_ROLES else None
+        if desired_role != active_role:
+            _set_migration_session_role(connection, desired_role)
+            active_role = desired_role
+        connection.execute(
+            sql.SQL("REVOKE EXECUTE ON FUNCTION {}.{}({}) FROM {}").format(
+                sql.Identifier(schema_name),
+                sql.Identifier(function_name),
+                sql.SQL(arguments),
+                sql.Identifier(migration_role),
+            )
+        )
+    if active_role is not None:
+        _set_migration_session_role(connection, None)
+
+
+def _grant_migration_function_grants(
+    connection: psycopg.Connection[Any],
+    migration_role: str,
+) -> None:
+    """Grant temporary function-body visibility through each real owner."""
+    rows = connection.execute(
+        """
+        SELECT namespace.nspname,
+               procedure.proname,
+               pg_get_function_identity_arguments(procedure.oid),
+               pg_get_userbyid(procedure.proowner)
+        FROM pg_proc AS procedure
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = procedure.pronamespace
+        WHERE namespace.nspname = 'football_runtime'
+        ORDER BY namespace.nspname, procedure.proname,
+                 pg_get_function_identity_arguments(procedure.oid)
+        """
+    ).fetchall()
+    active_role: str | None = None
+    for schema_name, function_name, arguments, owner in rows:
+        if owner == migration_role:
+            desired_role = None
+        elif owner in _RUNTIME_DATABASE_ROLES:
+            desired_role = owner
+        else:
+            continue
+        if desired_role != active_role:
+            _set_migration_session_role(connection, desired_role)
+            active_role = desired_role
+        connection.execute(
+            sql.SQL("GRANT EXECUTE ON FUNCTION {}.{}({}) TO {}").format(
+                sql.Identifier(schema_name),
+                sql.Identifier(function_name),
+                sql.SQL(arguments),
+                sql.Identifier(migration_role),
+            )
+        )
+    if active_role is not None:
+        _set_migration_session_role(connection, None)
+
+
+def _grant_migration_function_identity(
+    connection: psycopg.Connection[Any],
+    statement: str,
+    migration_role: str,
+    owner_role: str | None,
+) -> None:
+    """Keep a temporary grant on a function created during this migration."""
+    if owner_role is None:
+        return
+    identity = _migration_function_identity(connection, statement)
+    if identity is None:
+        return
+    rows = connection.execute(
+        """
+        SELECT namespace.nspname,
+               procedure.proname,
+               pg_get_function_identity_arguments(procedure.oid)
+        FROM pg_proc AS procedure
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = procedure.pronamespace
+        JOIN pg_roles AS owner
+          ON owner.oid = procedure.proowner
+        WHERE namespace.nspname = %s
+          AND procedure.proname = %s
+          AND owner.rolname = %s
+        """,
+        (*identity, owner_role),
+    ).fetchall()
+    for schema_name, function_name, arguments in rows:
+        connection.execute(
+            sql.SQL("GRANT EXECUTE ON FUNCTION {}.{}({}) TO {}").format(
+                sql.Identifier(schema_name),
+                sql.Identifier(function_name),
+                sql.SQL(arguments),
+                sql.Identifier(migration_role),
+            )
+        )
 
 
 def _validate_applied_migrations(
@@ -529,7 +791,15 @@ WITH runtime_roles AS (
 ), migration_owner AS (
     SELECT oid, rolname
     FROM pg_roles
-    WHERE rolname = COALESCE(%s::name, current_user)
+    WHERE rolname = COALESCE(
+        %s::name,
+        (
+            SELECT owner.rolname
+            FROM pg_namespace AS namespace
+            JOIN pg_roles AS owner ON owner.oid = namespace.nspowner
+            WHERE namespace.nspname = 'football_migrations'
+        )
+    )
 ), material AS (
     SELECT 'role'::text AS object_kind,
            role.rolname::text AS object_identity,
@@ -560,8 +830,18 @@ WITH runtime_roles AS (
     FROM pg_auth_members AS membership
     JOIN pg_roles AS member ON member.oid = membership.member
     JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
-    WHERE member.oid IN (SELECT oid FROM runtime_roles)
-       OR granted_role.oid IN (SELECT oid FROM runtime_roles)
+    WHERE (
+        member.oid IN (SELECT oid FROM runtime_roles)
+        OR granted_role.oid IN (SELECT oid FROM runtime_roles)
+        OR member.oid = (SELECT oid FROM migration_owner)
+    )
+      AND NOT (
+          member.oid = (SELECT oid FROM migration_owner)
+          AND granted_role.oid IN (SELECT oid FROM runtime_roles)
+          AND membership.admin_option IS FALSE
+          AND membership.inherit_option IS FALSE
+          AND membership.set_option IS TRUE
+      )
 
     UNION ALL
 
@@ -888,16 +1168,27 @@ def _assert_runtime_migration_integrity(
 
 
 class PostgresAcceptanceMigrator:
-    """Administrative schema setup kept outside every runtime process."""
+    """Schema setup kept outside every runtime process.
 
-    def __init__(self, admin_database_url: str) -> None:
+    ``admin_database_url`` is retained for testkit credential provisioning;
+    migrations themselves use ``migration_database_url`` when supplied so a
+    least-privilege PostgreSQL role can own and apply the schema changes.
+    """
+
+    def __init__(
+        self,
+        admin_database_url: str,
+        *,
+        migration_database_url: str | None = None,
+    ) -> None:
         self._admin_database_url = admin_database_url
+        self._migration_database_url = migration_database_url or admin_database_url
 
     def migrate(self) -> None:
         """Apply each immutable repository migration exactly once."""
         migration_paths = _repository_migration_paths()
         migration_names = tuple(path.name for path in migration_paths)
-        with psycopg.connect(self._admin_database_url) as connection:
+        with psycopg.connect(self._migration_database_url) as connection:
             connection.execute(
                 """
                 SELECT pg_advisory_xact_lock(
@@ -972,6 +1263,17 @@ class PostgresAcceptanceMigrator:
                 applied_migrations,
                 migration_paths,
             )
+            migration_identity = connection.execute(
+                """
+                SELECT current_user, rolsuper
+                FROM pg_roles
+                WHERE rolname = current_user
+                """,
+            ).fetchone()
+            if migration_identity is None:
+                raise RuntimeError("Migration identity is unavailable")
+            migration_role = migration_identity[0]
+            migration_is_superuser = migration_identity[1]
             if not adopted_untracked_schema:
                 _assert_material_schema(connection, applied_count)
             for migration_path in migration_paths:
@@ -980,7 +1282,84 @@ class PostgresAcceptanceMigrator:
                 applied_checksum = applied_migrations.get(migration_path.name)
                 if applied_checksum is not None:
                     continue
-                connection.execute(migration_bytes.decode("utf-8"))
+                grants_owner_transfer = (
+                    _OWNER_TRANSFER_MARKER in migration_bytes
+                    and not migration_is_superuser
+                )
+                grants_migration_execute = (
+                    applied_count > 0 and not migration_is_superuser
+                )
+                if grants_migration_execute:
+                    _grant_migration_function_grants(connection, migration_role)
+                if grants_owner_transfer:
+                    runtime_roles = sql.SQL(", ").join(
+                        sql.Identifier(role) for role in _RUNTIME_DATABASE_ROLES
+                    )
+                    connection.execute(
+                        sql.SQL("GRANT CREATE ON SCHEMA football_runtime TO {}").format(
+                            runtime_roles
+                        ),
+                    )
+                if migration_is_superuser:
+                    connection.execute(migration_bytes.decode("utf-8"))
+                else:
+                    # PostgreSQL resets function ACLs on OWNER transfer. Keep
+                    # the source migration immutable, and hand off only the
+                    # affected ACL statements to each SET-only owner role.
+                    active_role: str | None = None
+                    pending_owner_role: str | None = None
+                    for statement in _split_migration_sql(
+                        migration_bytes.decode("utf-8")
+                    ):
+                        statement_is_acl = _FUNCTION_ACL_PATTERN.match(statement)
+                        statement_is_function_mutation = re.match(
+                            r"^\s*(?:CREATE(?:\s+OR\s+REPLACE)?|ALTER|DROP)\s+"
+                            r"(?:FUNCTION|PROCEDURE)\b",
+                            statement,
+                            re.IGNORECASE,
+                        )
+                        owner_transfer = _OWNER_TRANSFER_PATTERN.match(statement)
+                        desired_role = pending_owner_role if statement_is_acl else None
+                        pending_owner_role = (
+                            pending_owner_role if statement_is_acl else None
+                        )
+                        if desired_role is None and statement_is_function_mutation:
+                            existing_owner = _existing_migration_function_owner(
+                                connection,
+                                statement,
+                            )
+                            if owner_transfer is None or (
+                                existing_owner == owner_transfer.group("role")
+                            ):
+                                desired_role = existing_owner
+                        if desired_role not in _RUNTIME_DATABASE_ROLES:
+                            desired_role = None
+                        if desired_role != active_role:
+                            _set_migration_session_role(connection, desired_role)
+                            active_role = desired_role
+                        connection.execute(statement)
+                        if statement_is_acl or statement_is_function_mutation:
+                            _grant_migration_function_identity(
+                                connection,
+                                statement,
+                                migration_role,
+                                active_role or migration_role,
+                            )
+                        if owner_transfer is not None:
+                            pending_owner_role = owner_transfer.group("role")
+                    if active_role is not None:
+                        _set_migration_session_role(connection, None)
+                if grants_owner_transfer:
+                    runtime_roles = sql.SQL(", ").join(
+                        sql.Identifier(role) for role in _RUNTIME_DATABASE_ROLES
+                    )
+                    connection.execute(
+                        sql.SQL(
+                            "REVOKE CREATE ON SCHEMA football_runtime FROM {}"
+                        ).format(runtime_roles),
+                    )
+                if grants_migration_execute:
+                    _revoke_migration_function_grants(connection, migration_role)
                 applied_count = migration_names.index(migration_path.name) + 1
                 if reconcile_pre_0003_delivery and applied_count == 3:
                     connection.execute(_PRE_0003_DELIVERY_RECONCILIATION)
