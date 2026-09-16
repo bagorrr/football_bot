@@ -931,7 +931,7 @@ class TelethonProvider:
     ) -> str:
         """Capture a typed transport boundary after address resolution."""
         try:
-            entity = self._entity_for_identity(identity)
+            entity = self._entity_for_identity(identity, refresh=False)
             from telethon import functions, types  # type: ignore[import-untyped]
 
             if identity.kind.value == "channel":
