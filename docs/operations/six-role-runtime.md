@@ -220,15 +220,18 @@ when usage or provider policy changes.
 
 ## PostgreSQL host contract
 
-The supported target is PostgreSQL 14.x from the Ubuntu 22.04 repositories.
-Install the `postgresql-14` and `postgresql-client-14` packages, keep the
-listener loopback only, and use the staging database `football_bot_staging` with the
-`football_migrations` and `football_runtime` schemas. The five runtime roles
-are `football_ingestion`, `football_application`, `football_classification`,
+The supported target is PostgreSQL 16.x from the PostgreSQL Apt Repository
+(PGDG) for Ubuntu 22.04. Ubuntu's default archive provides PostgreSQL 14, but
+the current readiness schema fingerprint uses PostgreSQL 16 role-membership
+metadata; PostgreSQL 14 is therefore outside this contract. Install the
+`postgresql-16` and `postgresql-client-16` packages from PGDG, keep the
+listener loopback only, and use the staging database `football_bot_staging`
+with the `football_migrations` and `football_runtime` schemas. The five runtime
+roles are `football_ingestion`, `football_application`,
+`football_classification`,
 `football_recommendation`, and `football_bot_assistant`; migrations use a
 separate operator identity. Local `quality` and pull-request CI use the
-matching `postgres:14-alpine` image, so PostgreSQL 16 is outside this
-acceptance contract.
+matching `postgres:16-alpine` image.
 
 After the target database is available, verify only the major version and
 print a redacted status:
@@ -236,7 +239,7 @@ print a redacted status:
 ```text
 postgresql_version="$(sudo -u postgres psql --dbname=postgres --tuples-only --no-align --command='SHOW server_version_num' 2>/dev/null || true)"
 case "${postgresql_version}" in
-  14*) printf '%s\n' 'postgresql_contract=ready major=14' ;;
+  16*) printf '%s\n' 'postgresql_contract=ready major=16' ;;
   *) printf '%s\n' 'postgresql_contract=failed' ; exit 1 ;;
 esac
 ```

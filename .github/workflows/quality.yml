@@ -50,7 +50,7 @@ jobs:
               tests/system/test_zero_result_search.py
     services:
       postgres:
-        image: postgres:14-alpine
+        image: postgres:16-alpine
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -92,10 +92,10 @@ jobs:
                   "unexpected PostgreSQL identity: "
                   f"{current_user}@{current_database}"
               )
-          if not str(server_version_num).startswith("14"):
-              raise SystemExit("postgresql contract is not major version 14")
+          if not str(server_version_num).startswith("16"):
+              raise SystemExit("postgresql contract is not major version 16")
 
-          print("postgresql_contract=ready major=14 identity=postgres@postgres")
+          print("postgresql_contract=ready major=16 identity=postgres@postgres")
       - name: Run repository static quality checks
         if: ${{ matrix.shard == 'unit-static' }}
         run: |

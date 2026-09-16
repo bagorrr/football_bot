@@ -17,7 +17,7 @@ if [[ -z "${TEST_DATABASE_URL:-}" ]]; then
     --name "${quality_postgres_container}" \
     --env POSTGRES_PASSWORD=postgres \
     --publish 127.0.0.1::5432 \
-    postgres:14-alpine >/dev/null
+    postgres:16-alpine >/dev/null
   quality_postgres_port="$(
     docker port "${quality_postgres_container}" 5432/tcp | sed 's/.*://'
   )"
@@ -35,9 +35,9 @@ if [[ -z "${TEST_DATABASE_URL:-}" ]]; then
       --command='SHOW server_version_num' 2>/dev/null
   )"
   case "${quality_postgres_version}" in
-    14*) ;;
+    16*) ;;
     *)
-      echo "local PostgreSQL contract is not major version 14" >&2
+      echo "local PostgreSQL contract is not major version 16" >&2
       exit 1
       ;;
   esac
