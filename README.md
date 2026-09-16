@@ -24,9 +24,9 @@ repository-local CI entry point:
 ```
 
 When `TEST_DATABASE_URL` is absent, the command starts a temporary local
-PostgreSQL 16 container. Pull-request and `main` CI supplies its own PostgreSQL
-service. The checks use only synthetic data and make no live Telegram, model,
-Location Resolver, or other provider calls.
+PostgreSQL 14 container. Pull-request and `main` CI supplies its own
+PostgreSQL 14 service. The checks use only synthetic data and make no live
+Telegram, model, Location Resolver, or other provider calls.
 
 ## Project documents
 

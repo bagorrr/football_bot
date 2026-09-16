@@ -723,7 +723,7 @@ def test_classification_production_composition_uses_primary_codex_adapter(
     monkeypatch.setattr(
         runtime_service,
         "_codex_cli_version",
-        lambda _executable, *, codex_home: "codex 1.0",
+        lambda _executable, *, codex_home: "codex-cli 0.144.4",
     )
 
     service = runtime_service.build_runtime_service(
@@ -743,6 +743,34 @@ def test_classification_production_composition_uses_primary_codex_adapter(
     assert isinstance(service.application.model, CodexCliClassifierAdapter)
     assert service.application.telegram_ingestion is None
     assert service.application.telegram_delivery is None
+
+
+def test_classification_production_composition_rejects_an_unpinned_codex_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modules import postgres_adapter
+
+    monkeypatch.setattr(postgres_adapter, "PostgresRoleStore", _ReadyStore)
+    monkeypatch.setattr(shutil, "which", lambda _command: "/usr/bin/codex")
+    monkeypatch.setattr(
+        runtime_service,
+        "_codex_cli_version",
+        lambda _executable, *, codex_home: "codex-cli 0.143.4",
+    )
+
+    with pytest.raises(RuntimeError, match="T4 classifier dependency is unavailable"):
+        runtime_service.build_runtime_service(
+            "classification",
+            {
+                "DATABASE_URL_CLASSIFICATION": (
+                    "postgresql://football_classification:controlled@db/football"
+                ),
+                "CLASSIFIER_CODEX_HOME": "/var/lib/football-bot/classification/codex",
+                "CLASSIFIER_MODEL": "gpt-5.6-sol",
+                "CLASSIFIER_REASONING_EFFORT": "high",
+            },
+            repository_root=Path(__file__).resolve().parents[2],
+        )
 
 
 def test_classification_runtime_rejects_missing_model_policy(

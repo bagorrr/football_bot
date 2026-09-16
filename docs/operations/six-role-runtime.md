@@ -65,6 +65,25 @@ Provision a separate protected ChatGPT-authenticated `CODEX_HOME` for each of
 Classification and Bot Assistant. The two paths must not be shared. Keep model
 policy in validated configuration, not an operator's personal Codex profile.
 
+The Classification role uses the pinned `codex-cli 0.144.4` executable. This
+is a separate host installation from the Python `openai-codex` dependency used
+by the one-shot Bot Assistant SDK worker. The classifier adapter requires
+`codex exec` to accept `--ignore-user-config --ignore-rules --strict-config`;
+do not substitute an older binary or remove that flag. Before starting the
+Classification service, run this redacted contract check as its service user:
+
+```text
+codex_cli_version="$(codex --version 2>/dev/null || true)"
+if [[ "${codex_cli_version}" != "codex-cli 0.144.4" ]]; then
+  printf '%s\n' 'codex_cli_contract=failed'
+  exit 1
+fi
+printf '%s\n' 'codex_cli_contract=ready version=0.144.4 strict_config=required'
+```
+
+The check prints status only; never include authentication output or the
+protected `CODEX_HOME` contents in an issue, journal, or handoff.
+
 ## Redacted configuration preflight and rotation
 
 The preflight-only path validates one T5 role projection and prints key names
@@ -198,6 +217,32 @@ presentations include `Search by LocationIQ.com` with the
 [LocationIQ match-quality documentation](https://docs.locationiq.com/docs/match-quality),
 and [LocationIQ attribution requirements](https://locationiq.com/attribution)
 when usage or provider policy changes.
+
+## PostgreSQL host contract
+
+The supported target is PostgreSQL 14.x from the Ubuntu 22.04 repositories.
+Install the `postgresql-14` and `postgresql-client-14` packages, keep the
+listener loopback only, and use the staging database `football_bot_staging` with the
+`football_migrations` and `football_runtime` schemas. The five runtime roles
+are `football_ingestion`, `football_application`, `football_classification`,
+`football_recommendation`, and `football_bot_assistant`; migrations use a
+separate operator identity. Local `quality` and pull-request CI use the
+matching `postgres:14-alpine` image, so PostgreSQL 16 is outside this
+acceptance contract.
+
+After the target database is available, verify only the major version and
+print a redacted status:
+
+```text
+postgresql_version="$(sudo -u postgres psql --dbname=postgres --tuples-only --no-align --command='SHOW server_version_num' 2>/dev/null || true)"
+case "${postgresql_version}" in
+  14*) printf '%s\n' 'postgresql_contract=ready major=14' ;;
+  *) printf '%s\n' 'postgresql_contract=failed' ; exit 1 ;;
+esac
+```
+
+Do not include connection strings, role credentials, or full server output in
+the verification record.
 
 ## Database migrations, backup, rollback, and recovery
 

@@ -50,7 +50,7 @@ jobs:
               tests/system/test_zero_result_search.py
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:14-alpine
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -81,16 +81,21 @@ jobs:
 
           with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
               with connection.cursor() as cursor:
-                  cursor.execute("SELECT current_user, current_database()")
-                  current_user, current_database = cursor.fetchone()
+                  cursor.execute(
+                      "SELECT current_user, current_database(), "
+                      "current_setting('server_version_num')"
+                  )
+                  current_user, current_database, server_version_num = cursor.fetchone()
 
           if (current_user, current_database) != ("postgres", "postgres"):
               raise SystemExit(
                   "unexpected PostgreSQL identity: "
                   f"{current_user}@{current_database}"
               )
+          if not str(server_version_num).startswith("14"):
+              raise SystemExit("postgresql contract is not major version 14")
 
-          print("connected as postgres to database postgres")
+          print("postgresql_contract=ready major=14 identity=postgres@postgres")
       - name: Run repository static quality checks
         if: ${{ matrix.shard == 'unit-static' }}
         run: |

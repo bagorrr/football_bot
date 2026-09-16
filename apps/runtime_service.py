@@ -232,6 +232,7 @@ def build_runtime_service(
             T4ClassifierProjection,
         )
         from modules.codex_classification_adapter import (
+            CODEX_CLI_VERSION,
             CodexCliClassifierAdapter,
             SubprocessCodexRunner,
         )
@@ -249,6 +250,9 @@ def build_runtime_service(
             }
         )
         schema_paths, prompt_paths = _classifier_artifacts(repository_root)
+        codex_version = _codex_cli_version(executable, codex_home=codex_home)
+        if codex_version != CODEX_CLI_VERSION:
+            raise RuntimeError("T4 classifier dependency is unavailable")
         model = CodexCliClassifierAdapter(
             codex_executable=executable,
             codex_home=codex_home,
@@ -256,7 +260,7 @@ def build_runtime_service(
             schema_paths=schema_paths,
             prompt_paths=prompt_paths,
             runner=SubprocessCodexRunner(),
-            codex_version=_codex_cli_version(executable, codex_home=codex_home),
+            codex_version=codex_version,
             adapter_version="codex-cli-classifier-runtime-v1",
             classifier_configuration=classifier_configuration,
             primary_schema_version=_PRIMARY_CLASSIFIER_SCHEMA,

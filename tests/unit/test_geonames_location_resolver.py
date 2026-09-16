@@ -117,6 +117,7 @@ def test_http_transport_repeats_geo_names_feature_class_parameters() -> None:
 
     request, timeout = requests[0]
     assert timeout == 3.0
+    assert urlsplit(request.full_url).hostname == "secure.geonames.org"
     assert parse_qs(urlsplit(request.full_url).query) == {
         "featureClass": ["A", "P", "S", "L", "H"],
         "username": ["controlled-user"],
