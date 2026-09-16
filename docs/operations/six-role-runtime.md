@@ -264,7 +264,11 @@ to apply adjacent function ACL statements as their new owners. It also grants
 the migration role temporary `EXECUTE` on existing and newly created runtime
 functions and temporary `CREATE` on `football_runtime` while an owner transfer
 is in progress; both temporary grants are removed before the migration ledger
-commit and must not be provisioned as persistent access.
+commit and must not be provisioned as persistent access. Material-schema
+fingerprints receive this same migration session owner explicitly at every
+boundary, including the first boundary when `football_runtime` exists before
+`football_migrations`; a missing ledger must never make the runtime schema
+appear unauthorized.
 
 Provision or reconcile the role as the local PostgreSQL administrator. The
 password is entered through psql's protected prompt or the approved secret

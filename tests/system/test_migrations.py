@@ -10,13 +10,14 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from threading import Barrier
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 from psycopg import conninfo, sql
 
+from modules import postgres_adapter
 from modules.contracts import RuntimeRole, derive_source_event_message_id
 from modules.domain import (
     SourceEventKind,
@@ -749,6 +750,7 @@ def _assert_final_migration_state(database_url: str) -> None:
 def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_memberships(
     fresh_database_url: str,
     separate_migration_database_login: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     migration_database_url, migration_role = separate_migration_database_login
     migrator = PostgresAcceptanceMigrator(
@@ -756,7 +758,42 @@ def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_members
         migration_database_url=migration_database_url,
     )
 
+    first_boundary_owners: list[str | None] = []
+    original_assert_material_schema = postgres_adapter._assert_material_schema
+
+    def assert_material_schema_at_boundary(
+        connection: psycopg.Connection[Any],
+        applied_count: int,
+        *,
+        migration_owner: str | None = None,
+    ) -> None:
+        if applied_count == 1:
+            first_boundary_owners.append(migration_owner)
+            assert connection.execute(
+                """
+                SELECT current_user,
+                       (
+                           SELECT owner.rolname
+                           FROM pg_namespace AS namespace
+                           JOIN pg_roles AS owner ON owner.oid = namespace.nspowner
+                           WHERE namespace.nspname = 'football_runtime'
+                       )
+                """
+            ).fetchone() == (migration_role, migration_role)
+        original_assert_material_schema(
+            connection,
+            applied_count,
+            migration_owner=migration_owner,
+        )
+
+    monkeypatch.setattr(
+        postgres_adapter,
+        "_assert_material_schema",
+        assert_material_schema_at_boundary,
+    )
+
     migrator.migrate()
+    assert first_boundary_owners == [migration_role]
     with psycopg.connect(migration_database_url) as connection:
         identity = connection.execute(
             """

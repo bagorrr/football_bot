@@ -798,7 +798,8 @@ WITH runtime_roles AS (
             FROM pg_namespace AS namespace
             JOIN pg_roles AS owner ON owner.oid = namespace.nspowner
             WHERE namespace.nspname = 'football_migrations'
-        )
+        ),
+        current_user
     )
 ), material AS (
     SELECT 'role'::text AS object_kind,
@@ -1108,8 +1109,13 @@ def _assert_material_schema(
 
 def _legacy_migration_prefix(
     connection: psycopg.Connection[Any],
+    *,
+    migration_owner: str | None = None,
 ) -> tuple[int, bool]:
-    fingerprint = _material_schema_fingerprint(connection)
+    fingerprint = _material_schema_fingerprint(
+        connection,
+        migration_owner=migration_owner,
+    )
     try:
         return _MATERIAL_SCHEMA_FINGERPRINTS.index(fingerprint) + 1, False
     except ValueError as error:
@@ -1199,6 +1205,17 @@ class PostgresAcceptanceMigrator:
                 )
                 """,
             )
+            migration_identity = connection.execute(
+                """
+                SELECT current_user, rolsuper
+                FROM pg_roles
+                WHERE rolname = current_user
+                """,
+            ).fetchone()
+            if migration_identity is None:
+                raise RuntimeError("Migration identity is unavailable")
+            migration_role = migration_identity[0]
+            migration_is_superuser = migration_identity[1]
             migration_state = connection.execute(
                 """
                 SELECT to_regclass(
@@ -1242,7 +1259,8 @@ class PostgresAcceptanceMigrator:
             reconcile_pre_0003_delivery = False
             if not history_existed and runtime_schema_existed:
                 applied_count, reconcile_pre_0003_delivery = _legacy_migration_prefix(
-                    connection
+                    connection,
+                    migration_owner=migration_role,
                 )
                 adopted_untracked_schema = True
                 expected_legacy_names = _LEGACY_MIGRATION_NAMES[:applied_count]
@@ -1263,19 +1281,12 @@ class PostgresAcceptanceMigrator:
                 applied_migrations,
                 migration_paths,
             )
-            migration_identity = connection.execute(
-                """
-                SELECT current_user, rolsuper
-                FROM pg_roles
-                WHERE rolname = current_user
-                """,
-            ).fetchone()
-            if migration_identity is None:
-                raise RuntimeError("Migration identity is unavailable")
-            migration_role = migration_identity[0]
-            migration_is_superuser = migration_identity[1]
             if not adopted_untracked_schema:
-                _assert_material_schema(connection, applied_count)
+                _assert_material_schema(
+                    connection,
+                    applied_count,
+                    migration_owner=migration_role,
+                )
             for migration_path in migration_paths:
                 migration_bytes = migration_path.read_bytes()
                 migration_checksum = sha256(migration_bytes).hexdigest()
@@ -1364,7 +1375,11 @@ class PostgresAcceptanceMigrator:
                 if reconcile_pre_0003_delivery and applied_count == 3:
                     connection.execute(_PRE_0003_DELIVERY_RECONCILIATION)
                     reconcile_pre_0003_delivery = False
-                _assert_material_schema(connection, applied_count)
+                _assert_material_schema(
+                    connection,
+                    applied_count,
+                    migration_owner=migration_role,
+                )
                 connection.execute(
                     """
                     INSERT INTO football_migrations.applied_migrations (
