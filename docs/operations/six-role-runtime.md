@@ -268,7 +268,10 @@ commit and must not be provisioned as persistent access. Material-schema
 fingerprints receive this same migration session owner explicitly at every
 boundary, including the first boundary when `football_runtime` exists before
 `football_migrations`; a missing ledger must never make the runtime schema
-appear unauthorized.
+appear unauthorized. Fingerprint queries use transaction-local
+`search_path = pg_catalog` and restore the caller's prior setting, keeping
+catalog renderings such as `pg_get_indexdef` deterministic across migration
+identities.
 
 Provision or reconcile the role as the local PostgreSQL administrator. The
 password is entered through psql's protected prompt or the approved secret

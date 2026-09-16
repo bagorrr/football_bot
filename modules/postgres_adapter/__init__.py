@@ -1082,10 +1082,25 @@ def _material_schema_fingerprint(
     migration_owner: str | None = None,
 ) -> str:
     """Hash the complete migration-owned runtime schema contract."""
-    rows = connection.execute(
-        _MATERIAL_SCHEMA_QUERY,
-        (list(_RUNTIME_DATABASE_ROLES), migration_owner),
-    ).fetchall()
+    search_path_row = connection.execute("SHOW search_path").fetchone()
+    if (
+        search_path_row is None
+        or not isinstance(search_path_row, (tuple, list))
+        or not search_path_row
+        or not isinstance(search_path_row[0], str)
+    ):
+        raise RuntimeError("Could not inspect search_path")
+    connection.execute("SET LOCAL search_path = pg_catalog")
+    try:
+        rows = connection.execute(
+            _MATERIAL_SCHEMA_QUERY,
+            (list(_RUNTIME_DATABASE_ROLES), migration_owner),
+        ).fetchall()
+    finally:
+        connection.execute(
+            "SELECT pg_catalog.set_config('search_path', %s, true)",
+            (search_path_row[0],),
+        )
     canonical = json.dumps(rows, ensure_ascii=True, separators=(",", ":"))
     return sha256(canonical.encode("utf-8")).hexdigest()
 

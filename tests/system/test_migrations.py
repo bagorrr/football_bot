@@ -753,12 +753,27 @@ def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_members
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     migration_database_url, migration_role = separate_migration_database_login
+    with psycopg.connect(fresh_database_url, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
+                sql.Identifier(migration_role),
+                sql.Identifier(migration_role),
+            ),
+        )
+        connection.execute(
+            sql.SQL(
+                "ALTER ROLE {} SET search_path = {}, football_migrations, public"
+            ).format(
+                sql.Identifier(migration_role),
+                sql.Identifier(migration_role),
+            ),
+        )
     migrator = PostgresAcceptanceMigrator(
         fresh_database_url,
         migration_database_url=migration_database_url,
     )
 
-    first_boundary_owners: list[str | None] = []
+    first_boundary_observations: list[tuple[int, str | None, str, str, str]] = []
     original_assert_material_schema = postgres_adapter._assert_material_schema
 
     def assert_material_schema_at_boundary(
@@ -768,7 +783,29 @@ def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_members
         migration_owner: str | None = None,
     ) -> None:
         if applied_count == 1:
-            first_boundary_owners.append(migration_owner)
+            before_search_path_row = connection.execute(
+                "SHOW search_path",
+            ).fetchone()
+            assert before_search_path_row is not None
+            before_search_path = before_search_path_row[0]
+            boundary_fingerprint = postgres_adapter._material_schema_fingerprint(
+                connection,
+                migration_owner=migration_owner,
+            )
+            after_search_path_row = connection.execute(
+                "SHOW search_path",
+            ).fetchone()
+            assert after_search_path_row is not None
+            after_search_path = after_search_path_row[0]
+            first_boundary_observations.append(
+                (
+                    applied_count,
+                    migration_owner,
+                    before_search_path,
+                    after_search_path,
+                    boundary_fingerprint,
+                ),
+            )
             assert connection.execute(
                 """
                 SELECT current_user,
@@ -793,7 +830,30 @@ def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_members
     )
 
     migrator.migrate()
-    assert first_boundary_owners == [migration_role]
+    assert len(first_boundary_observations) == 1
+    (
+        first_boundary_count,
+        first_boundary_owner,
+        before_search_path,
+        after_search_path,
+        first_boundary_fingerprint,
+    ) = first_boundary_observations[0]
+    assert first_boundary_count == 1
+    assert first_boundary_owner == migration_role
+    assert migration_role in before_search_path
+    assert "football_migrations" in before_search_path
+    assert after_search_path == before_search_path
+    assert (
+        first_boundary_fingerprint
+        == (postgres_adapter._MATERIAL_SCHEMA_FINGERPRINTS[0])
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        completed_migration_count_row = connection.execute(
+            "SELECT count(*) FROM football_migrations.applied_migrations",
+        ).fetchone()
+        assert completed_migration_count_row is not None
+        completed_migration_count = completed_migration_count_row[0]
+    assert completed_migration_count == len(_migration_paths())
     with psycopg.connect(migration_database_url) as connection:
         identity = connection.execute(
             """
