@@ -768,6 +768,12 @@ def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_members
                 sql.Identifier(migration_role),
             ),
         )
+    with psycopg.connect(migration_database_url) as connection:
+        caller_search_path_row = connection.execute(
+            "SHOW search_path",
+        ).fetchone()
+    assert caller_search_path_row is not None
+    caller_search_path = caller_search_path_row[0]
     migrator = PostgresAcceptanceMigrator(
         fresh_database_url,
         migration_database_url=migration_database_url,
@@ -840,8 +846,7 @@ def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_members
     ) = first_boundary_observations[0]
     assert first_boundary_count == 1
     assert first_boundary_owner == migration_role
-    assert migration_role in before_search_path
-    assert "football_migrations" in before_search_path
+    assert before_search_path == "public"
     assert after_search_path == before_search_path
     assert (
         first_boundary_fingerprint
@@ -853,7 +858,51 @@ def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_members
         ).fetchone()
         assert completed_migration_count_row is not None
         completed_migration_count = completed_migration_count_row[0]
+        uuid_extension_schema = connection.execute(
+            """
+            SELECT namespace.nspname
+            FROM pg_extension AS extension
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = extension.extnamespace
+            WHERE extension.extname = 'uuid-ossp'
+            """,
+        ).fetchone()
+        uuid_function_rows = connection.execute(
+            """
+            SELECT namespace.nspname, procedure.proname
+            FROM pg_proc AS procedure
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = procedure.pronamespace
+            JOIN pg_depend AS dependency
+              ON dependency.classid = 'pg_proc'::regclass
+             AND dependency.objid = procedure.oid
+             AND dependency.deptype = 'e'
+            JOIN pg_extension AS extension
+              ON extension.oid = dependency.refobjid
+            WHERE extension.extname = 'uuid-ossp'
+            ORDER BY namespace.nspname, procedure.proname
+            """,
+        ).fetchall()
     assert completed_migration_count == len(_migration_paths())
+    assert uuid_extension_schema == ("public",)
+    assert {schema_name for schema_name, _ in uuid_function_rows} == {"public"}
+    assert {function_name for _, function_name in uuid_function_rows} == {
+        "uuid_generate_v1",
+        "uuid_generate_v1mc",
+        "uuid_generate_v3",
+        "uuid_generate_v4",
+        "uuid_generate_v5",
+        "uuid_nil",
+        "uuid_ns_dns",
+        "uuid_ns_oid",
+        "uuid_ns_url",
+        "uuid_ns_x500",
+    }
+    with psycopg.connect(migration_database_url) as connection:
+        restored_search_path_row = connection.execute(
+            "SHOW search_path",
+        ).fetchone()
+    assert restored_search_path_row == (caller_search_path,)
     with psycopg.connect(migration_database_url) as connection:
         identity = connection.execute(
             """

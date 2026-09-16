@@ -271,7 +271,9 @@ boundary, including the first boundary when `football_runtime` exists before
 appear unauthorized. Fingerprint queries use transaction-local
 `search_path = pg_catalog` and restore the caller's prior setting, keeping
 catalog renderings such as `pg_get_indexdef` deterministic across migration
-identities.
+identities. Migration setup and every migration statement use a transaction-
+local `search_path = public`, so unqualified extension objects are created in
+`public`; the caller's path is restored before the migration transaction ends.
 
 Provision or reconcile the role as the local PostgreSQL administrator. The
 password is entered through psql's protected prompt or the approved secret

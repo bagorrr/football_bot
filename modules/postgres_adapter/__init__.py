@@ -16,7 +16,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 
 import psycopg
-from psycopg import conninfo, sql
+from psycopg import conninfo, pq, sql
 from psycopg.rows import dict_row
 
 from modules.classifier_promotion import (
@@ -1188,6 +1188,30 @@ def _assert_runtime_migration_integrity(
     )
 
 
+@contextmanager
+def _canonical_migration_search_path(
+    connection: psycopg.Connection[Any],
+) -> Iterator[None]:
+    """Run migration setup and SQL with a deterministic extension target."""
+    search_path_row = connection.execute("SHOW search_path").fetchone()
+    if (
+        search_path_row is None
+        or not isinstance(search_path_row, (tuple, list))
+        or not search_path_row
+        or not isinstance(search_path_row[0], str)
+    ):
+        raise RuntimeError("Could not inspect search_path")
+    connection.execute("SET LOCAL search_path = public")
+    try:
+        yield
+    finally:
+        if connection.info.transaction_status != pq.TransactionStatus.INERROR:
+            connection.execute(
+                "SELECT pg_catalog.set_config('search_path', %s, true)",
+                (search_path_row[0],),
+            )
+
+
 class PostgresAcceptanceMigrator:
     """Schema setup kept outside every runtime process.
 
@@ -1209,7 +1233,12 @@ class PostgresAcceptanceMigrator:
         """Apply each immutable repository migration exactly once."""
         migration_paths = _repository_migration_paths()
         migration_names = tuple(path.name for path in migration_paths)
-        with psycopg.connect(self._migration_database_url) as connection:
+        with (
+            psycopg.connect(
+                self._migration_database_url,
+            ) as connection,
+            _canonical_migration_search_path(connection),
+        ):
             connection.execute(
                 """
                 SELECT pg_advisory_xact_lock(
