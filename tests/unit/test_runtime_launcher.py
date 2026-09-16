@@ -157,4 +157,4 @@ def test_systemd_template_starts_only_through_the_t5_launcher() -> None:
         "/opt/football-bot/current/apps/runtime_launcher.py --role %i"
     ) in unit
     assert "EnvironmentFile=" not in unit
-    assert "CapabilityBoundingSet=CAP_SETUID CAP_SETGID" in unit
+    assert "CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_DAC_READ_SEARCH" in unit
