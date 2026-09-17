@@ -8777,8 +8777,14 @@ class PostgresRoleStore:
                 ).fetchone()
                 if active_lease is not None and active_lease["present"]:
                     return None
+            # Wait for deletion redaction instead of skipping its locked event.
+            claim_lock = (
+                "FOR UPDATE OF outbox"
+                if self._role is RuntimeRole.APPLICATION
+                else "FOR UPDATE OF outbox SKIP LOCKED"
+            )
             rows = connection.execute(
-                """
+                f"""
                 SELECT outbox.*, inbox.processing_status AS inbox_status
                 FROM football_runtime.contract_outbox AS outbox
                 LEFT JOIN football_runtime.contract_inbox AS inbox
@@ -8794,7 +8800,7 @@ class PostgresRoleStore:
                       OR outbox.claimed_until <= %s
                   )
                 ORDER BY outbox.recorded_at, outbox.message_id
-                FOR UPDATE OF outbox SKIP LOCKED
+                {claim_lock}
                 """,
                 (self._role.value, self._role.value, claimed_at),
             ).fetchall()

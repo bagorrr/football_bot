@@ -223,7 +223,7 @@ def test_raw_telethon_provider_feeds_the_postgres_ingestion_seam(
     )
     client = _RawDifferenceClient(
         [
-            SimpleNamespace(pts=500, final=True),
+            SimpleNamespace(full_chat=SimpleNamespace(pts=500)),
             SimpleNamespace(
                 new_messages=[message],
                 other_updates=[],
@@ -511,7 +511,7 @@ def test_raw_telethon_reenable_rejects_pause_gap_edit_and_accepts_current_edit(
 
     client = _RawDifferenceClient(
         [
-            SimpleNamespace(pts=6500, final=True),
+            SimpleNamespace(full_chat=SimpleNamespace(pts=6500)),
             SimpleNamespace(
                 new_messages=[],
                 other_updates=[
@@ -718,7 +718,7 @@ def test_raw_telethon_first_page_post_boundary_edit_or_delete_is_recorded(
     )
     client = _RawDifferenceClient(
         [
-            SimpleNamespace(pts=9000, final=True),
+            SimpleNamespace(full_chat=SimpleNamespace(pts=9000)),
             SimpleNamespace(
                 new_messages=[],
                 other_updates=[update],
@@ -856,7 +856,7 @@ def test_raw_telethon_invalid_difference_checkpoint_stops_before_ack(
             response.other_updates = [types.UpdateDeleteMessages([901], 501, 1)]
             response.pts = 501
     client = _RawDifferenceClient(
-        [SimpleNamespace(pts=500, final=True), response],
+        [SimpleNamespace(full_chat=SimpleNamespace(pts=500)), response],
         entity,
     )
     values = {
@@ -1191,7 +1191,7 @@ def test_raw_telethon_same_time_edits_remain_distinct_and_history_replays(
     second_message = message(edit_date=second_edit, body="Raw B.")
     client = _RawDifferenceClient(
         [
-            SimpleNamespace(pts=500, final=True),
+            SimpleNamespace(full_chat=SimpleNamespace(pts=500)),
             SimpleNamespace(
                 new_messages=[create_message],
                 other_updates=[],
@@ -1342,7 +1342,7 @@ def test_raw_telethon_same_snapshot_normalized_before_commit_is_idempotent(
     edit_message = message(body="Raw overlapping edit.", edit_date=edit_date)
     client_one = _RawDifferenceClient(
         [
-            SimpleNamespace(pts=600, final=True),
+            SimpleNamespace(full_chat=SimpleNamespace(pts=600)),
             SimpleNamespace(
                 new_messages=[create_message],
                 other_updates=[],
