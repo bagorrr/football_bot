@@ -674,6 +674,13 @@ def _telethon_failure_reason(error: Exception) -> IngestionFailureReason:
         return IngestionFailureReason.SESSION_REVOKED
     if "unauthorized" in name or "authentication" in name:
         return IngestionFailureReason.AUTHENTICATION_LOST
+    if name in {
+        "limitinvaliderror",
+        "persistenttimestampemptyerror",
+        "persistenttimestampinvaliderror",
+        "persistenttimestampoutdatederror",
+    }:
+        return IngestionFailureReason.CHECKPOINT_UNAVAILABLE
     if "differencetoolong" in name:
         return IngestionFailureReason.DIFFERENCE_TOO_LONG
     if any(
@@ -943,25 +950,16 @@ class TelethonProvider:
                         scope=IngestionFailureScope.SOURCE_STREAM,
                     )
                 response = self._request(
-                    functions.updates.GetChannelDifferenceRequest(
+                    functions.channels.GetFullChannelRequest(
                         channel=types.InputChannel(identity.telegram_id, access_hash),
-                        filter=types.ChannelMessagesFilterEmpty(),
-                        pts=0,
-                        limit=1,
-                        force=False,
                     ),
                     scope=IngestionFailureScope.SOURCE_STREAM,
                 )
-                pts = getattr(response, "pts", None)
+                full_chat = getattr(response, "full_chat", None)
+                pts = getattr(full_chat, "pts", None)
                 if type(pts) is not int or pts < 0:
                     raise TelethonTransportError(
                         "Telegram channel boundary is unavailable",
-                        reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
-                        scope=IngestionFailureScope.SOURCE_STREAM,
-                    )
-                if getattr(response, "final", None) is not True:
-                    raise TelethonTransportError(
-                        "Telegram channel boundary is incomplete",
                         reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
                         scope=IngestionFailureScope.SOURCE_STREAM,
                     )

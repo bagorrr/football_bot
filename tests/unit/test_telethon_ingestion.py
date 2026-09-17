@@ -11,7 +11,11 @@ from threading import Thread
 from types import SimpleNamespace
 
 import pytest
-from telethon import types  # type: ignore[import-untyped]
+from telethon import functions, types  # type: ignore[import-untyped]
+from telethon.errors import (  # type: ignore[import-untyped]
+    ChannelPrivateError,
+    PersistentTimestampEmptyError,
+)
 
 from modules.domain import (
     IngestionFailureReason,
@@ -619,17 +623,21 @@ class _DifferenceClientProbe:
         *,
         entities: list[object] | None = None,
         history_messages: list[object] | None = None,
+        request_error: Exception | None = None,
     ) -> None:
         self.responses = responses
         self.entities = entities or []
         self.default_entity = _channel_entity()
         self.history_messages = history_messages or []
+        self.request_error = request_error
         self.requests: list[object] = []
         self.entity_requests: list[object] = []
         self.history_kwargs: dict[str, object] | None = None
 
     def __call__(self, request: object) -> object:
         self.requests.append(request)
+        if self.request_error is not None:
+            raise self.request_error
         return self.responses.pop(0)
 
     def get_entity(self, entity: object) -> object:
@@ -1423,9 +1431,11 @@ def test_provider_ignores_scheduled_updates() -> None:
         assert result.to_checkpoint == TelegramChannelCheckpoint(pts=11)
 
 
-def test_provider_rejects_non_final_channel_registration_boundary() -> None:
+def test_provider_rejects_invalid_channel_registration_checkpoint() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
-    client = _DifferenceClientProbe([SimpleNamespace(pts=11, final=False)])
+    client = _DifferenceClientProbe(
+        [SimpleNamespace(full_chat=SimpleNamespace(pts=-1))]
+    )
     provider = TelethonProvider(
         client=client,
         approved_source_chats=(identity,),
@@ -1438,11 +1448,43 @@ def test_provider_rejects_non_final_channel_registration_boundary() -> None:
     assert client.responses == []
 
 
+@pytest.mark.parametrize(
+    ("request_error", "expected_reason"),
+    (
+        pytest.param(
+            PersistentTimestampEmptyError(object()),
+            IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+            id="request-contract",
+        ),
+        pytest.param(
+            ChannelPrivateError(object()),
+            IngestionFailureReason.ACCESS_LOST,
+            id="access",
+        ),
+    ),
+)
+def test_provider_classifies_registration_boundary_provider_errors(
+    request_error: Exception,
+    expected_reason: IngestionFailureReason,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([], request_error=request_error),
+        approved_source_chats=(identity,),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.capture_source_chat_registration_boundary(identity)
+
+    assert error.value.reason is expected_reason
+
+
 def test_registration_boundary_reuses_resolved_channel_entity() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
     resolved_entity = _channel_entity()
     client = _DifferenceClientProbe(
-        [SimpleNamespace(pts=11, final=True)], entities=[resolved_entity]
+        [SimpleNamespace(full_chat=SimpleNamespace(pts=11))],
+        entities=[resolved_entity],
     )
     provider = TelethonProvider(client=client)
 
@@ -1453,6 +1495,10 @@ def test_registration_boundary_reuses_resolved_channel_entity() -> None:
         "channel-pts:11"
     )
     assert client.entity_requests == ["@resolved_source"]
+    assert len(client.requests) == 1
+    request = client.requests[0]
+    assert isinstance(request, functions.channels.GetFullChannelRequest)
+    assert request.channel == types.InputChannel(42, 9)
 
 
 def test_unrelated_account_updates_are_body_free_checkpoint_progress() -> None:
