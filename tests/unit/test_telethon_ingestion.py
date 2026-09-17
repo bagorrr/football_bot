@@ -1440,16 +1440,10 @@ def test_provider_rejects_non_final_channel_registration_boundary() -> None:
 
 def test_registration_boundary_reuses_resolved_channel_entity() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
-    client = _DifferenceClientProbe([SimpleNamespace(pts=11, final=True)])
     resolved_entity = _channel_entity()
-
-    def get_entity(reference: object) -> object:
-        client.entity_requests.append(reference)
-        if reference != "@resolved_source":
-            raise AssertionError("registration boundary must reuse resolved entity")
-        return resolved_entity
-
-    client.get_entity = get_entity
+    client = _DifferenceClientProbe(
+        [SimpleNamespace(pts=11, final=True)], entities=[resolved_entity]
+    )
     provider = TelethonProvider(client=client)
 
     resolution = provider.resolve_source_chat("@resolved_source")
