@@ -36,6 +36,31 @@ def test_runtime_health_exposes_low_cardinality_systemd_metrics() -> None:
     }
 
 
+def test_runtime_health_preserves_inactive_state_with_unset_resource_counters() -> None:
+    report = parse_systemd_show_output(
+        "ingestion",
+        "\n".join(
+            (
+                "ActiveState=inactive",
+                "SubState=dead",
+                "Result=success",
+                "ExecMainStatus=0",
+                "NRestarts=0",
+                "CPUUsageNSec=[not set]",
+                "MemoryCurrent=[not set]",
+            )
+        ),
+    )
+
+    assert not report.healthy
+    assert report.failure is None
+    assert report.active_state == "inactive"
+    assert report.sub_state == "dead"
+    assert report.result == "success"
+    assert report.cpu_usage_ns is None
+    assert report.memory_bytes is None
+
+
 def test_runtime_health_fails_closed_and_redacts_malformed_systemd_output() -> None:
     report = parse_systemd_show_output(
         "bot_assistant",

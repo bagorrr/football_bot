@@ -98,8 +98,8 @@ def parse_systemd_show_output(role: str, output: str) -> RuntimeRoleHealth:
             result=properties["Result"],
             main_status=_nonnegative_integer(properties["ExecMainStatus"]),
             restart_count=_nonnegative_integer(properties["NRestarts"]),
-            cpu_usage_ns=_nonnegative_integer(properties["CPUUsageNSec"]),
-            memory_bytes=_nonnegative_integer(properties["MemoryCurrent"]),
+            cpu_usage_ns=_optional_nonnegative_integer(properties["CPUUsageNSec"]),
+            memory_bytes=_optional_nonnegative_integer(properties["MemoryCurrent"]),
         )
     except (KeyError, ValueError):
         return _unavailable(role, "systemd_status_malformed")
@@ -109,6 +109,12 @@ def _nonnegative_integer(value: str) -> int:
     if not value.isascii() or not value.isdecimal() or len(value) > 20:
         raise ValueError
     return int(value)
+
+
+def _optional_nonnegative_integer(value: str) -> int | None:
+    if value == "[not set]":
+        return None
+    return _nonnegative_integer(value)
 
 
 def _unavailable(role: str, failure: str) -> RuntimeRoleHealth:
