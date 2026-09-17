@@ -2419,10 +2419,8 @@ class BotApiHttpTransport:
     ) -> None:
         if request_timeout_seconds <= 0:
             raise ValueError("Bot API request timeout must be positive")
-        if not api_root.endswith("/"):
-            api_root += "/"
         self._configuration = configuration
-        self._api_root = api_root
+        self._api_root = api_root.rstrip("/")
         self._request_timeout_seconds = request_timeout_seconds
         self._opener = opener
         self._reconciliation = reconciliation

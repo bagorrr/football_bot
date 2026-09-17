@@ -905,7 +905,7 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
         request_data = request.data
         request_url = request.full_url
         payload = json.loads(request_data.decode("utf-8"))
-        requests.append((request_url.rsplit("/", 1)[-1], payload))
+        requests.append((request_url, payload))
         return _Response(responses.pop(0))
 
     reconciliation = InMemoryBotApiDeliveryReconciliation()
@@ -917,39 +917,45 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
         transport_factory=lambda configuration: BotApiHttpTransport(
             configuration,
             reconciliation=reconciliation,
-            api_root="https://example.invalid/bot",
+            api_root="https://example.invalid/bot/",
             opener=opener,
         ),
     ).configuration
-    ambiguous_methods: list[str] = []
+    ambiguous_urls: list[str] = []
 
     def unavailable_opener(request: object, **_kwargs: object) -> object:
         assert hasattr(request, "full_url")
-        ambiguous_methods.append(request.full_url.rsplit("/", 1)[-1])
+        ambiguous_urls.append(request.full_url)
         raise URLError("network unavailable")
 
     transport = BotApiHttpTransport(
         configuration,
         reconciliation=reconciliation,
-        api_root="https://example.invalid/bot",
+        api_root="https://example.invalid/bot/",
         opener=unavailable_opener,
     )
 
     poll = BotApiHttpTransport(
         configuration,
         reconciliation=reconciliation,
-        api_root="https://example.invalid/bot",
         opener=opener,
     ).get_updates(offset=40, timeout_seconds=30)
 
     assert poll.updates[0].update_id == 41
     assert poll.oldest_available_update_id is None
-    assert requests == [("getUpdates", {"offset": 40, "timeout": 30})]
+    assert requests == [
+        (
+            "https://api.telegram.org/bot123456:secret-token/getUpdates",
+            {"offset": 40, "timeout": 30},
+        )
+    ]
     with pytest.raises(BotApiOutcomeUnknownError) as error:
         transport.send_message(_message("http-ambiguous"))
     assert "secret-token" not in str(error.value)
     assert transport.reconcile_message(_message("http-ambiguous")) is None
-    assert ambiguous_methods == ["sendMessage"]
+    assert ambiguous_urls == [
+        "https://example.invalid/bot123456:secret-token/sendMessage"
+    ]
 
 
 def test_http_transport_reconciles_send_and_edit_by_delivery_id() -> None:
