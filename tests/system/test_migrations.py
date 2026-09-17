@@ -29,6 +29,7 @@ from modules.domain import (
 from modules.ports import ClassifierAdapterResult
 from modules.postgres_adapter import (
     PostgresAcceptanceMigrator,
+    PostgresRoleStore,
     _ensure_application_proposition_identity_mapping,
     runtime_database_url,
 )
@@ -119,7 +120,6 @@ def separate_migration_database_login(
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
     assert [path.name for path in _migration_paths()][-18:] == [
-        "0047_allow_silent_callback_ack.sql",
         "0048_persist_dynamic_result_callback_copy.sql",
         "0049_result_conversation.sql",
         "0050_bot_assistant_execution.sql",
@@ -137,6 +137,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0062_telethon_active_ingestion_scope.sql",
         "0063_semantic_origin_update_id.sql",
         "0064_runtime_readiness_and_ingestion_bootstrap.sql",
+        "0065_source_chat_ingestion_read_policy.sql",
     ]
 
 
@@ -967,6 +968,122 @@ def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_members
         )
 
     migrator.migrate()
+
+
+def test_ingestion_source_chat_projections_are_read_only_under_force_rls(
+    fresh_database_url: str,
+    separate_migration_database_login: tuple[str, str],
+) -> None:
+    """Ingestion projections see only active rows through the definer boundary."""
+    migration_database_url, _migration_role = separate_migration_database_login
+    migrator = PostgresAcceptanceMigrator(
+        fresh_database_url,
+        migration_database_url=migration_database_url,
+    )
+    migrator.migrate()
+    passwords = {role: "source-chat-ingestion-read-test" for role in RuntimeRole}
+    migrator.provision_runtime_credentials(passwords)
+    recorded_at = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+    source_rows = (
+        ("channel", 4101, 1, False, recorded_at + timedelta(minutes=1)),
+        ("channel", 4101, 2, True, None),
+        ("chat", 4202, 1, True, None),
+        ("channel", 4303, 1, True, None),
+        ("channel", 4404, 1, True, None),
+        ("channel", 4505, 1, False, None),
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        for peer_kind, telegram_chat_id, generation, enabled, removed_at in source_rows:
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_chat_registry (
+                    peer_kind, telegram_chat_id, registry_generation,
+                    address_kind, current_address, processing_started_at,
+                    transport_boundary, enabled, initial_consent_attestation,
+                    attested_at, created_at, updated_at, permanently_removed_at
+                ) VALUES (%s, %s, %s, 'public_username', %s, %s, %s, %s,
+                           'confirmed', %s, %s, %s, %s)
+                """,
+                (
+                    peer_kind,
+                    telegram_chat_id,
+                    generation,
+                    f"@scope_{telegram_chat_id}_{generation}",
+                    recorded_at,
+                    f"{peer_kind}-pts:{telegram_chat_id}",
+                    enabled,
+                    recorded_at,
+                    recorded_at,
+                    recorded_at,
+                    removed_at,
+                ),
+            )
+
+    ingestion_url = runtime_database_url(
+        fresh_database_url,
+        RuntimeRole.INGESTION,
+        passwords[RuntimeRole.INGESTION],
+    )
+    with psycopg.connect(ingestion_url, autocommit=True) as connection:
+        assert connection.execute(
+            """
+            SELECT has_table_privilege(
+                       current_user,
+                       'football_runtime.source_chat_registry',
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       current_user,
+                       'football_runtime.source_chat_registry',
+                       'INSERT,UPDATE,DELETE'
+                   ),
+                   has_function_privilege(
+                       'football_application',
+                       'football_runtime.read_active_source_chat_ingestion_scope()',
+                       'EXECUTE'
+                   )
+            """
+        ).fetchone() == (False, False, False)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                "SELECT peer_kind FROM football_runtime.source_chat_registry"
+            ).fetchall()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_chat_registry (
+                    peer_kind, telegram_chat_id, registry_generation,
+                    address_kind, current_address, processing_started_at,
+                    transport_boundary, enabled, initial_consent_attestation,
+                    attested_at, created_at, updated_at
+                ) VALUES (
+                    'channel', 4999, 1, 'public_username', '@write_denied',
+                    %s, 'channel-pts:4999', true, 'confirmed', %s, %s, %s
+                )
+                """,
+                (recorded_at, recorded_at, recorded_at, recorded_at),
+            )
+
+    ingestion_store = PostgresRoleStore(RuntimeRole.INGESTION, ingestion_url)
+    assert ingestion_store.source_chat_ingestion_bootstrap_required() is False
+    assert ingestion_store.active_source_chat_ingestion_scope() == (
+        (TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4101), 2),
+        (TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4303), 1),
+        (TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4404), 1),
+        (TelegramPeerIdentity(TelegramPeerKind.CHAT, 4202), 1),
+    )
+    assert (
+        ingestion_store.source_chat_ingestion_generation(
+            TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4101)
+        )
+        == 2
+    )
+    assert (
+        ingestion_store.source_chat_ingestion_generation(
+            TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4505)
+        )
+        is None
+    )
 
 
 def test_bot_assistant_can_read_only_the_current_tournament_projection(
