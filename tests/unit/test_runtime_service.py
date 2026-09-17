@@ -152,7 +152,7 @@ def test_bot_assistant_production_composition_uses_real_adapters_and_t1_boundary
     assert service.bot_api_conformance is not None
 
 
-def test_runtime_readiness_runs_bot_api_conformance(
+def test_runtime_readiness_uses_only_read_only_bot_api_checks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from modules import t5_runtime_configuration
@@ -200,7 +200,7 @@ def test_runtime_readiness_runs_bot_api_conformance(
 
     assert runtime_service._run(service) == 1
     assert ingress.readiness_checks == 1
-    assert conformance.probes == 1
+    assert conformance.probes == 0
 
 
 def test_ingestion_production_composition_uses_generation_scoped_telethon(

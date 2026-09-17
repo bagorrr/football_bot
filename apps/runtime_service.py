@@ -559,9 +559,6 @@ def _run(service: RuntimeService) -> int:
             return 78
         if service.bot_api_ingress is not None:
             service.bot_api_ingress.verify_readiness()
-            if service.bot_api_conformance is None:
-                raise RuntimeError("T1 conformance boundary is unavailable")
-            service.bot_api_conformance.run()
         _emit_readiness(
             service.role.value,
             configuration="ready",
