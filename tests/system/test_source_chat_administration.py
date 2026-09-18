@@ -3189,7 +3189,7 @@ class _CountingConversationLanguageAdapter(ControlledConversationLanguageAdapter
         return super().render(locale, update_id=update_id)
 
 
-def test_unsupported_language_uses_fixed_source_chat_administration_copy() -> None:
+def test_dynamic_administration_preserves_fixed_source_chat_copy() -> None:
     telegram = ControlledTelegramDeliveryAdapter()
     telethon = ControlledTelegramIngestionAdapter()
     language_adapter = _CountingConversationLanguageAdapter()
@@ -3256,11 +3256,12 @@ def test_unsupported_language_uses_fixed_source_chat_administration_copy() -> No
     )
     administration = telegram.messages[-1]
     assert administration.display_locale == "de"
-    assert administration.text == "⚙️ **Administration**"
-    assert administration.button_rows[0][0][0] == "Source Chats"
-    assert administration.button_rows[1][0][0] == "Source Data Deletion Requests"
-    assert administration.button_rows[2][0][0] == "Source Data Audit"
-    assert len(language_adapter.render_update_ids) == render_count_before_administration
+    assert administration.text == "⚙️ **Verwaltung**"
+    assert administration.button_rows[0][0][0] == "Quell-Chats"
+    assert administration.button_rows[1][0][0] == "Löschanfragen für Source Data"
+    assert administration.button_rows[2][0][0] == "Datenaufbewahrungs-Audit"
+    assert len(language_adapter.render_update_ids) > render_count_before_administration
+    render_count_after_administration = len(language_adapter.render_update_ids)
 
     system.select_administration_action(
         update_id="source-chats:german-administration",
@@ -3271,7 +3272,7 @@ def test_unsupported_language_uses_fixed_source_chat_administration_copy() -> No
     assert source_chats.display_locale == "de"
     assert source_chats.text == "📡 **Source Chats**"
     assert source_chats.button_rows[0][0][0] == "Add Source Chat"
-    assert len(language_adapter.render_update_ids) == render_count_before_administration
+    assert len(language_adapter.render_update_ids) == render_count_after_administration
 
     system.select_source_chats_action(
         update_id="add:german-administration",
@@ -3281,7 +3282,7 @@ def test_unsupported_language_uses_fixed_source_chat_administration_copy() -> No
     address = telegram.messages[-1]
     assert address.display_locale == "de"
     assert address.text.startswith("Send a public @username")
-    assert len(language_adapter.render_update_ids) == render_count_before_administration
+    assert len(language_adapter.render_update_ids) == render_count_after_administration
 
     system.submit_source_chat_address(
         update_id="address:german-malformed",
@@ -3297,7 +3298,7 @@ def test_unsupported_language_uses_fixed_source_chat_administration_copy() -> No
     )
     assert malformed.display_locale == "de"
     assert malformed.text.startswith("Use a valid public @username")
-    assert len(language_adapter.render_update_ids) == render_count_before_administration
+    assert len(language_adapter.render_update_ids) == render_count_after_administration
 
     message_count_before_registration = len(telegram.messages)
     system.submit_source_chat_address(
@@ -3335,7 +3336,7 @@ def test_unsupported_language_uses_fixed_source_chat_administration_copy() -> No
     assert failed.display_locale == "de"
     assert failed.text.startswith("Could not register this Source Chat")
     assert system.conversation_state(administrator_id).locale == "de"
-    assert len(language_adapter.render_update_ids) == render_count_before_administration
+    assert len(language_adapter.render_update_ids) == render_count_after_administration
     system.reset()
 
 
