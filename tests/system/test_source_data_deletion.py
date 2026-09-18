@@ -201,15 +201,10 @@ def test_source_data_deletion_ui_is_bounded_and_revision_bound() -> None:
 class _GuardedConversationLanguageAdapter(ControlledConversationLanguageAdapter):
     def __init__(self) -> None:
         self.render_update_ids: list[str | None] = []
-        self.rendering_forbidden = False
 
     def render(
         self, locale: str, *, update_id: str | None = None
     ) -> LanguageSelection | None:
-        if self.rendering_forbidden:
-            raise AssertionError(
-                "fixed administration/deletion presentation rendered dynamic language"
-            )
         self.render_update_ids.append(update_id)
         return super().render(locale, update_id=update_id)
 
@@ -279,17 +274,19 @@ class _GuardedConversationLanguageAdapter(ControlledConversationLanguageAdapter)
         pytest.param(
             "de",
             "Deutsch",
-            "🛡️ **Review Source Data Deletion target**",
-            "This starts request-scoped suppression and deletion. Confirm explicitly.",
-            "Enter exactly request_id=<opaque> source_author=<numeric> "
-            "source_chat=<exact Source Chat key> support_case=<opaque>. "
-            "Do not include a body.",
-            "Enter one bounded rejection reason without whitespace.",
-            "Enter body-free completion proof pointer for outcome completed.",
+            "🛡️ **Ziel der Löschung von Source Data prüfen**",
+            "Diese Operation startet die auf die Anfrage begrenzte Unterdrückung "
+            "und Löschung. Bestätigen Sie ausdrücklich.",
+            "Geben Sie genau request_id=<opaque> source_author=<numeric> "
+            "source_chat=<exact Source Chat key> support_case=<opaque> ein. "
+            "Fügen Sie keinen Textkörper ein.",
+            "Geben Sie einen begrenzten Ablehnungsgrund ohne Leerzeichen ein.",
+            "Geben Sie den Nachweiszeiger ohne Textkörper für das Ergebnis "
+            "completed ein.",
         ),
     ),
 )
-def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
+def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
     locale: str,
     language_text: str | None,
     review_heading: str,
@@ -351,8 +348,7 @@ def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
         assert "Verwaltung" in tuple(
             button[0] for row in settings.button_rows for button in row
         )
-    render_count_before_fixed_screens = len(language_adapter.render_update_ids)
-    language_adapter.rendering_forbidden = True
+    render_count_before_administration = len(language_adapter.render_update_ids)
 
     system.select_settings_action(
         update_id=f"administration:fixed-deletion:{locale}",
@@ -368,11 +364,20 @@ def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
             "ru": "⚙️ **Администрирование**",
             "es": "⚙️ **Administración**",
             "fr": "⚙️ **Administration**",
-            "de": "⚙️ **Administration**",
+            "de": "⚙️ **Verwaltung**",
         }[locale]
     )
-    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+    if locale == "de":
+        assert (
+            len(language_adapter.render_update_ids) > render_count_before_administration
+        )
+    else:
+        assert (
+            len(language_adapter.render_update_ids)
+            == render_count_before_administration
+        )
 
+    render_count_before_deletion = len(language_adapter.render_update_ids)
     system.select_administration_action(
         update_id=f"source-data-deletion:fixed-deletion:{locale}",
         telegram_user_id=administrator_id,
@@ -380,7 +385,11 @@ def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
     )
     deletion = delivery.messages[-1]
     assert deletion.display_locale == locale
-    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+    if locale == "de":
+        assert len(language_adapter.render_update_ids) > render_count_before_deletion
+        assert deletion.text.startswith("🗑️ **Löschanfragen für Source Data**")
+    else:
+        assert len(language_adapter.render_update_ids) == render_count_before_deletion
 
     pending = system.create_source_data_deletion_request(
         request_id=f"deletion-request:pending:{locale}",
@@ -412,6 +421,11 @@ def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
         action=_callback(deletion, "sdd:intake:"),
     )
     assert delivery.messages[-1].text == intake_prompt
+    render_count_after_intake = len(language_adapter.render_update_ids)
+    if locale == "de":
+        assert render_count_after_intake > render_count_before_deletion
+    else:
+        assert render_count_after_intake == render_count_before_deletion
     intake = delivery.messages[-1]
     system.go_back(
         update_id=f"intake-back:fixed-deletion:{locale}",
@@ -420,6 +434,7 @@ def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
     )
 
     deletion = delivery.messages[-1]
+    render_count_before_reject = len(language_adapter.render_update_ids)
     system.select_source_data_deletion_action(
         update_id=f"reject:fixed-deletion:{locale}",
         telegram_user_id=administrator_id,
@@ -428,6 +443,10 @@ def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
     assert delivery.messages[-1].text == (
         f"request={pending.request_id}\n\n{reject_prompt}"
     )
+    if locale == "de":
+        assert len(language_adapter.render_update_ids) > render_count_before_reject
+    else:
+        assert len(language_adapter.render_update_ids) == render_count_before_reject
     reject_input = delivery.messages[-1]
     system.go_back(
         update_id=f"reject-back:fixed-deletion:{locale}",
@@ -436,12 +455,17 @@ def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
     )
 
     deletion = delivery.messages[-1]
+    render_count_before_review = len(language_adapter.render_update_ids)
     system.select_source_data_deletion_action(
         update_id=f"review:fixed-deletion:{locale}",
         telegram_user_id=administrator_id,
         action=_callback(deletion, "sdd:review:"),
     )
     review = delivery.messages[-1]
+    if locale == "de":
+        assert len(language_adapter.render_update_ids) > render_count_before_review
+    else:
+        assert len(language_adapter.render_update_ids) == render_count_before_review
     assert review.text == (
         f"{review_heading}\n\n"
         f"request={approved.request_id}\n"
@@ -473,6 +497,7 @@ def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
         screen_revision=review.screen_revision,
     )
     deletion = delivery.messages[-1]
+    render_count_before_completion = len(language_adapter.render_update_ids)
     system.select_source_data_deletion_action(
         update_id=f"completion:fixed-deletion:{locale}",
         telegram_user_id=administrator_id,
@@ -482,7 +507,11 @@ def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
     assert completion_input.text == (
         f"request={approved.request_id}\n\n{completion_prompt}"
     )
-    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+    if locale == "de":
+        assert len(language_adapter.render_update_ids) > render_count_before_completion
+    else:
+        assert len(language_adapter.render_update_ids) == render_count_before_completion
+    render_count_before_completion_submit = len(language_adapter.render_update_ids)
     assert system._conversation_onboarding().handle_message(
         update_id=f"completion-submit:fixed-deletion:{locale}",
         telegram_user_id=administrator_id,
@@ -498,9 +527,19 @@ def test_source_data_deletion_fixed_copy_is_localized_without_model_rendering(
         ).status.value
         == "completed"
     )
-    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+    if locale == "de":
+        assert (
+            len(language_adapter.render_update_ids)
+            > render_count_before_completion_submit
+        )
+    else:
+        assert (
+            len(language_adapter.render_update_ids)
+            == render_count_before_completion_submit
+        )
+    render_count_before_reset = len(language_adapter.render_update_ids)
     system.reset()
-    assert len(language_adapter.render_update_ids) == render_count_before_fixed_screens
+    assert len(language_adapter.render_update_ids) == render_count_before_reset
 
 
 def test_source_data_deletion_captures_pending_and_racing_ingestion() -> None:

@@ -2787,6 +2787,9 @@ class ConversationOnboarding:
         operation = _source_data_deletion_input_operation(
             current=current,
             current_message=current_message,
+            selection=self._language_rendering(
+                current.locale or "en", update_id=update_id
+            ),
         )
         if operation is None:
             self._queue_current_view(update_id=update_id, state=current)
@@ -5011,6 +5014,7 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
+                selection=self._language_rendering(locale, update_id=update_id),
             ),
             recorded_at=self._clock.now(),
         )
@@ -5041,6 +5045,9 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=current.locale or "en",
                 screen_revision=state.screen_revision,
+                selection=self._language_rendering(
+                    current.locale or "en", update_id=update_id
+                ),
                 request=request,
             ),
             recorded_at=self._clock.now(),
@@ -5077,6 +5084,9 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=current.locale or "en",
                 screen_revision=state.screen_revision,
+                selection=self._language_rendering(
+                    current.locale or "en", update_id=update_id
+                ),
                 operation=operation,
                 request=request,
                 completion_outcome=completion_outcome,
@@ -5158,6 +5168,9 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=current.locale or "en",
                 screen_revision=state.screen_revision,
+                selection=self._language_rendering(
+                    current.locale or "en", update_id=update_id
+                ),
                 requests=self._store.source_data_deletion_requests(),
             ),
             command=command,
@@ -5249,6 +5262,7 @@ class ConversationOnboarding:
                 telegram_user_id=current.telegram_user_id,
                 locale=locale,
                 screen_revision=state.screen_revision,
+                selection=self._language_rendering(locale, update_id=update_id),
                 requests=self._store.source_data_deletion_requests(),
             ),
             recorded_at=self._clock.now(),
@@ -16472,15 +16486,30 @@ def _administration_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
+    selection: LanguageSelection | None = None,
 ) -> TelegramMessage:
-    (
-        text,
-        source_chats,
-        source_data_deletion,
-        source_data_audit,
-        back,
-        menu,
-    ) = _ADMINISTRATION_COPY.get(locale, _ADMINISTRATION_COPY["en"])
+    if locale in SUPPORTED_LOCALES:
+        (
+            text,
+            source_chats,
+            source_data_deletion,
+            source_data_audit,
+            back,
+            menu,
+        ) = _ADMINISTRATION_COPY[locale]
+    elif (
+        selection is not None
+        and selection.locale == locale
+        and selection.administration_text is not None
+        and selection.administration_labels is not None
+    ):
+        text = selection.administration_text
+        source_chats, source_data_audit, back, menu = selection.administration_labels
+        source_data_deletion = (
+            selection.source_data_deletion_label or "Source Data Deletion Requests"
+        )
+    else:
+        raise RuntimeError("Conversation Language has no Administration rendering")
     return TelegramMessage(
         delivery_id=f"administration:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -16514,11 +16543,25 @@ def _source_data_deletion_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
+    selection: LanguageSelection | None = None,
     requests: tuple[SourceDataDeletionRequest, ...] = (),
 ) -> TelegramMessage:
-    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
-        locale, _SOURCE_DATA_DELETION_COPY["en"]
-    )
+    if locale in SUPPORTED_LOCALES:
+        deletion_copy = _SOURCE_DATA_DELETION_COPY[locale]
+    elif (
+        selection is not None
+        and selection.locale == locale
+        and selection.source_data_deletion_text is not None
+        and selection.source_data_deletion_labels is not None
+    ):
+        deletion_copy = {
+            **_SOURCE_DATA_DELETION_COPY["en"],
+            "heading": selection.source_data_deletion_text,
+            "back": selection.source_data_deletion_labels[0],
+            "menu": selection.source_data_deletion_labels[1],
+        }
+    else:
+        deletion_copy = _SOURCE_DATA_DELETION_COPY["en"]
     actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
         locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
     )
@@ -16608,24 +16651,39 @@ def _source_data_deletion_review_message(
     telegram_user_id: int,
     locale: str,
     screen_revision: int,
+    selection: LanguageSelection | None = None,
     request: SourceDataDeletionRequest,
 ) -> TelegramMessage:
     """Render a body-free exact author/chat scope before execution."""
-    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
-        locale, _SOURCE_DATA_DELETION_COPY["en"]
-    )
+    if locale in SUPPORTED_LOCALES:
+        deletion_copy = _SOURCE_DATA_DELETION_COPY[locale]
+        back = deletion_copy["back"]
+        menu = deletion_copy["menu"]
+        text_template = deletion_copy["review"]
+    elif (
+        selection is not None
+        and selection.locale == locale
+        and selection.source_data_deletion_review_text is not None
+        and selection.source_data_deletion_labels is not None
+    ):
+        back, menu = selection.source_data_deletion_labels
+        text_template = selection.source_data_deletion_review_text
+    else:
+        deletion_copy = _SOURCE_DATA_DELETION_COPY["en"]
+        back = deletion_copy["back"]
+        menu = deletion_copy["menu"]
+        text_template = deletion_copy["review"]
     actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
         locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
     )
     token = _source_data_deletion_callback_token(request.request_id)
-    text = deletion_copy["review"].format(
+    text = text_template.format(
         request=request.request_id,
         source_author=request.source_author_telegram_id,
         source_chat=request.source_chat_key,
         support_case=request.support_case_pointer,
         status=request.status.value,
     )
-    menu = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
     return TelegramMessage(
         delivery_id=f"source-data-deletion-review:{update_id}",
         telegram_user_id=telegram_user_id,
@@ -16639,7 +16697,7 @@ def _source_data_deletion_review_message(
                     f"sdd:start:{token}:{screen_revision}",
                 ),
             ),
-            ((actions["back"], f"sdd:back:{screen_revision}"),),
+            ((back, f"sdd:back:{screen_revision}"),),
         ),
         reply_button=menu,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
@@ -16653,33 +16711,53 @@ def _source_data_deletion_input_message(
     locale: str,
     screen_revision: int,
     operation: str,
+    selection: LanguageSelection | None = None,
     request: SourceDataDeletionRequest | None = None,
     completion_outcome: str | None = None,
 ) -> TelegramMessage:
     """Render a fixed prompt for structured administrator input."""
-    deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
-        locale, _SOURCE_DATA_DELETION_COPY["en"]
-    )
-    actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
-        locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
-    )
+    if locale in SUPPORTED_LOCALES:
+        deletion_copy = _SOURCE_DATA_DELETION_COPY[locale]
+        back = deletion_copy["back"]
+        menu = deletion_copy["menu"]
+        input_texts = (
+            deletion_copy["intake"],
+            deletion_copy["reject"],
+            deletion_copy["completion"],
+        )
+    elif (
+        selection is not None
+        and selection.locale == locale
+        and selection.source_data_deletion_input_texts is not None
+        and selection.source_data_deletion_labels is not None
+    ):
+        back, menu = selection.source_data_deletion_labels
+        input_texts = selection.source_data_deletion_input_texts
+    else:
+        deletion_copy = _SOURCE_DATA_DELETION_COPY["en"]
+        back = deletion_copy["back"]
+        menu = deletion_copy["menu"]
+        input_texts = (
+            deletion_copy["intake"],
+            deletion_copy["reject"],
+            deletion_copy["completion"],
+        )
     if operation == "intake":
-        prompt = deletion_copy["intake"]
+        prompt = input_texts[0]
     elif operation == "reject":
-        prompt = deletion_copy["reject"]
+        prompt = input_texts[1]
     else:
         outcome = completion_outcome or "completed"
-        prompt = deletion_copy["completion"].format(outcome=outcome)
+        prompt = input_texts[2].format(outcome=outcome)
     if request is not None:
         prompt = f"request={request.request_id}\n\n{prompt}"
-    menu = _MAIN_MENU_COPY.get(locale, _MAIN_MENU_COPY["en"])[4]
     return TelegramMessage(
         delivery_id=f"source-data-deletion-input:{update_id}",
         telegram_user_id=telegram_user_id,
         display_locale=locale,
         screen_revision=screen_revision,
         text=prompt,
-        button_rows=(((actions["back"], f"sdd:back:{screen_revision}"),),),
+        button_rows=(((back, f"sdd:back:{screen_revision}"),),),
         reply_button=menu,
         reply_keyboard_action=ReplyKeyboardAction.BUTTON,
     )
@@ -23665,6 +23743,7 @@ def _source_data_deletion_input_operation(
     *,
     current: ConversationState,
     current_message: TelegramMessage | None,
+    selection: LanguageSelection | None = None,
 ) -> tuple[str, str | None, str | None] | None:
     """Identify the exact operation represented by the current input prompt."""
     if (
@@ -23677,18 +23756,40 @@ def _source_data_deletion_input_operation(
     deletion_copy = _SOURCE_DATA_DELETION_COPY.get(
         locale, _SOURCE_DATA_DELETION_COPY["en"]
     )
-    prompt_copies = (deletion_copy, _SOURCE_DATA_DELETION_COPY["en"])
-    if any(prompt == copy["intake"] for copy in prompt_copies):
-        return "intake", None, None
+    prompt_copies: tuple[tuple[str, str, str], ...] = (
+        (
+            deletion_copy["intake"],
+            deletion_copy["reject"],
+            deletion_copy["completion"],
+        ),
+        (
+            _SOURCE_DATA_DELETION_COPY["en"]["intake"],
+            _SOURCE_DATA_DELETION_COPY["en"]["reject"],
+            _SOURCE_DATA_DELETION_COPY["en"]["completion"],
+        ),
+    )
+    if (
+        locale not in SUPPORTED_LOCALES
+        and selection is not None
+        and selection.locale == locale
+        and selection.source_data_deletion_input_texts is not None
+    ):
+        prompt_copies = (
+            selection.source_data_deletion_input_texts,
+            *prompt_copies,
+        )
+    for intake_prompt, _, _ in prompt_copies:
+        if prompt == intake_prompt:
+            return "intake", None, None
     request_id = current.source_data_deletion_request_id
     if request_id is None:
         return None
-    for copy in prompt_copies:
-        if prompt == f"request={request_id}\n\n{copy['reject']}":
+    for _, reject_prompt, completion_prompt in prompt_copies:
+        if prompt == f"request={request_id}\n\n{reject_prompt}":
             return "reject", request_id, None
         for outcome in ("completed", "data_not_found"):
             if prompt == (
-                f"request={request_id}\n\n{copy['completion'].format(outcome=outcome)}"
+                f"request={request_id}\n\n{completion_prompt.format(outcome=outcome)}"
             ):
                 return "complete", request_id, outcome
     return None

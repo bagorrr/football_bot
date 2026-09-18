@@ -54,6 +54,7 @@ _LANGUAGE_SEQUENCE_LENGTHS = {
     "zero_result": 3,
     "administration_labels": 4,
     "source_data_deletion_labels": 2,
+    "source_data_deletion_input_texts": 3,
     "source_data_audit_labels": 2,
     "source_chats_labels": 3,
     "source_chat_address_labels": 2,
@@ -113,6 +114,22 @@ _LANGUAGE_SELECTION_SOURCE: dict[str, JsonValue] = {
     "source_data_deletion_label": "Source Data Deletion Requests",
     "source_data_deletion_text": "**Source Data Deletion Requests**",
     "source_data_deletion_labels": ["Back", "Menu"],
+    "source_data_deletion_review_text": (
+        "🛡️ **Review Source Data Deletion target**\n\n"
+        "request={request}\n"
+        "source_author={source_author}\n"
+        "source_chat={source_chat}\n"
+        "support_case={support_case}\n"
+        "status={status}\n\n"
+        "This starts request-scoped suppression and deletion. Confirm explicitly."
+    ),
+    "source_data_deletion_input_texts": [
+        "Enter exactly request_id=<opaque> source_author=<numeric> "
+        "source_chat=<exact Source Chat key> support_case=<opaque>. "
+        "Do not include a body.",
+        "Enter one bounded rejection reason without whitespace.",
+        "Enter body-free completion proof pointer for outcome {outcome}.",
+    ],
     "source_data_audit_text": "**Source Data Audit**",
     "source_data_audit_labels": ["Back", "Menu"],
     "source_chats_text": "**Source Chats**",

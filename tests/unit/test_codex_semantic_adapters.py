@@ -248,6 +248,7 @@ def _translated_language_fields() -> dict[str, JsonValue]:
         "zero_result": 3,
         "administration_labels": 4,
         "source_data_deletion_labels": 2,
+        "source_data_deletion_input_texts": 3,
         "source_data_audit_labels": 2,
         "source_chats_labels": 3,
         "source_chat_address_labels": 2,

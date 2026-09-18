@@ -2524,6 +2524,24 @@ class ControlledConversationLanguageAdapter:
                 "Die Ansicht enthält keine Nachrichtentexte."
             ),
             source_data_deletion_labels=("Zurück", "Menü"),
+            source_data_deletion_review_text=(
+                "🛡️ **Ziel der Löschung von Source Data prüfen**\n\n"
+                "request={request}\n"
+                "source_author={source_author}\n"
+                "source_chat={source_chat}\n"
+                "support_case={support_case}\n"
+                "status={status}\n\n"
+                "Diese Operation startet die auf die Anfrage begrenzte "
+                "Unterdrückung und Löschung. Bestätigen Sie ausdrücklich."
+            ),
+            source_data_deletion_input_texts=(
+                "Geben Sie genau request_id=<opaque> source_author=<numeric> "
+                "source_chat=<exact Source Chat key> support_case=<opaque> ein. "
+                "Fügen Sie keinen Textkörper ein.",
+                "Geben Sie einen begrenzten Ablehnungsgrund ohne Leerzeichen ein.",
+                "Geben Sie den Nachweiszeiger ohne Textkörper für das Ergebnis "
+                "{outcome} ein.",
+            ),
             source_data_audit_text=(
                 "🧾 **Datenaufbewahrungs-Audit**\n\n"
                 "Ereignisse ohne Nachrichtentext werden 90 Tage aufbewahrt."
