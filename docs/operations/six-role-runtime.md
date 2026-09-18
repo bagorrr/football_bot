@@ -179,6 +179,33 @@ single affected role after service recovery; do not clear offsets or replay
 queues by hand. T1 delivery reconciliation and Bot Assistant idempotency remain
 application-owned; never resend an ambiguous Telegram effect manually.
 
+### T2 checkpoint recovery after a failed first start
+
+The ordinary runtime does not initialize missing T2 checkpoint rows. After the
+implementation has passed its fresh review and the protected staging owner has
+approved this separate state transition, stop the Ingestion service and verify
+the reviewed checkout, PostgreSQL 16 contract, and exact four-channel active
+scope. Then run the explicit operator entrypoint as the Ingestion OS identity:
+
+```text
+/opt/football-bot/current/.venv/bin/python -I -B \
+  /opt/football-bot/current/apps/t2_checkpoint_bootstrap.py --apply
+```
+
+The process must receive `DATABASE_URL_INGESTION` and the four T2 Telegram keys
+through the existing protected secret injection path; never place their values
+on this command line, in shell history, or in a journal. The entrypoint
+authenticates the configured account, captures the complete account state,
+checks current access and channel `pts` for all four approved channels, and
+initializes missing rows only from persisted admission boundaries. It marks
+only the admission history window completed, so it does not request Telegram
+message history or claim a backfill. A redacted JSON `pass` with initialization
+counts is required; a typed `blocked` result never guesses or backfills and is
+safe to reconcile with an idempotent retry after the cause is understood.
+Existing conflicting rows, a changed scope, a regressed provider `pts`, or a
+non-completed history row fail closed. Start the Ingestion service only after
+this procedure and its redacted readiness checks pass.
+
 ## Geographic provider policy and privacy
 
 The resolver uses GeoNames HTTPS JSON services for canonical country/city

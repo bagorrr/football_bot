@@ -504,8 +504,12 @@ def _run_ingestion(service: RuntimeService) -> None:
     while True:
         if live_transport_failure or not live_thread.is_alive():
             if live_transport_failure:
-                service.application._stop_telethon_transport_failure(
-                    live_transport_failure[0]
+                failure = live_transport_failure[0]
+                service.application._stop_telethon_transport_failure(failure)
+                raise TelethonTransportError(
+                    "T2 live transport stopped",
+                    reason=failure.reason,
+                    scope=IngestionFailureScope.INGESTION_ROLE,
                 )
             raise RuntimeError("T2 live transport stopped")
         worked = service.application.process_next()
@@ -536,6 +540,8 @@ def _run_ingestion(service: RuntimeService) -> None:
 
 
 def _run(service: RuntimeService) -> int:
+    from modules.telethon_ingestion import TelethonTransportError
+
     try:
         from modules.t5_runtime_configuration import (
             ROLE_CONFIGURATION_KEYS,
@@ -594,6 +600,16 @@ def _run(service: RuntimeService) -> int:
             _run_bot_assistant(service)
         else:
             _run_durable_pump(service)
+    except TelethonTransportError as error:
+        _emit_readiness(
+            service.role.value,
+            configuration="ready",
+            dependencies="ready",
+            runtime="failed",
+            reason=error.reason.value,
+        )
+        _notify_systemd("STATUS=Runtime stopped")
+        return 1
     except Exception:
         _emit_readiness(
             service.role.value,

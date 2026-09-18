@@ -4737,6 +4737,86 @@ class PostgresRoleStore:
             advanced_at=row["advanced_at"],
         )
 
+    def initialize_source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        initialized_at: datetime,
+    ) -> TelegramHistoryProgress:
+        """Create one completed admission window without reading message history."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(
+            self._database_url,
+            row_factory=dict_row,
+        ) as connection:
+            active = connection.execute(
+                """
+                SELECT 1
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                )
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+            if active is None:
+                raise LookupError(identity)
+            connection.execute(
+                """
+                INSERT INTO football_runtime.telegram_source_chat_history_progress (
+                    peer_kind, telegram_chat_id, registry_generation,
+                    window_start, window_end, completed, last_outcome, advanced_at
+                ) VALUES (%s, %s, %s, %s, %s, TRUE, 'completed', %s)
+                ON CONFLICT (peer_kind, telegram_chat_id, registry_generation)
+                DO NOTHING
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    window_start,
+                    window_end,
+                    initialized_at,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT last_telegram_message_id, window_start, window_end,
+                       completed, last_outcome, last_source_event_id, advanced_at
+                FROM football_runtime.telegram_source_chat_history_progress
+                WHERE peer_kind = %s
+                  AND telegram_chat_id = %s
+                  AND registry_generation = %s
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+        if row is None:
+            raise LookupError(identity)
+        if row["window_start"] != window_start or row["window_end"] != window_end:
+            raise ValueError("Source Chat history window changed for a generation")
+        if row["completed"] is not True or row["last_outcome"] != "completed":
+            raise OutboxConflictError
+        return TelegramHistoryProgress(
+            last_telegram_message_id=row["last_telegram_message_id"],
+            window_start=row["window_start"],
+            window_end=row["window_end"],
+            completed=row["completed"],
+            last_outcome=row["last_outcome"],
+            last_source_event_id=row["last_source_event_id"],
+            advanced_at=row["advanced_at"],
+        )
+
     def source_chat_history_progress(
         self,
         *,
@@ -5266,6 +5346,73 @@ class PostgresRoleStore:
         if context is None or context.checkpoint is None:
             raise LookupError(identity)
         return context.checkpoint
+
+    def initialize_channel_ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramChannelCheckpoint,
+        initialized_at: datetime,
+    ) -> None:
+        """Create one active channel pts and reject conflicting initialization."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        if identity.kind is not TelegramPeerKind.CHANNEL:
+            raise ValueError("Telegram channel checkpoint requires a channel")
+        with psycopg.connect(self._database_url, row_factory=dict_row) as connection:
+            active = connection.execute(
+                """
+                SELECT 1
+                FROM football_runtime.read_active_source_chat_ingestion_context(
+                    %s, %s, %s
+                )
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                ),
+            ).fetchone()
+            if active is None:
+                raise LookupError(identity)
+            inserted = connection.execute(
+                """
+                INSERT INTO football_runtime.telegram_channel_difference_checkpoints (
+                    peer_kind, telegram_chat_id, registry_generation,
+                    channel_pts, advanced_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (peer_kind, telegram_chat_id, registry_generation)
+                DO NOTHING
+                RETURNING peer_kind
+                """,
+                (
+                    identity.kind.value,
+                    identity.telegram_id,
+                    registry_generation,
+                    checkpoint.pts,
+                    initialized_at,
+                ),
+            ).fetchone()
+            if inserted is None:
+                existing = connection.execute(
+                    """
+                    SELECT channel_pts
+                    FROM football_runtime.telegram_channel_difference_checkpoints
+                    WHERE peer_kind = %s
+                      AND telegram_chat_id = %s
+                      AND registry_generation = %s
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                    ),
+                ).fetchone()
+                if existing is None:
+                    raise LookupError(identity)
+                if existing["channel_pts"] != checkpoint.pts:
+                    raise OutboxConflictError
 
     def advance_channel_difference_checkpoint(
         self,

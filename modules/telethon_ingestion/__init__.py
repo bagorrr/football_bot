@@ -12,7 +12,7 @@ import asyncio
 import hashlib
 import inspect
 import re
-from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
@@ -334,6 +334,16 @@ class TelethonSource(Protocol):
         self, identity: TelegramPeerIdentity
     ) -> str:
         """Read the current transport position for a successful admission."""
+        ...
+
+    def capture_account_checkpoint(self) -> TelegramAccountCheckpoint:
+        """Capture a complete account-wide difference checkpoint."""
+        ...
+
+    def capture_channel_checkpoint(
+        self, identity: TelegramPeerIdentity
+    ) -> TelegramChannelCheckpoint:
+        """Capture one approved channel's current pts boundary."""
         ...
 
     def get_account_difference_event(
@@ -690,6 +700,23 @@ def _telethon_failure_reason(error: Exception) -> IngestionFailureReason:
     return IngestionFailureReason.ACCESS_LOST
 
 
+def _telethon_async_callable(target: object) -> Callable[..., Any] | None:
+    """Return the bound coroutine behind one Telethon sync wrapper."""
+    candidate = getattr(target, "__tl.sync", None)
+    owner = getattr(target, "__self__", None)
+    if not callable(candidate):
+        call = type(target).__call__ if callable(target) else None
+        if callable(call):
+            call = call.__get__(target, type(target))
+        candidate = getattr(call, "__tl.sync", None)
+        owner = getattr(call, "__self__", None)
+    if not callable(candidate):
+        return None
+    if owner is not None and getattr(candidate, "__self__", None) is None:
+        candidate = candidate.__get__(owner, type(owner))
+    return cast(Callable[..., Any], candidate)
+
+
 def _transport_error(
     error: Exception,
     message: str,
@@ -905,6 +932,74 @@ class TelethonProvider:
             )
         return True
 
+    def capture_account_checkpoint(self) -> TelegramAccountCheckpoint:
+        """Capture all fields returned by Telegram's account state request."""
+        try:
+            from telethon import functions  # type: ignore[import-untyped]
+
+            response = self._request(
+                functions.updates.GetStateRequest(),
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            )
+            return self._account_response_checkpoint(response, None)
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram account checkpoint capture failed",
+                reason=_telethon_failure_reason(error),
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from None
+
+    def capture_channel_checkpoint(
+        self, identity: TelegramPeerIdentity
+    ) -> TelegramChannelCheckpoint:
+        """Capture one channel pts without reading messages or history."""
+        if identity.kind is not TelegramPeerKind.CHANNEL:
+            raise TelethonTransportError(
+                "Telegram channel checkpoint requires a channel",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        try:
+            entity = self._entity_for_identity(identity, refresh=False)
+            from telethon import functions, types
+
+            if self._identity_from_entity(entity) != identity:
+                raise TelethonTransportError(
+                    "Telegram Source Chat identity is inconsistent",
+                    reason=IngestionFailureReason.ACCESS_LOST,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+            access_hash = getattr(entity, "access_hash", None)
+            if type(access_hash) is not int:
+                raise TelethonTransportError(
+                    "Telegram channel access hash is unavailable",
+                    reason=IngestionFailureReason.ACCESS_LOST,
+                    scope=IngestionFailureScope.SOURCE_STREAM,
+                )
+            response = self._request(
+                functions.channels.GetFullChannelRequest(
+                    channel=types.InputChannel(identity.telegram_id, access_hash),
+                ),
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+            full_chat = getattr(response, "full_chat", None)
+            pts = self._required_checkpoint_int(
+                getattr(full_chat, "pts", _MISSING),
+                field_name="pts",
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+            return TelegramChannelCheckpoint(pts=pts)
+        except TelethonTransportError:
+            raise
+        except Exception as error:
+            raise TelethonTransportError(
+                "Telegram channel checkpoint capture failed",
+                reason=_telethon_failure_reason(error),
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            ) from None
+
     def resolve_source_chat(self, address: str) -> SourceChatAdmissionResolution:
         """Resolve a public or already-accessible private address without joining."""
         try:
@@ -938,32 +1033,20 @@ class TelethonProvider:
     ) -> str:
         """Capture a typed transport boundary after address resolution."""
         try:
-            entity = self._entity_for_identity(identity, refresh=False)
-            from telethon import functions, types  # type: ignore[import-untyped]
-
-            if identity.kind.value == "channel":
-                access_hash = getattr(entity, "access_hash", None)
-                if type(access_hash) is not int:
-                    raise TelethonTransportError(
-                        "Telegram channel access hash is unavailable",
-                        reason=IngestionFailureReason.ACCESS_LOST,
-                        scope=IngestionFailureScope.SOURCE_STREAM,
-                    )
-                response = self._request(
-                    functions.channels.GetFullChannelRequest(
-                        channel=types.InputChannel(identity.telegram_id, access_hash),
-                    ),
-                    scope=IngestionFailureScope.SOURCE_STREAM,
-                )
-                full_chat = getattr(response, "full_chat", None)
-                pts = getattr(full_chat, "pts", None)
-                if type(pts) is not int or pts < 0:
+            if identity.kind is TelegramPeerKind.CHANNEL:
+                try:
+                    checkpoint = self.capture_channel_checkpoint(identity)
+                except TelethonTransportError as error:
+                    if error.reason is not IngestionFailureReason.CHECKPOINT_INVALID:
+                        raise
                     raise TelethonTransportError(
                         "Telegram channel boundary is unavailable",
                         reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
                         scope=IngestionFailureScope.SOURCE_STREAM,
-                    )
-                return f"channel-pts:{pts}"
+                    ) from None
+                return f"channel-pts:{checkpoint.pts}"
+            from telethon import functions
+
             response = self._request(
                 functions.updates.GetStateRequest(),
                 scope=IngestionFailureScope.ACCOUNT_STREAM,
@@ -1589,20 +1672,27 @@ class TelethonProvider:
     @staticmethod
     def _account_response_checkpoint(
         response: object,
-        checkpoint: TelegramAccountCheckpoint,
+        checkpoint: TelegramAccountCheckpoint | None,
     ) -> TelegramAccountCheckpoint:
         missing = _MISSING
         state = getattr(response, "state", missing)
         if state is missing:
             state = getattr(response, "intermediate_state", missing)
         account_scope = IngestionFailureScope.ACCOUNT_STREAM
+        if state is missing and all(
+            getattr(response, field_name, missing) is not missing
+            for field_name in ("pts", "qts", "seq", "date")
+        ):
+            state = response
         if state is missing:
             try:
                 from telethon import types
             except Exception:
                 types = None
-            if types is not None and isinstance(
-                response, types.updates.DifferenceEmpty
+            if (
+                types is not None
+                and isinstance(response, types.updates.DifferenceEmpty)
+                and checkpoint is not None
             ):
                 return TelegramAccountCheckpoint(
                     pts=checkpoint.pts,
@@ -3258,6 +3348,9 @@ class TelethonProvider:
             target_callable = getattr(self._client, target)
         else:
             target_callable = target
+        async_target = _telethon_async_callable(target_callable)
+        if async_target is not None:
+            target_callable = async_target
         try:
             result = target_callable(*args, **kwargs)
             if inspect.isawaitable(result):
@@ -3276,9 +3369,25 @@ class TelethonProvider:
                         result = asyncio.run_coroutine_threadsafe(
                             await_result(), client_loop
                         ).result()
+                    elif (
+                        isinstance(client_loop, asyncio.AbstractEventLoop)
+                        and not client_loop.is_closed()
+                    ):
+
+                        async def await_result() -> Any:
+                            return await result
+
+                        result = client_loop.run_until_complete(await_result())
                     else:
-                        result = asyncio.run(cast(Coroutine[Any, Any, Any], result))
+
+                        async def await_result() -> Any:
+                            return await result
+
+                        result = asyncio.run(await_result())
                 else:
+                    close = getattr(result, "close", None)
+                    if callable(close):
+                        close()
                     raise RuntimeError("Telethon provider cannot block a running loop")
             return result
         except TelethonTransportError:
@@ -3661,6 +3770,58 @@ class TelethonIngestionAdapter:
             raise SourceChatAdmissionError from None
         except Exception:
             raise SourceChatAdmissionError from None
+
+    def capture_account_checkpoint(self) -> TelegramAccountCheckpoint:
+        """Capture one complete account checkpoint through the ready boundary."""
+        self._runtime.require_ready()
+        capture = getattr(self._source, "capture_account_checkpoint", None)
+        if not callable(capture):
+            raise TelethonConformanceError(
+                key="ACCOUNT_CHECKPOINT", status="provider_boundary_unavailable"
+            )
+        try:
+            checkpoint = capture()
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram account checkpoint capture failed",
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            ) from None
+        if not isinstance(checkpoint, TelegramAccountCheckpoint):
+            raise TelethonTransportError(
+                "Telegram account checkpoint is invalid",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.ACCOUNT_STREAM,
+            )
+        return checkpoint
+
+    def capture_channel_checkpoint(
+        self, identity: TelegramPeerIdentity
+    ) -> TelegramChannelCheckpoint:
+        """Capture one approved channel checkpoint through the ready boundary."""
+        self._require_approved(identity)
+        capture = getattr(self._source, "capture_channel_checkpoint", None)
+        if not callable(capture):
+            raise TelethonConformanceError(
+                key="CHANNEL_CHECKPOINT", status="provider_boundary_unavailable"
+            )
+        try:
+            checkpoint = capture(identity)
+        except Exception as error:
+            raise _transport_error(
+                error,
+                "Telegram channel checkpoint capture failed",
+                reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            ) from None
+        if not isinstance(checkpoint, TelegramChannelCheckpoint):
+            raise TelethonTransportError(
+                "Telegram channel checkpoint is invalid",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
+        return checkpoint
 
     def get_account_difference_event(
         self, checkpoint: TelegramAccountCheckpoint

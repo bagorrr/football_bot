@@ -86,6 +86,14 @@ class _RecordingTelethonSource:
     ) -> str:
         raise AssertionError(identity)
 
+    def capture_account_checkpoint(self) -> TelegramAccountCheckpoint:
+        raise AssertionError
+
+    def capture_channel_checkpoint(
+        self, identity: TelegramPeerIdentity
+    ) -> TelegramChannelCheckpoint:
+        raise AssertionError(identity)
+
     def get_account_difference_event(
         self, checkpoint: TelegramAccountCheckpoint
     ) -> TelegramDifferenceResult | None:
@@ -573,6 +581,103 @@ def test_production_telethon_provider_is_lazy_and_wires_live_client_boundary() -
     assert client.calls[:3] == ["connect", "is_user_authorized", "get_me"]
     assert len(client.handlers) == 3
     assert client.calls[-2:] == ["catch_up", "run_until_disconnected"]
+
+
+def test_provider_captures_complete_account_state_and_channel_pts() -> None:
+    account_response = SimpleNamespace(
+        pts=101,
+        qts=202,
+        seq=303,
+        date=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+    )
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    client = _DifferenceClientProbe(
+        [account_response, SimpleNamespace(full_chat=SimpleNamespace(pts=404))]
+    )
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+
+    assert provider.capture_account_checkpoint() == TelegramAccountCheckpoint(
+        pts=101,
+        qts=202,
+        seq=303,
+        date=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+    )
+    assert provider.capture_channel_checkpoint(identity) == TelegramChannelCheckpoint(
+        pts=404
+    )
+    assert isinstance(client.requests[0], functions.updates.GetStateRequest)
+    assert isinstance(client.requests[1], functions.channels.GetFullChannelRequest)
+    assert client.history_kwargs is None
+
+
+def test_provider_awaits_telethon_sync_wrapper_on_client_loop() -> None:
+    calls: list[str] = []
+
+    async def async_catch_up() -> None:
+        calls.append("catch_up")
+
+    def sync_wrapper() -> object:
+        coroutine = async_catch_up()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            raise RuntimeError("sync wrapper cannot run without a loop") from None
+        return coroutine
+
+    setattr(sync_wrapper, "__tl.sync", async_catch_up)
+
+    class _SyncWrapperClient(_ProductionClientProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.loop = asyncio.new_event_loop()
+            self.__dict__["catch_up"] = sync_wrapper
+
+        def run_until_disconnected(self) -> None:
+            calls.append("run_until_disconnected")
+
+    client = _SyncWrapperClient()
+    provider = TelethonProvider(client=client)
+    try:
+        provider.start_live_ingestion(lambda _identity: None)
+        provider.run_live_ingestion()
+    finally:
+        client.loop.close()
+
+    assert calls == ["catch_up", "run_until_disconnected"]
+
+
+def test_provider_awaits_sync_wrapped_client_request() -> None:
+    response = SimpleNamespace(
+        pts=1,
+        qts=2,
+        seq=3,
+        date=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+    )
+
+    class _SyncCallableClient:
+        def __init__(self) -> None:
+            self.responses = [response]
+            self.requests: list[object] = []
+
+        async def async_call(self, request: object) -> object:
+            self.requests.append(request)
+            return self.responses.pop(0)
+
+        def __call__(self, request: object) -> object:
+            coroutine = self.async_call(request)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                raise RuntimeError("sync wrapper cannot run without a loop") from None
+            return coroutine
+
+    _SyncCallableClient.__call__.__dict__["__tl.sync"] = _SyncCallableClient.async_call
+    client = _SyncCallableClient()
+
+    assert TelethonProvider(client=client).capture_account_checkpoint() == (
+        TelegramAccountCheckpoint(1, 2, 3, response.date)
+    )
+    assert isinstance(client.requests[0], functions.updates.GetStateRequest)
 
 
 def test_provider_schedules_async_transport_calls_on_its_running_client_loop() -> None:

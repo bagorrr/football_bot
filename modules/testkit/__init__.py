@@ -506,6 +506,18 @@ class ControlledTelegramIngestionAdapter:
             )
         return boundaries.pop(0)
 
+    def capture_account_checkpoint(self) -> TelegramAccountCheckpoint:
+        """Keep explicit provider checkpoint capture outside controlled tests."""
+        raise AssertionError("controlled account checkpoint capture is not configured")
+
+    def capture_channel_checkpoint(
+        self, identity: TelegramPeerIdentity
+    ) -> TelegramChannelCheckpoint:
+        """Keep explicit provider checkpoint capture outside controlled tests."""
+        raise AssertionError(
+            f"controlled channel checkpoint capture is not configured: {identity}"
+        )
+
     def add_account_difference_event(
         self,
         *,

@@ -191,6 +191,16 @@ class TelegramIngestionAdapter(Protocol):
         """Capture the current transport position after successful resolution."""
         ...
 
+    def capture_account_checkpoint(self) -> TelegramAccountCheckpoint:
+        """Capture a complete account-wide difference checkpoint."""
+        ...
+
+    def capture_channel_checkpoint(
+        self, identity: TelegramPeerIdentity
+    ) -> TelegramChannelCheckpoint:
+        """Capture one approved channel's current pts boundary."""
+        ...
+
     def get_account_difference_event(
         self,
         checkpoint: TelegramAccountCheckpoint,
@@ -1359,6 +1369,17 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read one Source Chat generation's durable channel pts."""
         ...
 
+    def initialize_channel_ingestion_checkpoint(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        checkpoint: TelegramChannelCheckpoint,
+        initialized_at: datetime,
+    ) -> None:
+        """Create one Source Chat channel pts without guessing or advancing it."""
+        ...
+
     def advance_channel_difference_checkpoint(
         self,
         *,
@@ -1407,6 +1428,18 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         initialized_at: datetime,
     ) -> TelegramHistoryProgress:
         """Create or read one generation's exact bounded-history progress row."""
+        ...
+
+    def initialize_source_chat_history_progress(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+        window_start: datetime,
+        window_end: datetime,
+        initialized_at: datetime,
+    ) -> TelegramHistoryProgress:
+        """Create a completed admission window without reading message history."""
         ...
 
     def source_chat_history_progress(

@@ -650,6 +650,42 @@ def test_run_ingestion_routes_normal_disconnect_to_durable_stop(
     assert error.scope is IngestionFailureScope.INGESTION_ROLE
 
 
+def test_run_emits_typed_redacted_ingestion_stop_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modules.telethon_ingestion import TelethonTransportError
+
+    readiness: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        runtime_service,
+        "_emit_readiness",
+        lambda _role, **values: readiness.append(values),
+    )
+    monkeypatch.setattr(runtime_service, "_notify_systemd", lambda _message: None)
+    monkeypatch.setattr(
+        "modules.t5_runtime_configuration.preflight_role",
+        lambda _role, _projection: SimpleNamespace(configuration_ready=True),
+    )
+
+    def stop_with_typed_reason(_service: object) -> None:
+        raise TelethonTransportError(
+            "secret provider detail",
+            reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+            scope=IngestionFailureScope.INGESTION_ROLE,
+        )
+
+    monkeypatch.setattr(runtime_service, "_run_ingestion", stop_with_typed_reason)
+    service = runtime_service.RuntimeService(
+        role=RuntimeRole.INGESTION,
+        application=object(),
+        store=object(),
+    )
+
+    assert runtime_service._run(service) == 1
+    assert readiness[-1]["reason"] == "checkpoint_unavailable"
+    assert "secret provider detail" not in str(readiness)
+
+
 def test_ingestion_discards_scope_activation_after_registry_change() -> None:
     from modules.application import RuntimeApplication
 
