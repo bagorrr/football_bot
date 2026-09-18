@@ -185,23 +185,50 @@ The ordinary runtime does not initialize missing T2 checkpoint rows. After the
 implementation has passed its fresh review and the protected staging owner has
 approved this separate state transition, stop the Ingestion service and verify
 the reviewed checkout, PostgreSQL 16 contract, and exact four-channel active
-scope. Then run the explicit operator entrypoint as the Ingestion OS identity:
+scope. This is a durable-state recovery procedure, so it must not start until
+all of the following evidence is recorded in redacted form:
+
+1. A custom-format PostgreSQL backup was created for the target staging
+   database, its status and digest were recorded, and the backup was restored
+   successfully into an isolated temporary database with `pg_restore --exit-on-error`.
+2. A separate recovery decision was explicitly recorded by the staging owner:
+   initialize only the current account and four persisted admission boundaries,
+   mark only the four admission history windows completed, and do not request
+   or claim a history backfill. Backup success is evidence for the decision; it
+   is not the decision itself.
+3. Redacted before-counts were recorded for account checkpoints, channel
+   checkpoints, and completed history-progress rows. Record counts only, never
+   peer IDs, database URLs, session values, or message data.
+
+Run the T5 launcher in checkpoint-bootstrap mode as root; it reads the
+canonical master file, projects only the Ingestion keys, clears inherited
+groups, drops to the Ingestion OS identity, and then execs the operator
+procedure:
 
 ```text
 /opt/football-bot/current/.venv/bin/python -I -B \
-  /opt/football-bot/current/apps/t2_checkpoint_bootstrap.py --apply
+  /opt/football-bot/current/apps/runtime_launcher.py \
+  --role ingestion --checkpoint-bootstrap
 ```
 
-The process must receive `DATABASE_URL_INGESTION` and the four T2 Telegram keys
-through the existing protected secret injection path; never place their values
-on this command line, in shell history, or in a journal. The entrypoint
-authenticates the configured account, captures the complete account state,
-checks current access and channel `pts` for all four approved channels, and
-initializes missing rows only from persisted admission boundaries. It marks
-only the admission history window completed, so it does not request Telegram
-message history or claim a backfill. A redacted JSON `pass` with initialization
-counts is required; a typed `blocked` result never guesses or backfills and is
-safe to reconcile with an idempotent retry after the cause is understood.
+The launched process receives `DATABASE_URL_INGESTION` and the four T2 Telegram
+keys only through that protected projection; never place their values on a
+command line, in shell history, or in a journal. It authenticates the
+configured account, captures the complete account state, checks current access
+and channel `pts` for all four approved channels, and initializes missing rows
+only from persisted admission boundaries. It marks only the admission history
+window completed, so it does not request Telegram message history or claim a
+backfill. A redacted JSON `pass` with initialization counts is required; a
+typed `blocked` result never guesses or backfills and is safe to reconcile with
+an idempotent retry after the cause is understood.
+
+After the command, record redacted after-counts for the same three row classes
+and retain the JSON initialization counts with the backup and isolated-restore
+evidence. The expected successful state is one account checkpoint, four
+channel checkpoints, and four completed admission-window progress rows. If
+the counts or the typed result do not match the separately recorded recovery
+decision, keep Ingestion stopped and follow the explicit restore/recovery
+decision procedure; do not retry blindly or edit offsets by hand.
 Existing conflicting rows, a changed scope, a regressed provider `pts`, or a
 non-completed history row fail closed. Start the Ingestion service only after
 this procedure and its redacted readiness checks pass.

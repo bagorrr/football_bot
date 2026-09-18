@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from apps import runtime_launcher
 from apps.runtime_launcher import build_role_environment
-from modules.t5_runtime_configuration import project_role
+from modules.t5_runtime_configuration import PRODUCTION_MASTER_ENV_PATH, project_role
 
 
 def test_launcher_environment_contains_only_role_projection_and_os_basics() -> None:
@@ -73,6 +76,93 @@ def test_launcher_environment_contains_only_role_projection_and_os_basics() -> N
     }
     assert assistant["HOME"] == "/var/lib/football-bot/bot_assistant"
     assert assistant["NOTIFY_SOCKET"] == "/run/systemd/notify"
+
+
+def test_t2_checkpoint_bootstrap_uses_t5_projection_and_role_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    master = {
+        "DATABASE_URL_INGESTION": "postgresql://football_ingestion@db/app",
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "456789",
+        "TELEGRAM_BOT_TOKEN": "123456:controlled-token",
+    }
+    runtime_user = SimpleNamespace(
+        pw_uid=1001,
+        pw_gid=1002,
+        pw_dir="/var/lib/football-bot/ingestion",
+    )
+    privilege_calls: list[tuple[str, object]] = []
+    exec_calls: list[tuple[str, tuple[str, ...], dict[str, str]]] = []
+
+    def read_master(path: Path) -> dict[str, str]:
+        assert path == PRODUCTION_MASTER_ENV_PATH
+        return master
+
+    def get_runtime_user(name: str) -> SimpleNamespace:
+        assert name == "football-ingestion"
+        return runtime_user
+
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(runtime_launcher, "read_master_env_file", read_master)
+    monkeypatch.setattr(pwd, "getpwnam", get_runtime_user)
+    monkeypatch.setattr(
+        os,
+        "setgroups",
+        lambda groups: privilege_calls.append(("setgroups", groups)),
+    )
+    monkeypatch.setattr(
+        os,
+        "setgid",
+        lambda gid: privilege_calls.append(("setgid", gid)),
+    )
+    monkeypatch.setattr(
+        os,
+        "setuid",
+        lambda uid: privilege_calls.append(("setuid", uid)),
+    )
+    monkeypatch.setattr(os, "umask", lambda _mask: None)
+    monkeypatch.setattr(os, "chdir", lambda _path: None)
+    monkeypatch.setattr(
+        os,
+        "execve",
+        lambda executable, arguments, environment: exec_calls.append(
+            (executable, arguments, environment)
+        ),
+    )
+
+    result = runtime_launcher.main(["--role", "ingestion", "--checkpoint-bootstrap"])
+
+    assert result == 0
+    assert privilege_calls == [
+        ("setgroups", []),
+        ("setgid", 1002),
+        ("setuid", 1001),
+    ]
+    assert len(exec_calls) == 1
+    executable, arguments, environment = exec_calls[0]
+    assert executable == sys.executable
+    assert arguments[-2:] == (
+        "--apply",
+        "--from-t5-launcher",
+    )
+    assert arguments[-3].endswith("/apps/t2_checkpoint_bootstrap.py")
+    assert set(environment) == {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "LANG",
+        "PYTHONUTF8",
+        "DATABASE_URL_INGESTION",
+        "TELEGRAM_API_ID",
+        "TELEGRAM_API_HASH",
+        "TELEGRAM_SESSION_STRING",
+        "TELEGRAM_ADMIN_USER_ID",
+    }
+    assert "TELEGRAM_BOT_TOKEN" not in environment
 
 
 def test_preflight_only_checks_staged_master_without_starting_role(

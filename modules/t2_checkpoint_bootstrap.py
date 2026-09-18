@@ -5,7 +5,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import NoReturn, Protocol
+from enum import StrEnum
+from typing import NoReturn, Protocol, TypeAlias
+
+import psycopg
 
 from modules.domain import (
     IngestionFailureReason,
@@ -15,6 +18,7 @@ from modules.domain import (
     TelegramPeerIdentity,
     TelegramPeerKind,
 )
+from modules.ports import ConversationAccessDeniedError
 from modules.telethon_ingestion import (
     SourceChatHistoryWindow,
     TelethonTransportError,
@@ -25,10 +29,27 @@ _CHANNEL_BOUNDARY_PREFIX = "channel-pts:"
 _POSTGRES_BIGINT_MAX = 2**63 - 1
 
 
+class T2CheckpointFailureReason(StrEnum):
+    """Actionable body-free failure classes for the operator procedure."""
+
+    DATABASE_UNAVAILABLE = "database_unavailable"
+    DATABASE_NOT_READY = "database_not_ready"
+    DATABASE_IDENTITY_MISMATCH = "database_identity_mismatch"
+    DATABASE_FAILED = "database_failed"
+    ACCESS_DENIED = "access_denied"
+    DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+    CONFIGURATION_INVALID = "configuration_invalid"
+    CONFORMANCE_FAILED = "conformance_failed"
+    RUNTIME_FAILED = "runtime_failed"
+
+
+T2CheckpointReason: TypeAlias = IngestionFailureReason | T2CheckpointFailureReason
+
+
 class T2CheckpointBootstrapError(RuntimeError):
     """A redacted, typed failure while initializing T2 checkpoint state."""
 
-    def __init__(self, *, reason: IngestionFailureReason) -> None:
+    def __init__(self, *, reason: T2CheckpointReason) -> None:
         self.reason = reason
         super().__init__("T2 checkpoint bootstrap failed")
 
@@ -221,9 +242,9 @@ def bootstrap_t2_checkpoint_state(
         raise
     except TelethonTransportError as error:
         raise T2CheckpointBootstrapError(reason=error.reason) from None
-    except Exception:
+    except Exception as error:
         raise T2CheckpointBootstrapError(
-            reason=IngestionFailureReason.CHECKPOINT_INVALID
+            reason=classify_t2_checkpoint_exception(error)
         ) from None
 
 
@@ -376,3 +397,18 @@ def _validate_bigint_checkpoint(checkpoint: TelegramAccountCheckpoint) -> None:
 
 def _fail(reason: IngestionFailureReason) -> NoReturn:
     raise T2CheckpointBootstrapError(reason=reason)
+
+
+def classify_t2_checkpoint_exception(error: Exception) -> T2CheckpointReason:
+    """Classify unexpected operator-boundary failures without exposing details."""
+    if isinstance(error, ConversationAccessDeniedError | PermissionError):
+        return T2CheckpointFailureReason.ACCESS_DENIED
+    if isinstance(error, psycopg.errors.InsufficientPrivilege):
+        return T2CheckpointFailureReason.ACCESS_DENIED
+    if isinstance(error, (psycopg.OperationalError, psycopg.InterfaceError)):
+        return T2CheckpointFailureReason.DATABASE_UNAVAILABLE
+    if isinstance(error, psycopg.Error):
+        return T2CheckpointFailureReason.DATABASE_FAILED
+    if isinstance(error, ValueError):
+        return IngestionFailureReason.CHECKPOINT_INVALID
+    return T2CheckpointFailureReason.RUNTIME_FAILED

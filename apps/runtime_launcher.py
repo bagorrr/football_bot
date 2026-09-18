@@ -106,7 +106,26 @@ def _run(
     *,
     preflight_only: bool,
     config_file: Path,
+    checkpoint_bootstrap: bool,
 ) -> int:
+    if checkpoint_bootstrap and role != "ingestion":
+        _emit_preflight(
+            role,
+            configuration="not_checked",
+            dependencies="not_checked",
+            runtime="not_started",
+            failure={"status": "role_unauthorized"},
+        )
+        return 78
+    if checkpoint_bootstrap and preflight_only:
+        _emit_preflight(
+            role,
+            configuration="not_checked",
+            dependencies="not_checked",
+            runtime="not_started",
+            failure={"status": "bootstrap_cannot_be_preflight_only"},
+        )
+        return 78
     if os.geteuid() != 0:
         _emit_preflight(
             role,
@@ -183,7 +202,26 @@ def _run(
         home=Path(runtime_user.pw_dir),
         notify_socket=os.environ.get("NOTIFY_SOCKET"),
     )
-    service_path = REPOSITORY_ROOT / "apps" / "runtime_service.py"
+    if checkpoint_bootstrap:
+        service_path = REPOSITORY_ROOT / "apps" / "t2_checkpoint_bootstrap.py"
+        service_arguments = (
+            sys.executable,
+            "-I",
+            "-B",
+            str(service_path),
+            "--apply",
+            "--from-t5-launcher",
+        )
+    else:
+        service_path = REPOSITORY_ROOT / "apps" / "runtime_service.py"
+        service_arguments = (
+            sys.executable,
+            "-I",
+            "-B",
+            str(service_path),
+            "--role",
+            role,
+        )
     try:
         os.chdir(REPOSITORY_ROOT)
         os.umask(0o077)
@@ -192,7 +230,7 @@ def _run(
         os.setuid(runtime_user.pw_uid)
         os.execve(
             sys.executable,
-            (sys.executable, "-I", "-B", str(service_path), "--role", role),
+            service_arguments,
             environment,
         )
     except OSError:
@@ -212,6 +250,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--role", choices=sorted(SERVICE_ROLES), required=True)
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument(
+        "--checkpoint-bootstrap",
+        action="store_true",
+        help="run the T2 checkpoint initializer through the protected launcher",
+    )
+    parser.add_argument(
         "--config-file",
         type=Path,
         default=PRODUCTION_MASTER_ENV_PATH,
@@ -221,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         arguments.role,
         preflight_only=arguments.preflight_only,
         config_file=arguments.config_file,
+        checkpoint_bootstrap=arguments.checkpoint_bootstrap,
     )
 
 

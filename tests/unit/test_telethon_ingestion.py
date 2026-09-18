@@ -11,11 +11,12 @@ from threading import Thread
 from types import SimpleNamespace
 
 import pytest
-from telethon import functions, types  # type: ignore[import-untyped]
+from telethon import TelegramClient, functions, types  # type: ignore[import-untyped]
 from telethon.errors import (  # type: ignore[import-untyped]
     ChannelPrivateError,
     PersistentTimestampEmptyError,
 )
+from telethon.sessions import StringSession  # type: ignore[import-untyped]
 
 from modules.domain import (
     IngestionFailureReason,
@@ -644,6 +645,48 @@ def test_provider_awaits_telethon_sync_wrapper_on_client_loop() -> None:
         client.loop.close()
 
     assert calls == ["catch_up", "run_until_disconnected"]
+
+
+def test_provider_awaits_live_call_with_real_telethon_loop_property() -> None:
+    calls: list[str] = []
+    errors: list[BaseException] = []
+
+    client = TelegramClient(
+        StringSession(),
+        123456,
+        "controlled-api-hash",
+        catch_up=False,
+    )
+
+    def set_client_attribute(name: str, value: object) -> None:
+        setattr(client, name, value)
+
+    async def async_catch_up() -> None:
+        calls.append("catch_up")
+        assert asyncio.get_running_loop() is not None
+
+    set_client_attribute("catch_up", async_catch_up)
+    set_client_attribute(
+        "run_until_disconnected",
+        lambda: calls.append("run_until_disconnected"),
+    )
+    provider = TelethonProvider(client=client)
+    provider.start_live_ingestion(lambda _identity: None)
+
+    def run_live_transport() -> None:
+        try:
+            provider.run_live_ingestion()
+        except BaseException as error:
+            errors.append(error)
+
+    live_thread = Thread(target=run_live_transport)
+    live_thread.start()
+    live_thread.join(timeout=2)
+
+    assert not live_thread.is_alive()
+    assert errors == []
+    assert calls == ["catch_up", "run_until_disconnected"]
+    assert isinstance(type(client).loop, property)
 
 
 def test_provider_awaits_sync_wrapped_client_request() -> None:

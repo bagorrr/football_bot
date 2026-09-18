@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
+import psycopg
 import pytest
 
+from apps import t2_checkpoint_bootstrap as bootstrap_app
 from modules.domain import (
     IngestionFailureReason,
     TelegramAccountCheckpoint,
@@ -14,9 +17,16 @@ from modules.domain import (
     TelegramPeerIdentity,
     TelegramPeerKind,
 )
+from modules.ports import ConversationAccessDeniedError
+from modules.postgres_adapter import PostgresRoleReadinessError
 from modules.t2_checkpoint_bootstrap import (
     T2CheckpointBootstrapError,
+    T2CheckpointFailureReason,
     bootstrap_t2_checkpoint_state,
+)
+from modules.telethon_ingestion import (
+    TelethonConfigurationError,
+    TelethonConformanceError,
 )
 
 NOW = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
@@ -147,6 +157,53 @@ class _Store:
         return progress
 
 
+class _FailingStore(_Store):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    def active_source_chat_ingestion_scope(
+        self,
+    ) -> tuple[tuple[TelegramPeerIdentity, int], ...]:
+        raise self.error
+
+
+def test_t2_environment_projection_ignores_inherited_keys() -> None:
+    database_url, projection = bootstrap_app._t2_environment_projection(
+        {
+            "DATABASE_URL_INGESTION": "postgresql://football_ingestion@db/app",
+            "TELEGRAM_API_ID": "123456",
+            "TELEGRAM_API_HASH": "controlled-api-hash",
+            "TELEGRAM_SESSION_STRING": "controlled-session",
+            "TELEGRAM_ADMIN_USER_ID": "789012",
+            "TELEGRAM_BOT_TOKEN": "not-for-t2",
+            "UNAUTHORIZED_INHERITED_KEY": "not-for-t2",
+        }
+    )
+
+    assert database_url == "postgresql://football_ingestion@db/app"
+    assert set(projection) == {
+        "TELEGRAM_API_ID",
+        "TELEGRAM_API_HASH",
+        "TELEGRAM_SESSION_STRING",
+        "TELEGRAM_ADMIN_USER_ID",
+    }
+    assert "TELEGRAM_BOT_TOKEN" not in projection
+    assert "UNAUTHORIZED_INHERITED_KEY" not in projection
+
+
+def test_bootstrap_requires_the_t5_launcher(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert bootstrap_app.main(["--apply"]) == 78
+
+    assert json.loads(capsys.readouterr().out) == {
+        "event": "t2_checkpoint_bootstrap",
+        "outcome": "blocked",
+        "reason": "t5_launcher_required",
+    }
+
+
 def test_bootstrap_initializes_only_missing_state_from_verified_boundaries() -> None:
     source = _Source()
     store = _Store()
@@ -185,3 +242,89 @@ def test_bootstrap_preflights_channel_pts_before_writing_any_state() -> None:
     assert store.account is None
     assert store.channel_initializations == []
     assert store.history_initializations == []
+
+
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    (
+        (
+            psycopg.OperationalError("controlled database outage"),
+            T2CheckpointFailureReason.DATABASE_UNAVAILABLE,
+        ),
+        (
+            ConversationAccessDeniedError(),
+            T2CheckpointFailureReason.ACCESS_DENIED,
+        ),
+        (
+            RuntimeError("controlled runtime failure"),
+            T2CheckpointFailureReason.RUNTIME_FAILED,
+        ),
+    ),
+)
+def test_bootstrap_preserves_actionable_unexpected_failure_types(
+    error: Exception,
+    reason: T2CheckpointFailureReason,
+) -> None:
+    with pytest.raises(T2CheckpointBootstrapError) as raised:
+        bootstrap_t2_checkpoint_state(
+            source=_Source(),
+            store=_FailingStore(error),
+            initialized_at=NOW,
+        )
+
+    assert raised.value.reason is reason
+
+
+@pytest.mark.parametrize(
+    ("error", "reason", "exit_code"),
+    (
+        (
+            PostgresRoleReadinessError(status="database_unavailable"),
+            "database_unavailable",
+            1,
+        ),
+        (
+            PostgresRoleReadinessError(status="schema_not_ready"),
+            "database_not_ready",
+            1,
+        ),
+        (
+            TelethonConfigurationError(
+                key="T2",
+                status="dependency_unavailable",
+            ),
+            "dependency_unavailable",
+            78,
+        ),
+        (
+            TelethonConformanceError(
+                key="APPROVED_SOURCE_CHATS",
+                status="access_check_failed",
+            ),
+            "access_lost",
+            1,
+        ),
+        (RuntimeError("controlled runtime failure"), "runtime_failed", 1),
+    ),
+)
+def test_guarded_cli_reports_actionable_redacted_failure_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+    reason: str,
+    exit_code: int,
+) -> None:
+    def fail() -> int:
+        raise error
+
+    monkeypatch.setattr(bootstrap_app, "_run", fail)
+
+    assert bootstrap_app._run_guarded() == exit_code
+    raw_output = capsys.readouterr().out
+    output = json.loads(raw_output)
+    assert output == {
+        "event": "t2_checkpoint_bootstrap",
+        "outcome": "blocked",
+        "reason": reason,
+    }
+    assert "controlled" not in raw_output

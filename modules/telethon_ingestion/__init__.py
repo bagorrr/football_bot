@@ -717,6 +717,18 @@ def _telethon_async_callable(target: object) -> Callable[..., Any] | None:
     return cast(Callable[..., Any], candidate)
 
 
+def _client_bound_loop(client: object) -> asyncio.AbstractEventLoop | None:
+    """Read only concrete loop state without invoking Telethon's loop property."""
+    attributes = getattr(client, "__dict__", None)
+    if not isinstance(attributes, Mapping):
+        return None
+    for name in ("_loop", "loop"):
+        candidate = attributes.get(name)
+        if isinstance(candidate, asyncio.AbstractEventLoop):
+            return candidate
+    return None
+
+
 def _transport_error(
     error: Exception,
     message: str,
@@ -3357,7 +3369,7 @@ class TelethonProvider:
                 try:
                     asyncio.get_running_loop()
                 except RuntimeError:
-                    client_loop = getattr(self._client, "loop", None)
+                    client_loop = _client_bound_loop(self._client)
                     if (
                         isinstance(client_loop, asyncio.AbstractEventLoop)
                         and client_loop.is_running()
