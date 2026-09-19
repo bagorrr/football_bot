@@ -47,6 +47,8 @@ from modules.telethon_ingestion import (
     TelethonConformance,
     TelethonConformanceError,
     TelethonIngestionAdapter,
+    TelethonLoopLifecycleError,
+    TelethonLoopOwner,
     TelethonProvider,
     TelethonRuntime,
     TelethonTransportError,
@@ -838,6 +840,68 @@ def test_provider_reuses_one_loop_across_auth_and_checkpoint_calls() -> None:
     ]
     assert observed_loops
     assert {id(loop) for loop in observed_loops} == {id(observed_loops[0])}
+
+
+def test_provider_uses_one_loop_owner_for_conformance_and_live_ingestion() -> None:
+    observed_loops: list[asyncio.AbstractEventLoop] = []
+
+    class _OwnedClient:
+        async def _observe(self) -> None:
+            observed_loops.append(asyncio.get_running_loop())
+
+        async def connect(self) -> None:
+            await self._observe()
+
+        async def is_user_authorized(self) -> bool:
+            await self._observe()
+            return True
+
+        async def get_me(self) -> object:
+            await self._observe()
+            return SimpleNamespace(id=123456)
+
+        def add_event_handler(self, _callback: object, _event: object) -> None:
+            observed_loops.append(asyncio.get_running_loop())
+
+        async def catch_up(self) -> None:
+            await self._observe()
+
+        async def run_until_disconnected(self) -> None:
+            await self._observe()
+
+    owner = TelethonLoopOwner()
+    owner.start()
+    owned_loop = owner.loop
+    provider = TelethonProvider(client=_OwnedClient(), loop_owner=owner)
+    try:
+        assert provider.authenticate() == 123456
+        provider.start_live_ingestion(lambda _identity: None)
+        live_thread = Thread(target=provider.run_live_ingestion)
+        live_thread.start()
+        live_thread.join(timeout=2)
+        assert not live_thread.is_alive()
+    finally:
+        owner.close()
+
+    assert observed_loops
+    assert {id(loop) for loop in observed_loops} == {id(owned_loop)}
+
+
+def test_provider_reports_closed_loop_owner_as_typed_redacted_failure() -> None:
+    class _Client:
+        async def connect(self) -> None:
+            raise AssertionError("closed loop must reject before client invocation")
+
+    owner = TelethonLoopOwner()
+    owner.start()
+    provider = TelethonProvider(client=_Client(), loop_owner=owner)
+    owner.close()
+
+    with pytest.raises(TelethonLoopLifecycleError) as error:
+        provider.authenticate()
+
+    assert error.value.reason is IngestionFailureReason.CHECKPOINT_UNAVAILABLE
+    assert str(error.value) == "Telegram event loop lifecycle failed"
 
 
 class _DifferenceClientProbe:

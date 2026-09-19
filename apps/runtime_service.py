@@ -40,6 +40,7 @@ class RuntimeService:
     telethon_ingestion: Any | None = None
     wake_event: Event | None = None
     bot_api_conformance: Any | None = None
+    telethon_loop_owner: Any | None = None
 
 
 _PRIMARY_CLASSIFIER_SCHEMA = "source-message-classification-v5"
@@ -134,80 +135,88 @@ def build_runtime_service(
         from modules.telethon_ingestion import (
             T2TelethonProjection,
             TelethonIngestionAdapter,
+            TelethonLoopOwner,
             TelethonRuntime,
         )
 
-        persisted_scope = store.active_source_chat_ingestion_scope()
-        bootstrap_required = store.source_chat_ingestion_bootstrap_required()
-        approved_source_chats = tuple(
-            identity for identity, _generation in persisted_scope
-        )
-        wake_event = Event()
-        telethon_values = {
-            key: values[key]
-            for key in (
-                "TELEGRAM_API_ID",
-                "TELEGRAM_API_HASH",
-                "TELEGRAM_SESSION_STRING",
-                "TELEGRAM_ADMIN_USER_ID",
-            )
-        }
-        telethon_runtime = TelethonRuntime.from_projection(
-            T2TelethonProjection.from_mapping(telethon_values)
-        )
-        source = telethon_runtime.create_production_provider(
-            approved_source_chats=approved_source_chats,
-            source_scope_generation_lookup=store.source_chat_ingestion_generation,
-        )
-        telethon_runtime.verify_conformance(
-            transport=source,
-            approved_source_chats=approved_source_chats,
-        )
-        source.refresh_source_scope(approved_source_chats)
-        if bootstrap_required:
-            seed_catalog = load_source_chat_seed_catalog(
-                repository_root / "config" / "source-chats.yaml"
-            )
-            recorded_at = clock.now()
-            resolutions = bootstrap_source_chat_catalog(
-                seed_catalog,
-                ingestion=source,
-                publisher=store,
-                telegram_user_id=int(telethon_values["TELEGRAM_ADMIN_USER_ID"]),
-                recorded_at=recorded_at,
-            )
-            if not resolutions or len(resolutions) != len(seed_catalog.seeds):
-                raise RuntimeError("T2 bootstrap scope is incomplete")
-        current_scope = store.active_source_chat_ingestion_scope()
-        if current_scope != persisted_scope:
+        telethon_loop_owner = TelethonLoopOwner()
+        try:
+            persisted_scope = store.active_source_chat_ingestion_scope()
+            bootstrap_required = store.source_chat_ingestion_bootstrap_required()
             approved_source_chats = tuple(
-                identity for identity, _generation in current_scope
+                identity for identity, _generation in persisted_scope
+            )
+            wake_event = Event()
+            telethon_values = {
+                key: values[key]
+                for key in (
+                    "TELEGRAM_API_ID",
+                    "TELEGRAM_API_HASH",
+                    "TELEGRAM_SESSION_STRING",
+                    "TELEGRAM_ADMIN_USER_ID",
+                )
+            }
+            telethon_runtime = TelethonRuntime.from_projection(
+                T2TelethonProjection.from_mapping(telethon_values),
+                loop_owner=telethon_loop_owner,
+            )
+            source = telethon_runtime.create_production_provider(
+                approved_source_chats=approved_source_chats,
+                source_scope_generation_lookup=store.source_chat_ingestion_generation,
             )
             telethon_runtime.verify_conformance(
                 transport=source,
                 approved_source_chats=approved_source_chats,
             )
             source.refresh_source_scope(approved_source_chats)
-        adapter = TelethonIngestionAdapter(
-            runtime=telethon_runtime,
-            source=source,
-            approved_source_chats=approved_source_chats,
-            live_update_callback=lambda _identity: wake_event.set(),
-        )
-        adapter.start_live_ingestion()
-        application = RuntimeApplication(
-            role=role,
-            store=store,
-            clock=clock,
-            telegram_ingestion=adapter,
-        )
-        return RuntimeService(
-            role,
-            application,
-            store,
-            telethon_ingestion=adapter,
-            wake_event=wake_event,
-        )
+            if bootstrap_required:
+                seed_catalog = load_source_chat_seed_catalog(
+                    repository_root / "config" / "source-chats.yaml"
+                )
+                recorded_at = clock.now()
+                resolutions = bootstrap_source_chat_catalog(
+                    seed_catalog,
+                    ingestion=source,
+                    publisher=store,
+                    telegram_user_id=int(telethon_values["TELEGRAM_ADMIN_USER_ID"]),
+                    recorded_at=recorded_at,
+                )
+                if not resolutions or len(resolutions) != len(seed_catalog.seeds):
+                    raise RuntimeError("T2 bootstrap scope is incomplete")
+            current_scope = store.active_source_chat_ingestion_scope()
+            if current_scope != persisted_scope:
+                approved_source_chats = tuple(
+                    identity for identity, _generation in current_scope
+                )
+                telethon_runtime.verify_conformance(
+                    transport=source,
+                    approved_source_chats=approved_source_chats,
+                )
+                source.refresh_source_scope(approved_source_chats)
+            adapter = TelethonIngestionAdapter(
+                runtime=telethon_runtime,
+                source=source,
+                approved_source_chats=approved_source_chats,
+                live_update_callback=lambda _identity: wake_event.set(),
+            )
+            adapter.start_live_ingestion()
+            application = RuntimeApplication(
+                role=role,
+                store=store,
+                clock=clock,
+                telegram_ingestion=adapter,
+            )
+            return RuntimeService(
+                role,
+                application,
+                store,
+                telethon_ingestion=adapter,
+                wake_event=wake_event,
+                telethon_loop_owner=telethon_loop_owner,
+            )
+        except Exception:
+            telethon_loop_owner.close()
+            raise
 
     if role is RuntimeRole.APPLICATION:
         from modules.application import RuntimeApplication
@@ -701,7 +710,12 @@ def main(argv: list[str] | None = None) -> int:
             reason="runtime_composition_failed",
         )
         return 78
-    return _run(service)
+    try:
+        return _run(service)
+    finally:
+        loop_owner = service.telethon_loop_owner
+        if loop_owner is not None:
+            loop_owner.close()
 
 
 if __name__ == "__main__":

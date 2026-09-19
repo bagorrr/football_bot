@@ -12,10 +12,12 @@ import asyncio
 import hashlib
 import inspect
 import re
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol, cast
+from threading import Event, Thread, current_thread
+from typing import Any, Protocol, TypeVar, cast
 
 from modules.domain import (
     IngestionFailureReason,
@@ -119,6 +121,107 @@ class TelethonTransportError(RuntimeError):
         self.reason = reason
         self.scope = scope
         super().__init__(message)
+
+
+class TelethonLoopLifecycleError(TelethonTransportError):
+    """A body-free failure while the shared Telethon loop is unavailable."""
+
+    def __init__(
+        self,
+        *,
+        scope: IngestionFailureScope = IngestionFailureScope.INGESTION_ROLE,
+    ) -> None:
+        super().__init__(
+            "Telegram event loop lifecycle failed",
+            reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+            scope=scope,
+        )
+
+
+_LoopResult = TypeVar("_LoopResult")
+_LOOP_START_TIMEOUT_SECONDS = 5.0
+
+
+class TelethonLoopOwner:
+    """Own one long-lived asyncio loop for the complete Telethon runtime."""
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._ready = Event()
+        self._thread: Thread | None = None
+        self._closed = False
+        self._failed = False
+
+    def start(self) -> None:
+        """Start the owner thread and fail closed if it cannot stay running."""
+        if self._closed or self._loop.is_closed():
+            raise TelethonLoopLifecycleError()
+        if self._thread is not None:
+            self._require_running()
+            return
+        self._thread = Thread(target=self._run, daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=_LOOP_START_TIMEOUT_SECONDS):
+            raise TelethonLoopLifecycleError()
+        self._require_running()
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop:
+        """Return the running loop owned by this runtime."""
+        self._require_running()
+        return self._loop
+
+    def submit(self, coroutine: Coroutine[Any, Any, _LoopResult]) -> _LoopResult:
+        """Run one coroutine on the owner loop and return its result."""
+        try:
+            loop = self.loop
+        except TelethonLoopLifecycleError:
+            close = getattr(coroutine, "close", None)
+            if callable(close):
+                close()
+            raise
+        try:
+            future: Future[_LoopResult] = asyncio.run_coroutine_threadsafe(
+                coroutine, loop
+            )
+        except RuntimeError:
+            close = getattr(coroutine, "close", None)
+            if callable(close):
+                close()
+            raise TelethonLoopLifecycleError() from None
+        return future.result()
+
+    def close(self) -> None:
+        """Stop and close the loop after its owner thread has exited."""
+        self._closed = True
+        if self._loop.is_closed():
+            return
+        if self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        thread = self._thread
+        if thread is not None and thread is not current_thread():
+            thread.join(timeout=_LOOP_START_TIMEOUT_SECONDS)
+        if thread is None or not thread.is_alive():
+            self._loop.close()
+
+    def _run(self) -> None:
+        try:
+            asyncio.set_event_loop(self._loop)
+            self._ready.set()
+            self._loop.run_forever()
+        except Exception:
+            self._failed = True
+            self._ready.set()
+        finally:
+            asyncio.set_event_loop(None)
+
+    def _require_running(self) -> None:
+        if self._failed or self._closed or self._loop.is_closed():
+            raise TelethonLoopLifecycleError()
+        if self._thread is None or not self._thread.is_alive():
+            raise TelethonLoopLifecycleError()
+        if not self._loop.is_running():
+            raise TelethonLoopLifecycleError()
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,9 +655,16 @@ TelethonIngestionConfiguration = TelethonConfiguration
 class TelethonRuntime:
     """Construct the provider client only after complete T2 validation."""
 
-    def __init__(self, *, configuration: TelethonConfiguration, client: object) -> None:
+    def __init__(
+        self,
+        *,
+        configuration: TelethonConfiguration,
+        client: object,
+        loop_owner: TelethonLoopOwner | None = None,
+    ) -> None:
         self.configuration = configuration
         self.client = client
+        self.loop_owner = loop_owner
         self._ready = False
         self._conformance_scope: frozenset[TelegramPeerIdentity] = frozenset()
 
@@ -564,19 +674,34 @@ class TelethonRuntime:
         projection: T2TelethonProjection,
         *,
         client_factory: Callable[[TelethonConfiguration], object] | None = None,
+        loop_owner: TelethonLoopOwner | None = None,
     ) -> TelethonRuntime:
         """Validate the projection before invoking the client factory."""
         configuration = TelethonConfiguration.from_projection(projection)
         factory = client_factory or build_telethon_client
         try:
+            if loop_owner is not None:
+                loop_owner.start()
             client = factory(configuration)
+        except TelethonLoopLifecycleError:
+            if loop_owner is not None:
+                loop_owner.close()
+            raise
         except TelethonConfigurationError:
+            if loop_owner is not None:
+                loop_owner.close()
             raise
         except Exception:
+            if loop_owner is not None:
+                loop_owner.close()
             raise TelethonConfigurationError(
                 key="T2", status="client_construction_failed"
             ) from None
-        return cls(configuration=configuration, client=client)
+        return cls(
+            configuration=configuration,
+            client=client,
+            loop_owner=loop_owner,
+        )
 
     @classmethod
     def from_mapping(
@@ -584,12 +709,14 @@ class TelethonRuntime:
         values: Mapping[str, object],
         *,
         client_factory: Callable[[TelethonConfiguration], object] | None = None,
+        loop_owner: TelethonLoopOwner | None = None,
         role: str = "ingestion",
     ) -> TelethonRuntime:
         """Build from caller-owned T2 data without reading process configuration."""
         return cls.from_projection(
             T2TelethonProjection.from_mapping(values, role=role),
             client_factory=client_factory,
+            loop_owner=loop_owner,
         )
 
     def verify_conformance(
@@ -632,6 +759,7 @@ class TelethonRuntime:
         """Create the lazy production provider for the explicit T2 client."""
         return TelethonProvider(
             client=self.client,
+            loop_owner=self.loop_owner,
             approved_source_chats=approved_source_chats,
             message_identity_lookup=message_identity_lookup,
             source_scope_generation_lookup=source_scope_generation_lookup,
@@ -789,9 +917,13 @@ class TelethonProvider:
         ]
         | None = None,
         clock: Clock | None = None,
+        loop_owner: TelethonLoopOwner | None = None,
     ) -> None:
         self._client = client
-        self._client_loop = _client_bound_loop(client)
+        self._loop_owner = loop_owner
+        self._client_loop = (
+            loop_owner.loop if loop_owner is not None else _client_bound_loop(client)
+        )
         self._entities: dict[TelegramPeerIdentity, object] = {}
         self._generations: dict[TelegramPeerIdentity, int] = {}
         self._history_pending: dict[
@@ -3381,6 +3513,15 @@ class TelethonProvider:
         if async_target is not None:
             target_callable = async_target
         try:
+            if self._loop_owner is not None:
+
+                async def invoke_on_owner() -> Any:
+                    result = target_callable(*args, **kwargs)
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+
+                return self._loop_owner.submit(invoke_on_owner())
             result = target_callable(*args, **kwargs)
             if inspect.isawaitable(result):
                 try:

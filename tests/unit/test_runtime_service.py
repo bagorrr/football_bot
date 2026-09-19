@@ -210,6 +210,7 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
     from modules.telethon_ingestion import TelethonRuntime
 
     captured: list[dict[str, object]] = []
+    captured_loop_owners: list[object] = []
     recorded_at = datetime(2026, 1, 1, tzinfo=UTC)
     active_identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 1000)
     persisted_scope = ((active_identity, 7),)
@@ -290,6 +291,10 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
 
     adapter_runtime = _RecordingRuntime()
 
+    def from_projection(_projection: object, **kwargs: object) -> _RecordingRuntime:
+        captured_loop_owners.append(kwargs["loop_owner"])
+        return adapter_runtime
+
     monkeypatch.setattr(postgres_adapter, "PostgresRoleStore", _PersistedScopeStore)
     monkeypatch.setattr(
         source_chat_bootstrap,
@@ -304,7 +309,7 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
     monkeypatch.setattr(
         TelethonRuntime,
         "from_projection",
-        staticmethod(lambda _projection: adapter_runtime),
+        staticmethod(from_projection),
     )
     monkeypatch.setattr(
         telethon_ingestion,
@@ -336,6 +341,7 @@ def test_ingestion_production_composition_uses_generation_scoped_telethon(
     assert adapter_runtime.provider_kwargs["source_scope_generation_lookup"] == (
         service.store.source_chat_ingestion_generation
     )
+    assert captured_loop_owners == [service.telethon_loop_owner]
     assert service.telethon_ingestion.started is True
 
 
@@ -398,7 +404,7 @@ def test_ingestion_restart_does_not_rebootstrap_paused_or_removed_scope(
     monkeypatch.setattr(
         TelethonRuntime,
         "from_projection",
-        staticmethod(lambda _projection: adapter_runtime),
+        staticmethod(lambda _projection, **_kwargs: adapter_runtime),
     )
     monkeypatch.setattr(telethon_ingestion, "TelethonIngestionAdapter", _Adapter)
 
@@ -489,7 +495,7 @@ def test_ingestion_bootstraps_only_after_telethon_authentication(
     monkeypatch.setattr(
         TelethonRuntime,
         "from_projection",
-        staticmethod(lambda _projection: adapter_runtime),
+        staticmethod(lambda _projection, **_kwargs: adapter_runtime),
     )
     monkeypatch.setattr(
         telethon_ingestion,
