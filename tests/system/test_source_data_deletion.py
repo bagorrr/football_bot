@@ -582,8 +582,17 @@ def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
             "modules.postgres_adapter._find_bot_completed_search_ids",
             fail_bot_scope_capture,
         )
-        assert system.process_next_contract_handoff(RuntimeRole.BOT_ASSISTANT)
-        assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+        for role in RuntimeRole:
+            assert system.process_next_contract_handoff(role)
+        while (
+            next(
+                request
+                for request in system.source_data_deletion_requests()
+                if request.request_id == retry_request_id
+            ).status.value
+            == "suppressing"
+        ):
+            assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
         assert (
             next(
                 request
