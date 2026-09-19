@@ -1,0 +1,346 @@
+;; Hand-written UML Viewer IR for Ticket #104.
+;; Project nodes and dependency edges come from Python AST import analysis.
+;; Association edges are limited to runtime and external relationships confirmed
+;; by code, deployment configuration, or the repository's architecture docs.
+{:hierarchical true
+ :title "Football Bot — Ticket #104 architecture diagnostic"
+ :prefix "football-bot"
+ :order [:apps :modules]
+ :levels [[:modules] [:apps]]
+ :classes
+ [{:id :apps
+   :name "Apps"
+   :ns "apps"
+   :stereotype nil
+   :level 5
+   :hide-members true}
+  {:id :apps.codex_bot_assistant_worker
+   :name "CodexBotAssistantWorker"
+   :ns "apps.codex_bot_assistant_worker"
+   :stereotype nil
+   :level 5
+   :hide-members true}
+  {:id :apps.runtime_health
+   :name "RuntimeHealth"
+   :ns "apps.runtime_health"
+   :stereotype nil
+   :level 5
+   :hide-members true}
+  {:id :apps.runtime_launcher
+   :name "RuntimeLauncher"
+   :ns "apps.runtime_launcher"
+   :stereotype nil
+   :level 5
+   :hide-members true}
+  {:id :apps.runtime_service
+   :name "RuntimeService"
+   :ns "apps.runtime_service"
+   :stereotype nil
+   :level 5
+   :hide-members true}
+  {:id :apps.system_acceptance
+   :name "SystemAcceptance"
+   :ns "apps.system_acceptance"
+   :stereotype nil
+   :level 5
+   :hide-members true}
+  {:id :apps.t2_checkpoint_bootstrap
+   :name "T2CheckpointBootstrap"
+   :ns "apps.t2_checkpoint_bootstrap"
+   :stereotype nil
+   :level 5
+   :hide-members true}
+  {:id :modules
+   :name "Modules"
+   :ns "modules"
+   :stereotype nil
+   :level 0
+   :hide-members true}
+  {:id :modules.application
+   :name "Application"
+   :ns "modules.application"
+   :stereotype nil
+   :level 2
+   :hide-members true}
+  {:id :modules.bot_api
+   :name "BotApi"
+   :ns "modules.bot_api"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :modules.classifier_adapter
+   :name "ClassifierAdapter"
+   :ns "modules.classifier_adapter"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :modules.classifier_configuration
+   :name "ClassifierConfiguration"
+   :ns "modules.classifier_configuration"
+   :stereotype nil
+   :level 1
+   :hide-members true}
+  {:id :modules.classifier_contract
+   :name "ClassifierContract"
+   :ns "modules.classifier_contract"
+   :stereotype nil
+   :level 0
+   :hide-members true}
+  {:id :modules.classifier_promotion
+   :name "ClassifierPromotion"
+   :ns "modules.classifier_promotion"
+   :stereotype nil
+   :level 2
+   :hide-members true}
+  {:id :modules.codex_bot_assistant_adapter
+   :name "CodexBotAssistantAdapter"
+   :ns "modules.codex_bot_assistant_adapter"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :modules.codex_classification_adapter
+   :name "CodexClassificationAdapter"
+   :ns "modules.codex_classification_adapter"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :modules.codex_semantic_adapters
+   :name "CodexSemanticAdapters"
+   :ns "modules.codex_semantic_adapters"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :modules.contracts
+   :name "Contracts"
+   :ns "modules.contracts"
+   :stereotype nil
+   :level 0
+   :hide-members true}
+  {:id :modules.domain
+   :name "Domain"
+   :ns "modules.domain"
+   :stereotype nil
+   :level 0
+   :hide-members true}
+  {:id :modules.geonames_location_resolver
+   :name "GeoNamesLocationResolver"
+   :ns "modules.geonames_location_resolver"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :modules.player_promotion_runtime
+   :name "PlayerPromotionRuntime"
+   :ns "modules.player_promotion_runtime"
+   :stereotype nil
+   :level 2
+   :hide-members true}
+  {:id :modules.ports
+   :name "Ports"
+   :ns "modules.ports"
+   :stereotype :interface
+   :level 1
+   :hide-members true}
+  {:id :modules.postgres_adapter
+   :name "PostgresAdapter"
+   :ns "modules.postgres_adapter"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :modules.proposition_graph
+   :name "PropositionGraph"
+   :ns "modules.proposition_graph"
+   :stereotype nil
+   :level 0
+   :hide-members true}
+  {:id :modules.responses_classification_adapter
+   :name "ResponsesClassificationAdapter"
+   :ns "modules.responses_classification_adapter"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :modules.source_chat_bootstrap
+   :name "SourceChatBootstrap"
+   :ns "modules.source_chat_bootstrap"
+   :stereotype nil
+   :level 1
+   :hide-members true}
+  {:id :modules.t2_checkpoint_bootstrap
+   :name "T2CheckpointBootstrap"
+   :ns "modules.t2_checkpoint_bootstrap"
+   :stereotype nil
+   :level 4
+   :hide-members true}
+  {:id :modules.t5_runtime_configuration
+   :name "T5RuntimeConfiguration"
+   :ns "modules.t5_runtime_configuration"
+   :stereotype nil
+   :level 4
+   :hide-members true}
+  {:id :modules.telethon_ingestion
+   :name "TelethonIngestion"
+   :ns "modules.telethon_ingestion"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :modules.testkit
+   :name "Testkit"
+   :ns "modules.testkit"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :modules.timezone_data_adapter
+   :name "TimezoneDataAdapter"
+   :ns "modules.timezone_data_adapter"
+   :stereotype nil
+   :level 3
+   :hide-members true}
+  {:id :external.postgresql
+   :name "PostgreSQL 16 (psycopg)"
+   :foreign true}
+  {:id :external.telegram-mtproto
+   :name "Telegram MTProto (Telethon)"
+   :foreign true}
+  {:id :external.telegram-bot-api
+   :name "Telegram Bot API"
+   :foreign true}
+  {:id :external.geonames
+   :name "GeoNames"
+   :foreign true}
+  {:id :external.locationiq
+   :name "LocationIQ / OpenStreetMap"
+   :foreign true}
+  {:id :external.codex-cli
+   :name "Codex CLI 0.144.4"
+   :foreign true}
+  {:id :external.openai-codex-sdk
+   :name "OpenAI Codex SDK"
+   :foreign true}
+  {:id :external.openai-responses-api
+   :name "OpenAI Responses API (inactive path)"
+   :foreign true}
+  {:id :external.iana-tzdata
+   :name "IANA Time Zone Data"
+   :foreign true}
+  {:id :external.systemd
+   :name "systemd"
+   :foreign true}]
+ :edges
+ [{:from :apps.codex_bot_assistant_worker :to :modules.codex_bot_assistant_adapter :kind :dependency}
+  {:from :apps.codex_bot_assistant_worker :to :modules.ports :kind :dependency}
+  {:from :apps.runtime_health :to :modules.t5_runtime_configuration :kind :dependency}
+  {:from :apps.runtime_launcher :to :modules.t5_runtime_configuration :kind :dependency}
+  {:from :apps.runtime_service :to :modules.application :kind :dependency}
+  {:from :apps.runtime_service :to :modules.bot_api :kind :dependency}
+  {:from :apps.runtime_service :to :modules.classifier_configuration :kind :dependency}
+  {:from :apps.runtime_service :to :modules.codex_bot_assistant_adapter :kind :dependency}
+  {:from :apps.runtime_service :to :modules.codex_classification_adapter :kind :dependency}
+  {:from :apps.runtime_service :to :modules.codex_semantic_adapters :kind :dependency}
+  {:from :apps.runtime_service :to :modules.contracts :kind :dependency}
+  {:from :apps.runtime_service :to :modules.domain :kind :dependency}
+  {:from :apps.runtime_service :to :modules.geonames_location_resolver :kind :dependency}
+  {:from :apps.runtime_service :to :modules.postgres_adapter :kind :dependency}
+  {:from :apps.runtime_service :to :modules.source_chat_bootstrap :kind :dependency}
+  {:from :apps.runtime_service :to :modules.t5_runtime_configuration :kind :dependency}
+  {:from :apps.runtime_service :to :modules.telethon_ingestion :kind :dependency}
+  {:from :apps.runtime_service :to :modules.timezone_data_adapter :kind :dependency}
+  {:from :apps.system_acceptance :to :modules.application :kind :dependency}
+  {:from :apps.system_acceptance :to :modules.classifier_configuration :kind :dependency}
+  {:from :apps.system_acceptance :to :modules.contracts :kind :dependency}
+  {:from :apps.system_acceptance :to :modules.ports :kind :dependency}
+  {:from :apps.system_acceptance :to :modules.postgres_adapter :kind :dependency}
+  {:from :apps.t2_checkpoint_bootstrap :to :modules.contracts :kind :dependency}
+  {:from :apps.t2_checkpoint_bootstrap :to :modules.domain :kind :dependency}
+  {:from :apps.t2_checkpoint_bootstrap :to :modules.ports :kind :dependency}
+  {:from :apps.t2_checkpoint_bootstrap :to :modules.postgres_adapter :kind :dependency}
+  {:from :apps.t2_checkpoint_bootstrap :to :modules.t2_checkpoint_bootstrap :kind :dependency}
+  {:from :apps.t2_checkpoint_bootstrap :to :modules.telethon_ingestion :kind :dependency}
+  {:from :modules.application :to :modules.classifier_configuration :kind :dependency}
+  {:from :modules.application :to :modules.classifier_contract :kind :dependency}
+  {:from :modules.application :to :modules.classifier_promotion :kind :dependency}
+  {:from :modules.application :to :modules.contracts :kind :dependency}
+  {:from :modules.application :to :modules.domain :kind :dependency}
+  {:from :modules.application :to :modules.ports :kind :dependency}
+  {:from :modules.application :to :modules.proposition_graph :kind :dependency}
+  {:from :modules.application :to :modules.source_chat_bootstrap :kind :dependency}
+  {:from :modules.bot_api :to :modules.domain :kind :dependency}
+  {:from :modules.bot_api :to :modules.ports :kind :dependency}
+  {:from :modules.classifier_adapter :to :modules.ports :kind :dependency}
+  {:from :modules.classifier_promotion :to :modules.classifier_contract :kind :dependency}
+  {:from :modules.classifier_promotion :to :modules.contracts :kind :dependency}
+  {:from :modules.classifier_promotion :to :modules.player_promotion_runtime :kind :dependency}
+  {:from :modules.codex_bot_assistant_adapter :to :modules.contracts :kind :dependency}
+  {:from :modules.codex_bot_assistant_adapter :to :modules.ports :kind :dependency}
+  {:from :modules.codex_classification_adapter :to :modules.classifier_adapter :kind :dependency}
+  {:from :modules.codex_classification_adapter :to :modules.classifier_configuration :kind :dependency}
+  {:from :modules.codex_classification_adapter :to :modules.classifier_contract :kind :dependency}
+  {:from :modules.codex_classification_adapter :to :modules.contracts :kind :dependency}
+  {:from :modules.codex_classification_adapter :to :modules.ports :kind :dependency}
+  {:from :modules.codex_semantic_adapters :to :modules.codex_bot_assistant_adapter :kind :dependency}
+  {:from :modules.codex_semantic_adapters :to :modules.contracts :kind :dependency}
+  {:from :modules.codex_semantic_adapters :to :modules.domain :kind :dependency}
+  {:from :modules.codex_semantic_adapters :to :modules.ports :kind :dependency}
+  {:from :modules.contracts :to :modules.classifier_contract :kind :dependency}
+  {:from :modules.contracts :to :modules.domain :kind :dependency}
+  {:from :modules.geonames_location_resolver :to :modules.domain :kind :dependency}
+  {:from :modules.geonames_location_resolver :to :modules.ports :kind :dependency}
+  {:from :modules.player_promotion_runtime :to :modules.classifier_contract :kind :dependency}
+  {:from :modules.player_promotion_runtime :to :modules.classifier_promotion :kind :dependency}
+  {:from :modules.player_promotion_runtime :to :modules.contracts :kind :dependency}
+  {:from :modules.player_promotion_runtime :to :modules.domain :kind :dependency}
+  {:from :modules.player_promotion_runtime :to :modules.ports :kind :dependency}
+  {:from :modules.player_promotion_runtime :to :modules.responses_classification_adapter :kind :dependency :violating true}
+  {:from :modules.player_promotion_runtime :to :modules.testkit :kind :dependency :violating true}
+  {:from :modules.ports :to :modules.classifier_contract :kind :dependency}
+  {:from :modules.ports :to :modules.contracts :kind :dependency}
+  {:from :modules.ports :to :modules.domain :kind :dependency}
+  {:from :modules.postgres_adapter :to :modules.classifier_promotion :kind :dependency}
+  {:from :modules.postgres_adapter :to :modules.contracts :kind :dependency}
+  {:from :modules.postgres_adapter :to :modules.domain :kind :dependency}
+  {:from :modules.postgres_adapter :to :modules.ports :kind :dependency}
+  {:from :modules.postgres_adapter :to :modules.source_chat_bootstrap :kind :dependency}
+  {:from :modules.responses_classification_adapter :to :modules.classifier_adapter :kind :dependency}
+  {:from :modules.responses_classification_adapter :to :modules.classifier_configuration :kind :dependency}
+  {:from :modules.responses_classification_adapter :to :modules.classifier_contract :kind :dependency}
+  {:from :modules.responses_classification_adapter :to :modules.contracts :kind :dependency}
+  {:from :modules.responses_classification_adapter :to :modules.ports :kind :dependency}
+  {:from :modules.source_chat_bootstrap :to :modules.contracts :kind :dependency}
+  {:from :modules.source_chat_bootstrap :to :modules.domain :kind :dependency}
+  {:from :modules.t2_checkpoint_bootstrap :to :modules.domain :kind :dependency}
+  {:from :modules.t2_checkpoint_bootstrap :to :modules.ports :kind :dependency}
+  {:from :modules.t2_checkpoint_bootstrap :to :modules.telethon_ingestion :kind :dependency}
+  {:from :modules.t5_runtime_configuration :to :modules.bot_api :kind :dependency}
+  {:from :modules.t5_runtime_configuration :to :modules.classifier_configuration :kind :dependency}
+  {:from :modules.t5_runtime_configuration :to :modules.codex_bot_assistant_adapter :kind :dependency}
+  {:from :modules.t5_runtime_configuration :to :modules.ports :kind :dependency}
+  {:from :modules.t5_runtime_configuration :to :modules.telethon_ingestion :kind :dependency}
+  {:from :modules.telethon_ingestion :to :modules.domain :kind :dependency}
+  {:from :modules.telethon_ingestion :to :modules.ports :kind :dependency}
+  {:from :modules.testkit :to :apps.system_acceptance :kind :dependency :violating true}
+  {:from :modules.testkit :to :modules.application :kind :dependency}
+  {:from :modules.testkit :to :modules.classifier_contract :kind :dependency}
+  {:from :modules.testkit :to :modules.classifier_promotion :kind :dependency}
+  {:from :modules.testkit :to :modules.contracts :kind :dependency}
+  {:from :modules.testkit :to :modules.domain :kind :dependency}
+  {:from :modules.testkit :to :modules.ports :kind :dependency}
+  {:from :modules.testkit :to :modules.postgres_adapter :kind :dependency}
+  {:from :modules.testkit :to :modules.telethon_ingestion :kind :dependency}
+  {:from :modules.testkit :to :modules.timezone_data_adapter :kind :dependency}
+  {:from :modules.timezone_data_adapter :to :modules.ports :kind :dependency}
+  {:from :modules.codex_bot_assistant_adapter :to :apps.codex_bot_assistant_worker :kind :association :label "spawns one-shot T3"}
+  {:from :apps.runtime_launcher :to :apps.runtime_service :kind :association :label "execs selected role"}
+  {:from :external.systemd :to :apps.runtime_launcher :kind :association :label "ExecStart (five services)"}
+  {:from :apps.runtime_health :to :external.systemd :kind :association :label "systemctl show"}
+  {:from :modules.bot_api :to :external.postgresql :kind :association :label "psycopg"}
+  {:from :modules.classifier_promotion :to :external.postgresql :kind :association :label "psycopg"}
+  {:from :modules.postgres_adapter :to :external.postgresql :kind :association :label "psycopg"}
+  {:from :modules.t2_checkpoint_bootstrap :to :external.postgresql :kind :association :label "psycopg"}
+  {:from :modules.t5_runtime_configuration :to :external.postgresql :kind :association :label "psycopg"}
+  {:from :modules.testkit :to :external.postgresql :kind :association :label "psycopg"}
+  {:from :modules.telethon_ingestion :to :external.telegram-mtproto :kind :association :label "Telethon"}
+  {:from :modules.bot_api :to :external.telegram-bot-api :kind :association :label "HTTPS"}
+  {:from :modules.geonames_location_resolver :to :external.geonames :kind :association :label "HTTP lookup"}
+  {:from :modules.geonames_location_resolver :to :external.locationiq :kind :association :label "HTTP fallback"}
+  {:from :modules.codex_classification_adapter :to :external.codex-cli :kind :association :label "subprocess"}
+  {:from :apps.codex_bot_assistant_worker :to :external.openai-codex-sdk :kind :association :label "dynamic import"}
+  {:from :modules.responses_classification_adapter :to :external.openai-responses-api :kind :association :label "inactive provider path"}
+  {:from :modules.timezone_data_adapter :to :external.iana-tzdata :kind :association :label "zoneinfo"}]}
