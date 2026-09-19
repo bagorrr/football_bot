@@ -287,6 +287,7 @@ class _GuardedConversationLanguageAdapter(ControlledConversationLanguageAdapter)
     ),
 )
 def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
+    monkeypatch: pytest.MonkeyPatch,
     locale: str,
     language_text: str | None,
     review_heading: str,
@@ -563,6 +564,43 @@ def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
             len(language_adapter.render_update_ids)
             == render_count_before_completion_submit
         )
+    if locale == "de":
+        retry_request_id = "deletion-request:retry:de"
+        _approve_and_begin_source_data_deletion(
+            system,
+            request_id=retry_request_id,
+            author_id=78_906,
+            chat_id=4_680_406,
+            administrator_id=administrator_id,
+            effective_at=clock.now(),
+        )
+
+        def fail_bot_scope_capture(*_args: object, **_kwargs: object) -> list[str]:
+            raise RuntimeError("controlled Bot owner failure")
+
+        monkeypatch.setattr(
+            "modules.postgres_adapter._find_bot_completed_search_ids",
+            fail_bot_scope_capture,
+        )
+        assert system.process_next_contract_handoff(RuntimeRole.BOT_ASSISTANT)
+        assert system.process_next_contract_handoff(RuntimeRole.APPLICATION)
+        assert (
+            next(
+                request
+                for request in system.source_data_deletion_requests()
+                if request.request_id == retry_request_id
+            ).status.value
+            == "execution_error"
+        )
+        monkeypatch.undo()
+
+        _refresh_deletion_requests(
+            system,
+            administrator_id=administrator_id,
+            prefix="retry:fixed-deletion:de",
+        )
+        assert "Erneut prüfen" in _button_labels(delivery.messages[-1])
+
     render_count_before_reset = len(language_adapter.render_update_ids)
     system.reset()
     assert len(language_adapter.render_update_ids) == render_count_before_reset
