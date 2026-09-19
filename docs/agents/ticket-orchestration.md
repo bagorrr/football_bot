@@ -299,7 +299,9 @@ supported task-creation mechanism does not provide.
 ## Terminal task callbacks
 
 Every implementation, review, and fix task follows one terminal reporting
-sequence:
+sequence. Its callback is a compact, structured wake-up envelope rather than a
+second durable record: GitHub remains authoritative, and the receiving
+coordinator reconciles the linked durable state.
 
 1. Publish its terminal status to the canonical GitHub issue or pull request.
 2. Send exactly one `codex_app__send_message_to_thread` callback to the dynamic
@@ -311,28 +313,37 @@ sequence:
 
 Implementation and fix tasks send their callback only after the required
 exact-head checks have reached a terminal outcome, or after they have published
-a durable blocked or failed outcome. A failed callback send may be retried only
-until one delivery succeeds; after one successful terminal callback, no retry
-is permitted. If callback delivery remains unavailable, the task publishes a
-durable callback-delivery failure and ends; the coordinator does not poll the
-task to infer completion.
+a durable blocked or failed outcome. A transient failed callback send may be
+retried with the same transition key only until one delivery succeeds; after
+one successful terminal callback, no retry is permitted. If callback delivery
+remains unavailable, the task publishes a durable callback-delivery failure
+and ends; the coordinator does not poll the task to infer completion.
 
-The callback must include:
+The callback must be a compact structured envelope containing, as applicable:
 
+- the current stage, task kind, terminal status, and available outcome;
 - the subordinate task identity and transition idempotency key;
-- task kind and terminal status;
 - requested and effective model and reasoning effort;
-- specification, ticket, and pull request;
-- fixed base and exact head;
-- commit list;
-- local and hosted check results;
-- mergeability;
-- total and unresolved review-thread counts;
-- separate Standards and Spec findings;
-- the durable artifact URL;
+- links to the repository, specification, ticket, pull request, and canonical
+  durable artifact;
+- every exact SHA needed for unambiguous reconciliation, including the fixed
+  base and exact head whenever both are relevant; one SHA is not a limit, and
+  unrelated SHAs must not be included;
+- the compact commit list required by this repository;
+- concise local and hosted check statuses;
+- concise mergeability status;
+- concise total and unresolved review-thread counts;
+- concise separate Standards and Spec findings or outcomes;
 - whether a new commit appeared after verification;
-- scope deviations; and
-- the exact next coordinator action.
+- scope deviations, or an explicit `none`; and
+- exactly one concrete next coordinator action.
+
+Repository-required structured fields are permitted within this common
+envelope when they remain compact, including the commit list and review-thread
+counts above. Fields already available through canonical links are represented
+by those links and concise outcomes. Do not duplicate linked specifications,
+instructions, histories, full findings, secrets, full logs, or other large
+data; never include secret values.
 
 GitHub is authoritative if a callback and durable state disagree. The
 coordinator must not accept progress callbacks, hard-coded coordinator IDs in

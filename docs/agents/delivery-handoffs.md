@@ -341,16 +341,28 @@ destination model `gpt-5.6-luna` and reasoning effort `max`, and end.
 
 Do not begin another implementation ticket in the same thread.
 
-The callback is sent only after durable GitHub status. It includes task kind
-and status, subordinate task identity, transition idempotency key,
-requested/effective model and reasoning effort, specification/ticket/PR, fixed
-base and exact head, commits, local/hosted checks, mergeability,
-total/unresolved review threads, separate axis findings, artifact URL,
-new-commit status, scope deviations, and exact next action. Do not send
+The callback is sent only after durable GitHub status. It is a compact,
+structured wake-up envelope rather than a second durable record; GitHub remains
+authoritative. It contains, as applicable, the current stage and terminal
+outcome; task kind and status; subordinate task identity and transition
+idempotency key; requested and effective model and reasoning effort; links to
+the repository, specification, ticket, pull request, and canonical durable
+artifact; every exact SHA needed for unambiguous reconciliation, including
+fixed base and exact head whenever both are relevant; the compact commit list;
+concise local and hosted check statuses, mergeability, total and unresolved
+review-thread counts, and separate Standards and Spec findings or outcomes;
+new-commit status; scope deviations or an explicit `none`; and exactly one
+concrete next action.
+
+Repository-required structured fields are permitted within this common
+envelope. Fields already available through canonical links are represented by
+links and concise outcomes. Do not duplicate linked specifications,
+instructions, histories, full findings, secrets, full logs, or other large
+data; never include secret values. One SHA is not a limit: include every exact
+SHA needed for reconciliation, but do not include unrelated SHAs. Do not send
 progress callbacks, retry a successful send, or ask the product owner to relay
-the handoff. GitHub remains authoritative. After dispatch, the coordinator
-does not monitor the task; only this terminal callback resumes the automatic
-subordinate stage.
+the handoff. After dispatch, the coordinator does not monitor the task; only
+this terminal callback resumes the automatic subordinate stage.
 
 ## Review and fix protocol
 
