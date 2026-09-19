@@ -487,6 +487,13 @@ SUPPORTED_CONTRACTS = (
         "request_id",
     ),
     ContractDefinition(
+        ContractName.SOURCE_DATA_DELETION_REMINDER,
+        2,
+        RuntimeRole.APPLICATION,
+        RuntimeRole.BOT_ASSISTANT,
+        "request_id",
+    ),
+    ContractDefinition(
         ContractName.TELEGRAM_PRESENTATION_REQUESTED,
         1,
         RuntimeRole.BOT_ASSISTANT,
@@ -724,6 +731,7 @@ class ContractEnvelope(RawContractEnvelope):
         ):
             _validate_source_data_deletion_contract(
                 self.contract_name,
+                self.contract_version,
                 self.payload,
                 message_id=self.message_id,
                 producer=self.producer,
@@ -916,6 +924,7 @@ SUB_CITY_GEOGRAPHIC_TYPES = frozenset(
         "station",
         "transport_hub",
         "landmark",
+        "street",
         "address",
     }
 )
@@ -4645,6 +4654,7 @@ def _validate_source_chat_contract(
 
 def _validate_source_data_deletion_contract(
     contract_name: ContractName,
+    contract_version: int,
     payload: dict[str, JsonValue],
     *,
     message_id: UUID,
@@ -4796,27 +4806,30 @@ def _validate_source_data_deletion_contract(
             raise ValueError("SourceDataDeletionReminder pairing is invalid")
         expected_fields = {
             "request_id",
-            "telegram_admin_user_id",
             "status",
             "reminder_at",
             "deadline_at",
             "reminder_count",
         }
+        if contract_version == 1:
+            expected_fields.add("telegram_admin_user_id")
+        elif contract_version != 2:
+            raise ValueError("SourceDataDeletionReminder version is unsupported")
         if set(payload) != expected_fields or subject_revision != payload.get(
             "reminder_count"
         ):
             raise ValueError("SourceDataDeletionReminder payload is incomplete")
-        administrator_id = payload["telegram_admin_user_id"]
         count = payload["reminder_count"]
-        if (
-            not isinstance(administrator_id, int)
-            or isinstance(administrator_id, bool)
-            or administrator_id < 1
-            or not isinstance(count, int)
-            or isinstance(count, bool)
-            or count < 1
-        ):
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise ValueError("SourceDataDeletionReminder identity is invalid")
+        if contract_version == 1:
+            administrator_id = payload["telegram_admin_user_id"]
+            if (
+                not isinstance(administrator_id, int)
+                or isinstance(administrator_id, bool)
+                or administrator_id < 1
+            ):
+                raise ValueError("SourceDataDeletionReminder identity is invalid")
         if payload["status"] not in {
             "pending_decision",
             "approved_awaiting_execution",

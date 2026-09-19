@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from threading import Barrier
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
-from psycopg import sql
+from psycopg import conninfo, sql
 
+from modules import postgres_adapter
 from modules.contracts import RuntimeRole, derive_source_event_message_id
 from modules.domain import (
     SourceEventKind,
@@ -25,6 +29,7 @@ from modules.domain import (
 from modules.ports import ClassifierAdapterResult
 from modules.postgres_adapter import (
     PostgresAcceptanceMigrator,
+    PostgresRoleStore,
     _ensure_application_proposition_identity_mapping,
     runtime_database_url,
 )
@@ -44,12 +49,77 @@ def _migration_paths() -> list[Path]:
     return sorted(migration_root.glob("*.sql"))
 
 
+@pytest.fixture
+def separate_migration_database_login(
+    fresh_database_url: str,
+) -> Iterator[tuple[str, str]]:
+    """Provision one disposable NOSUPERUSER migration login for this database."""
+    admin_database_url = os.environ["TEST_DATABASE_URL"]
+    database_name = cast(
+        str,
+        conninfo.conninfo_to_dict(fresh_database_url)["dbname"],
+    )
+    role_name = f"football_migrations_test_{uuid4().hex}"
+    password = uuid4().hex
+    role_identifier = sql.Identifier(role_name)
+
+    with psycopg.connect(admin_database_url, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL(
+                "CREATE ROLE {} LOGIN NOSUPERUSER NOINHERIT NOCREATEDB "
+                "NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD {}"
+            ).format(role_identifier, sql.Literal(password)),
+        )
+        for runtime_role in RuntimeRole:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM pg_roles WHERE rolname = %s",
+                    (runtime_role.database_role,),
+                ).fetchone()
+                is None
+            ):
+                connection.execute(
+                    sql.SQL("CREATE ROLE {} NOLOGIN").format(
+                        sql.Identifier(runtime_role.database_role),
+                    ),
+                )
+            connection.execute(
+                sql.SQL(
+                    "GRANT {} TO {} WITH SET TRUE, INHERIT FALSE, ADMIN FALSE"
+                ).format(
+                    sql.Identifier(runtime_role.database_role),
+                    role_identifier,
+                ),
+            )
+        connection.execute(
+            sql.SQL("GRANT CONNECT, CREATE ON DATABASE {} TO {}").format(
+                sql.Identifier(database_name), role_identifier
+            ),
+        )
+
+    try:
+        yield (
+            conninfo.make_conninfo(
+                fresh_database_url,
+                user=role_name,
+                password=password,
+            ),
+            role_name,
+        )
+    finally:
+        with psycopg.connect(fresh_database_url, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL("DROP OWNED BY {} CASCADE").format(role_identifier),
+            )
+        with psycopg.connect(admin_database_url, autocommit=True) as connection:
+            connection.execute(
+                sql.SQL("DROP ROLE {}").format(role_identifier),
+            )
+
+
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
-    assert [path.name for path in _migration_paths()][-17:] == [
-        "0045_source_retention_audit_role_isolation.sql",
-        "0046_result_variants.sql",
-        "0047_allow_silent_callback_ack.sql",
+    assert [path.name for path in _migration_paths()][-18:] == [
         "0048_persist_dynamic_result_callback_copy.sql",
         "0049_result_conversation.sql",
         "0050_bot_assistant_execution.sql",
@@ -64,6 +134,10 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0059_telethon_history_progress.sql",
         "0060_telethon_ingestion_scope_lookup.sql",
         "0061_telethon_event_identity_and_progress_retention.sql",
+        "0062_telethon_active_ingestion_scope.sql",
+        "0063_semantic_origin_update_id.sql",
+        "0064_runtime_readiness_and_ingestion_bootstrap.sql",
+        "0065_source_chat_ingestion_read_policy.sql",
     ]
 
 
@@ -672,6 +746,344 @@ def _assert_final_migration_state(database_url: str) -> None:
             "sequence_id",
         ),
     ]
+
+
+def test_migrator_uses_a_nonsuperuser_login_and_allows_only_its_intended_memberships(
+    fresh_database_url: str,
+    separate_migration_database_login: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration_database_url, migration_role = separate_migration_database_login
+    with psycopg.connect(fresh_database_url, autocommit=True) as connection:
+        connection.execute(
+            sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(
+                sql.Identifier(migration_role),
+                sql.Identifier(migration_role),
+            ),
+        )
+        connection.execute(
+            sql.SQL(
+                "ALTER ROLE {} SET search_path = {}, football_migrations, public"
+            ).format(
+                sql.Identifier(migration_role),
+                sql.Identifier(migration_role),
+            ),
+        )
+    with psycopg.connect(migration_database_url) as connection:
+        caller_search_path_row = connection.execute(
+            "SHOW search_path",
+        ).fetchone()
+    assert caller_search_path_row is not None
+    caller_search_path = caller_search_path_row[0]
+    migrator = PostgresAcceptanceMigrator(
+        fresh_database_url,
+        migration_database_url=migration_database_url,
+    )
+
+    first_boundary_observations: list[tuple[int, str | None, str, str, str]] = []
+    original_assert_material_schema = postgres_adapter._assert_material_schema
+
+    def assert_material_schema_at_boundary(
+        connection: psycopg.Connection[Any],
+        applied_count: int,
+        *,
+        migration_owner: str | None = None,
+    ) -> None:
+        if applied_count == 1:
+            before_search_path_row = connection.execute(
+                "SHOW search_path",
+            ).fetchone()
+            assert before_search_path_row is not None
+            before_search_path = before_search_path_row[0]
+            boundary_fingerprint = postgres_adapter._material_schema_fingerprint(
+                connection,
+                migration_owner=migration_owner,
+            )
+            after_search_path_row = connection.execute(
+                "SHOW search_path",
+            ).fetchone()
+            assert after_search_path_row is not None
+            after_search_path = after_search_path_row[0]
+            first_boundary_observations.append(
+                (
+                    applied_count,
+                    migration_owner,
+                    before_search_path,
+                    after_search_path,
+                    boundary_fingerprint,
+                ),
+            )
+            assert connection.execute(
+                """
+                SELECT current_user,
+                       (
+                           SELECT owner.rolname
+                           FROM pg_namespace AS namespace
+                           JOIN pg_roles AS owner ON owner.oid = namespace.nspowner
+                           WHERE namespace.nspname = 'football_runtime'
+                       )
+                """
+            ).fetchone() == (migration_role, migration_role)
+        original_assert_material_schema(
+            connection,
+            applied_count,
+            migration_owner=migration_owner,
+        )
+
+    monkeypatch.setattr(
+        postgres_adapter,
+        "_assert_material_schema",
+        assert_material_schema_at_boundary,
+    )
+
+    migrator.migrate()
+    assert len(first_boundary_observations) == 1
+    (
+        first_boundary_count,
+        first_boundary_owner,
+        before_search_path,
+        after_search_path,
+        first_boundary_fingerprint,
+    ) = first_boundary_observations[0]
+    assert first_boundary_count == 1
+    assert first_boundary_owner == migration_role
+    assert before_search_path == "public"
+    assert after_search_path == before_search_path
+    assert (
+        first_boundary_fingerprint
+        == (postgres_adapter._MATERIAL_SCHEMA_FINGERPRINTS[0])
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        completed_migration_count_row = connection.execute(
+            "SELECT count(*) FROM football_migrations.applied_migrations",
+        ).fetchone()
+        assert completed_migration_count_row is not None
+        completed_migration_count = completed_migration_count_row[0]
+        uuid_extension_schema = connection.execute(
+            """
+            SELECT namespace.nspname
+            FROM pg_extension AS extension
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = extension.extnamespace
+            WHERE extension.extname = 'uuid-ossp'
+            """,
+        ).fetchone()
+        uuid_function_rows = connection.execute(
+            """
+            SELECT namespace.nspname, procedure.proname
+            FROM pg_proc AS procedure
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = procedure.pronamespace
+            JOIN pg_depend AS dependency
+              ON dependency.classid = 'pg_proc'::regclass
+             AND dependency.objid = procedure.oid
+             AND dependency.deptype = 'e'
+            JOIN pg_extension AS extension
+              ON extension.oid = dependency.refobjid
+            WHERE extension.extname = 'uuid-ossp'
+            ORDER BY namespace.nspname, procedure.proname
+            """,
+        ).fetchall()
+    assert completed_migration_count == len(_migration_paths())
+    assert uuid_extension_schema == ("public",)
+    assert {schema_name for schema_name, _ in uuid_function_rows} == {"public"}
+    assert {function_name for _, function_name in uuid_function_rows} == {
+        "uuid_generate_v1",
+        "uuid_generate_v1mc",
+        "uuid_generate_v3",
+        "uuid_generate_v4",
+        "uuid_generate_v5",
+        "uuid_nil",
+        "uuid_ns_dns",
+        "uuid_ns_oid",
+        "uuid_ns_url",
+        "uuid_ns_x500",
+    }
+    with psycopg.connect(migration_database_url) as connection:
+        restored_search_path_row = connection.execute(
+            "SHOW search_path",
+        ).fetchone()
+    assert restored_search_path_row == (caller_search_path,)
+    with psycopg.connect(migration_database_url) as connection:
+        identity = connection.execute(
+            """
+            SELECT rolcanlogin, rolsuper, rolinherit, rolcreaterole,
+                   rolcreatedb, rolreplication, rolbypassrls
+            FROM pg_roles
+            WHERE rolname = current_user
+            """,
+        ).fetchone()
+        memberships = connection.execute(
+            """
+            SELECT granted_role.rolname, membership.admin_option,
+                   membership.inherit_option, membership.set_option
+            FROM pg_auth_members AS membership
+            JOIN pg_roles AS member ON member.oid = membership.member
+            JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+            WHERE member.rolname = current_user
+            ORDER BY granted_role.rolname
+            """,
+        ).fetchall()
+        database_privileges = connection.execute(
+            """
+            SELECT has_database_privilege(current_user, current_database(), 'CONNECT'),
+                   has_database_privilege(current_user, current_database(), 'CREATE'),
+                   NOT EXISTS (
+                       SELECT 1
+                       FROM pg_database AS database_row
+                       CROSS JOIN LATERAL aclexplode(database_row.datacl) AS acl
+                       WHERE database_row.datname = current_database()
+                         AND acl.grantee = (
+                             SELECT oid
+                             FROM pg_roles
+                             WHERE rolname = current_user
+                         )
+                         AND acl.privilege_type = 'TEMPORARY'
+                   )
+            """,
+        ).fetchone()
+
+    assert identity == (True, False, False, False, False, False, False)
+    assert memberships == [
+        (role.database_role, False, False, True)
+        for role in sorted(RuntimeRole, key=lambda role: role.database_role)
+    ]
+    assert database_privileges == (True, True, True)
+
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            sql.SQL("GRANT pg_monitor TO {}").format(
+                sql.Identifier(migration_role),
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="material schema drift"):
+        migrator.migrate()
+
+    with psycopg.connect(fresh_database_url) as connection:
+        connection.execute(
+            sql.SQL("REVOKE pg_monitor FROM {}").format(
+                sql.Identifier(migration_role),
+            ),
+        )
+
+    migrator.migrate()
+
+
+def test_ingestion_source_chat_projections_are_read_only_under_force_rls(
+    fresh_database_url: str,
+    separate_migration_database_login: tuple[str, str],
+) -> None:
+    """Ingestion projections see only active rows through the definer boundary."""
+    migration_database_url, _migration_role = separate_migration_database_login
+    migrator = PostgresAcceptanceMigrator(
+        fresh_database_url,
+        migration_database_url=migration_database_url,
+    )
+    migrator.migrate()
+    passwords = {role: "source-chat-ingestion-read-test" for role in RuntimeRole}
+    migrator.provision_runtime_credentials(passwords)
+    recorded_at = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+    source_rows = (
+        ("channel", 4101, 1, False, recorded_at + timedelta(minutes=1)),
+        ("channel", 4101, 2, True, None),
+        ("chat", 4202, 1, True, None),
+        ("channel", 4303, 1, True, None),
+        ("channel", 4404, 1, True, None),
+        ("channel", 4505, 1, False, None),
+    )
+    with psycopg.connect(fresh_database_url) as connection:
+        for peer_kind, telegram_chat_id, generation, enabled, removed_at in source_rows:
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_chat_registry (
+                    peer_kind, telegram_chat_id, registry_generation,
+                    address_kind, current_address, processing_started_at,
+                    transport_boundary, enabled, initial_consent_attestation,
+                    attested_at, created_at, updated_at, permanently_removed_at
+                ) VALUES (%s, %s, %s, 'public_username', %s, %s, %s, %s,
+                           'confirmed', %s, %s, %s, %s)
+                """,
+                (
+                    peer_kind,
+                    telegram_chat_id,
+                    generation,
+                    f"@scope_{telegram_chat_id}_{generation}",
+                    recorded_at,
+                    f"{peer_kind}-pts:{telegram_chat_id}",
+                    enabled,
+                    recorded_at,
+                    recorded_at,
+                    recorded_at,
+                    removed_at,
+                ),
+            )
+
+    ingestion_url = runtime_database_url(
+        fresh_database_url,
+        RuntimeRole.INGESTION,
+        passwords[RuntimeRole.INGESTION],
+    )
+    with psycopg.connect(ingestion_url, autocommit=True) as connection:
+        assert connection.execute(
+            """
+            SELECT has_table_privilege(
+                       current_user,
+                       'football_runtime.source_chat_registry',
+                       'SELECT'
+                   ),
+                   has_table_privilege(
+                       current_user,
+                       'football_runtime.source_chat_registry',
+                       'INSERT,UPDATE,DELETE'
+                   ),
+                   has_function_privilege(
+                       'football_application',
+                       'football_runtime.read_active_source_chat_ingestion_scope()',
+                       'EXECUTE'
+                   )
+            """
+        ).fetchone() == (False, False, False)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                "SELECT peer_kind FROM football_runtime.source_chat_registry"
+            ).fetchall()
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                """
+                INSERT INTO football_runtime.source_chat_registry (
+                    peer_kind, telegram_chat_id, registry_generation,
+                    address_kind, current_address, processing_started_at,
+                    transport_boundary, enabled, initial_consent_attestation,
+                    attested_at, created_at, updated_at
+                ) VALUES (
+                    'channel', 4999, 1, 'public_username', '@write_denied',
+                    %s, 'channel-pts:4999', true, 'confirmed', %s, %s, %s
+                )
+                """,
+                (recorded_at, recorded_at, recorded_at, recorded_at),
+            )
+
+    ingestion_store = PostgresRoleStore(RuntimeRole.INGESTION, ingestion_url)
+    assert ingestion_store.source_chat_ingestion_bootstrap_required() is False
+    assert ingestion_store.active_source_chat_ingestion_scope() == (
+        (TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4101), 2),
+        (TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4303), 1),
+        (TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4404), 1),
+        (TelegramPeerIdentity(TelegramPeerKind.CHAT, 4202), 1),
+    )
+    assert (
+        ingestion_store.source_chat_ingestion_generation(
+            TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4101)
+        )
+        == 2
+    )
+    assert (
+        ingestion_store.source_chat_ingestion_generation(
+            TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4505)
+        )
+        is None
+    )
 
 
 def test_bot_assistant_can_read_only_the_current_tournament_projection(

@@ -804,6 +804,36 @@ def test_long_polling_requires_the_configured_private_administrator_destination(
     assert transport.poll_offsets == []
 
 
+def test_readiness_checks_identity_and_admin_chat_without_poll_or_send() -> None:
+    transport = ControlledBotApiTransport()
+    runtime = BotApiRuntime.from_mapping(
+        {
+            "TELEGRAM_BOT_TOKEN": "123456:fake-token",
+            "TELEGRAM_ADMIN_USER_ID": "456789",
+        },
+        transport_factory=lambda _configuration: transport,
+    )
+    ingress = BotApiIngress(
+        configuration=runtime.configuration,
+        transport=transport,
+        store=InMemoryBotApiContinuityStore(),
+        consumer=lambda _update: None,
+        delivery=BotApiDeliveryAdapter(transport, retry_sleep=lambda _seconds: None),
+        clock=_FixedClock(),
+    )
+
+    identity = ingress.verify_readiness()
+
+    assert identity == transport.identity
+    assert [name for name, _ in transport.calls] == [
+        "getMe",
+        "getWebhookInfo",
+        "getChat",
+    ]
+    assert transport.poll_offsets == []
+    assert transport.sent_messages == []
+
+
 def test_delivery_retries_rate_limit_and_proven_pre_effect_failure() -> None:
     transport = ControlledBotApiTransport(
         rate_limits_remaining=1,
@@ -875,7 +905,7 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
         request_data = request.data
         request_url = request.full_url
         payload = json.loads(request_data.decode("utf-8"))
-        requests.append((request_url.rsplit("/", 1)[-1], payload))
+        requests.append((request_url, payload))
         return _Response(responses.pop(0))
 
     reconciliation = InMemoryBotApiDeliveryReconciliation()
@@ -887,39 +917,45 @@ def test_http_transport_uses_get_updates_and_never_exposes_token_on_write_failur
         transport_factory=lambda configuration: BotApiHttpTransport(
             configuration,
             reconciliation=reconciliation,
-            api_root="https://example.invalid/bot",
+            api_root="https://example.invalid/bot/",
             opener=opener,
         ),
     ).configuration
-    ambiguous_methods: list[str] = []
+    ambiguous_urls: list[str] = []
 
     def unavailable_opener(request: object, **_kwargs: object) -> object:
         assert hasattr(request, "full_url")
-        ambiguous_methods.append(request.full_url.rsplit("/", 1)[-1])
+        ambiguous_urls.append(request.full_url)
         raise URLError("network unavailable")
 
     transport = BotApiHttpTransport(
         configuration,
         reconciliation=reconciliation,
-        api_root="https://example.invalid/bot",
+        api_root="https://example.invalid/bot/",
         opener=unavailable_opener,
     )
 
     poll = BotApiHttpTransport(
         configuration,
         reconciliation=reconciliation,
-        api_root="https://example.invalid/bot",
         opener=opener,
     ).get_updates(offset=40, timeout_seconds=30)
 
     assert poll.updates[0].update_id == 41
     assert poll.oldest_available_update_id is None
-    assert requests == [("getUpdates", {"offset": 40, "timeout": 30})]
+    assert requests == [
+        (
+            "https://api.telegram.org/bot123456:secret-token/getUpdates",
+            {"offset": 40, "timeout": 30},
+        )
+    ]
     with pytest.raises(BotApiOutcomeUnknownError) as error:
         transport.send_message(_message("http-ambiguous"))
     assert "secret-token" not in str(error.value)
     assert transport.reconcile_message(_message("http-ambiguous")) is None
-    assert ambiguous_methods == ["sendMessage"]
+    assert ambiguous_urls == [
+        "https://example.invalid/bot123456:secret-token/sendMessage"
+    ]
 
 
 def test_http_transport_reconciles_send_and_edit_by_delivery_id() -> None:

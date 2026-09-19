@@ -62,15 +62,19 @@ class _FreeTextFallbackLanguageAdapter(ControlledConversationLanguageAdapter):
         assert selection is not None
         return replace(selection, locale="tr", result_navigation_copy=None)
 
-    def interpret(self, text: str) -> LanguageSelection | None:
+    def interpret(
+        self, text: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
         if text.strip().casefold() == "türkçe".casefold():
             return self._turkish_selection()
-        return super().interpret(text)
+        return super().interpret(text, update_id=update_id)
 
-    def render(self, locale: str) -> LanguageSelection | None:
+    def render(
+        self, locale: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
         if locale == "tr":
             return self._turkish_selection()
-        return super().render(locale)
+        return super().render(locale, update_id=update_id)
 
 
 class _FailingResultLanguageAdapter(ControlledConversationLanguageAdapter):
@@ -82,12 +86,14 @@ class _FailingResultLanguageAdapter(ControlledConversationLanguageAdapter):
     def fail_next_render(self) -> None:
         self._fail_next_render = True
 
-    def render(self, locale: str) -> LanguageSelection | None:
+    def render(
+        self, locale: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
         self._events.append("render")
         if self._fail_next_render:
             self._fail_next_render = False
             raise RuntimeError("controlled result rendering failed")
-        return super().render(locale)
+        return super().render(locale, update_id=update_id)
 
 
 class _OrderedCallbackTelegramDeliveryAdapter(ControlledTelegramDeliveryAdapter):
