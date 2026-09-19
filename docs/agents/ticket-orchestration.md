@@ -313,15 +313,17 @@ coordinator reconciles the linked durable state.
 
 Implementation and fix tasks send their callback only after the required
 exact-head checks have reached a terminal outcome, or after they have published
-a durable blocked or failed outcome. A transient failed callback send may be
-retried with the same transition key only until one delivery succeeds; after
-one successful terminal callback, no retry is permitted. If callback delivery
-remains unavailable, the task publishes a durable callback-delivery failure
-and ends; the coordinator does not poll the task to infer completion.
+a durable blocked or failed outcome. A transient failed callback delivery may
+be retried with the same transition key only; every retry MUST remain one
+delivery attempt for the same logical callback and MUST NOT create a second
+logical callback. After one successful terminal callback, no retry is
+permitted. If callback delivery remains unavailable, the task publishes a
+durable callback-delivery failure and ends; the coordinator does not poll the
+task to infer completion.
 
-The callback must be a compact structured envelope containing, as applicable:
+The callback must be a compact structured envelope containing:
 
-- the current stage, task kind, terminal status, and available outcome;
+- the current stage, task kind, terminal status, and outcome;
 - the subordinate task identity and transition idempotency key;
 - requested and effective model and reasoning effort;
 - links to the repository, specification, ticket, pull request, and canonical
@@ -338,10 +340,12 @@ The callback must be a compact structured envelope containing, as applicable:
 - scope deviations, or an explicit `none`; and
 - exactly one concrete next coordinator action.
 
-Repository-required structured fields are permitted within this common
-envelope when they remain compact, including the commit list and review-thread
-counts above. Fields already available through canonical links are represented
-by those links and concise outcomes. Do not duplicate linked specifications,
+Repository-required structured fields are mandatory within this common
+envelope, including the commit list and review-thread counts above; keep them
+compact. Before sending, verify that the receiving coordinator can access the
+canonical linked context. Fields already available through those links are
+represented by the links and concise outcomes; include directly only essential
+context unavailable through them. Do not duplicate linked specifications,
 instructions, histories, full findings, secrets, full logs, or other large
 data; never include secret values.
 
