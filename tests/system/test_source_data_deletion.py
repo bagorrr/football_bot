@@ -459,10 +459,10 @@ def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
     if locale == "de":
         assert _button_labels(deletion) == (
             "Anfrage hinzufügen",
-            "Genehmigen",
-            "Ablehnen",
             "Ziel prüfen",
             "Antragsteller benachrichtigt",
+            "Genehmigen",
+            "Ablehnen",
             "Zurück",
         )
     render_count_before_review = len(language_adapter.render_update_ids)
