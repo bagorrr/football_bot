@@ -440,6 +440,20 @@ class TelethonConformance:
         identities = _approved_identities(self._approved_source_chats)
         try:
             authenticated_user_id = self._transport.authenticate()
+        except TelethonTransportError as error:
+            status = (
+                "authentication_failed"
+                if error.reason
+                in {
+                    IngestionFailureReason.ACCESS_LOST,
+                    IngestionFailureReason.SESSION_REVOKED,
+                    IngestionFailureReason.AUTHENTICATION_LOST,
+                }
+                else "runtime_failed"
+            )
+            raise TelethonConformanceError(
+                key="TELEGRAM_SESSION_STRING", status=status
+            ) from None
         except Exception:
             raise TelethonConformanceError(
                 key="TELEGRAM_SESSION_STRING", status="authentication_failed"
@@ -697,6 +711,8 @@ def _telethon_failure_reason(error: Exception) -> IngestionFailureReason:
         token in name for token in ("private", "access", "forbidden", "adminrequired")
     ):
         return IngestionFailureReason.ACCESS_LOST
+    if isinstance(error, RuntimeError):
+        return IngestionFailureReason.CHECKPOINT_UNAVAILABLE
     return IngestionFailureReason.ACCESS_LOST
 
 
@@ -775,6 +791,7 @@ class TelethonProvider:
         clock: Clock | None = None,
     ) -> None:
         self._client = client
+        self._client_loop = _client_bound_loop(client)
         self._entities: dict[TelegramPeerIdentity, object] = {}
         self._generations: dict[TelegramPeerIdentity, int] = {}
         self._history_pending: dict[
@@ -3369,7 +3386,14 @@ class TelethonProvider:
                 try:
                     asyncio.get_running_loop()
                 except RuntimeError:
-                    client_loop = _client_bound_loop(self._client)
+                    client_loop = self._client_loop
+                    if client_loop is None:
+                        client_loop = asyncio.new_event_loop()
+                        self._client_loop = client_loop
+                    if client_loop.is_closed():
+                        raise RuntimeError(
+                            "Telethon client event loop is closed"
+                        ) from None
                     if (
                         isinstance(client_loop, asyncio.AbstractEventLoop)
                         and client_loop.is_running()

@@ -764,6 +764,82 @@ def test_provider_schedules_async_transport_calls_on_its_running_client_loop() -
         loop.close()
 
 
+def test_provider_reuses_one_loop_across_auth_and_checkpoint_calls() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    observed_loops: list[asyncio.AbstractEventLoop] = []
+
+    class _SequentialClient:
+        def __init__(self) -> None:
+            self.bound_loop: asyncio.AbstractEventLoop | None = None
+            self.calls: list[str] = []
+
+        async def _observe(self, name: str) -> None:
+            loop = asyncio.get_running_loop()
+            if self.bound_loop is None:
+                self.bound_loop = loop
+            elif loop is not self.bound_loop:
+                raise RuntimeError("Telethon client loop changed")
+            observed_loops.append(loop)
+            self.calls.append(name)
+
+        async def connect(self) -> None:
+            await self._observe("connect")
+
+        async def is_user_authorized(self) -> bool:
+            await self._observe("is_user_authorized")
+            return True
+
+        async def get_me(self) -> object:
+            await self._observe("get_me")
+            return SimpleNamespace(id=123456)
+
+        async def get_entity(self, _entity: object) -> object:
+            await self._observe("get_entity")
+            return _channel_entity()
+
+        async def __call__(self, request: object) -> object:
+            if isinstance(request, functions.updates.GetStateRequest):
+                await self._observe("get_state")
+                return SimpleNamespace(
+                    pts=101,
+                    qts=202,
+                    seq=303,
+                    date=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+                )
+            if isinstance(request, functions.channels.GetFullChannelRequest):
+                await self._observe("get_full_channel")
+                return SimpleNamespace(full_chat=SimpleNamespace(pts=404))
+            raise AssertionError(type(request).__name__)
+
+    client = _SequentialClient()
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+    try:
+        assert provider.authenticate() == 123456
+        assert provider.capture_account_checkpoint() == TelegramAccountCheckpoint(
+            pts=101,
+            qts=202,
+            seq=303,
+            date=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+        )
+        assert provider.capture_channel_checkpoint(identity) == (
+            TelegramChannelCheckpoint(pts=404)
+        )
+    finally:
+        if client.bound_loop is not None and not client.bound_loop.is_closed():
+            client.bound_loop.close()
+
+    assert client.calls == [
+        "connect",
+        "is_user_authorized",
+        "get_me",
+        "get_state",
+        "get_entity",
+        "get_full_channel",
+    ]
+    assert observed_loops
+    assert {id(loop) for loop in observed_loops} == {id(observed_loops[0])}
+
+
 class _DifferenceClientProbe:
     def __init__(
         self,

@@ -148,6 +148,8 @@ def _run_guarded() -> int:
             reason = IngestionFailureReason.AUTHENTICATION_LOST.value
         elif error.status in {"access_check_failed", "inaccessible"}:
             reason = IngestionFailureReason.ACCESS_LOST.value
+        elif error.status == "runtime_failed":
+            reason = T2CheckpointFailureReason.RUNTIME_FAILED.value
         else:
             reason = T2CheckpointFailureReason.CONFORMANCE_FAILED.value
         _emit(outcome="blocked", reason=reason)
