@@ -388,6 +388,7 @@ def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
     if locale == "de":
         assert len(language_adapter.render_update_ids) > render_count_before_deletion
         assert deletion.text.startswith("🗑️ **Löschanfragen für Source Data**")
+        assert _button_labels(deletion) == ("Anfrage hinzufügen", "Zurück")
     else:
         assert len(language_adapter.render_update_ids) == render_count_before_deletion
 
@@ -455,6 +456,15 @@ def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
     )
 
     deletion = delivery.messages[-1]
+    if locale == "de":
+        assert _button_labels(deletion) == (
+            "Anfrage hinzufügen",
+            "Genehmigen",
+            "Ablehnen",
+            "Ziel prüfen",
+            "Antragsteller benachrichtigt",
+            "Zurück",
+        )
     render_count_before_review = len(language_adapter.render_update_ids)
     system.select_source_data_deletion_action(
         update_id=f"review:fixed-deletion:{locale}",
@@ -475,6 +485,8 @@ def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
         f"status={approved.status.value}\n\n"
         f"{review_explanation}"
     )
+    if locale == "de":
+        assert _button_labels(review) == ("Start bestätigen", "Zurück")
 
     assert system.begin_source_data_deletion_request(
         request_id=approved.request_id,
@@ -527,6 +539,16 @@ def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
         ).status.value
         == "completed"
     )
+    if locale == "de":
+        assert _button_labels(delivery.messages[-1]) == (
+            "Anfrage hinzufügen",
+            "Genehmigen",
+            "Ablehnen",
+            "Antragsteller benachrichtigt",
+            "Abschließen",
+            "Keine Daten gefunden",
+            "Zurück",
+        )
     if locale == "de":
         assert (
             len(language_adapter.render_update_ids)
@@ -2055,6 +2077,10 @@ def _callback(message: TelegramMessage, prefix: str) -> str:
             if callback.startswith(prefix):
                 return callback
     raise AssertionError(f"missing callback {prefix!r}")
+
+
+def _button_labels(message: TelegramMessage) -> tuple[str, ...]:
+    return tuple(label for row in message.button_rows for label, _callback_data in row)
 
 
 def _ingest_source_event(

@@ -2524,6 +2524,17 @@ class ControlledConversationLanguageAdapter:
                 "Die Ansicht enthält keine Nachrichtentexte."
             ),
             source_data_deletion_labels=("Zurück", "Menü"),
+            source_data_deletion_action_labels=(
+                "Anfrage hinzufügen",
+                "Genehmigen",
+                "Ablehnen",
+                "Ziel prüfen",
+                "Erneut prüfen",
+                "Antragsteller benachrichtigt",
+                "Abschließen",
+                "Keine Daten gefunden",
+                "Start bestätigen",
+            ),
             source_data_deletion_review_text=(
                 "🛡️ **Ziel der Löschung von Source Data prüfen**\n\n"
                 "request={request}\n"

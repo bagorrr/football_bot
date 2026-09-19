@@ -54,6 +54,7 @@ _LANGUAGE_SEQUENCE_LENGTHS = {
     "zero_result": 3,
     "administration_labels": 4,
     "source_data_deletion_labels": 2,
+    "source_data_deletion_action_labels": 9,
     "source_data_deletion_input_texts": 3,
     "source_data_audit_labels": 2,
     "source_chats_labels": 3,
@@ -114,6 +115,17 @@ _LANGUAGE_SELECTION_SOURCE: dict[str, JsonValue] = {
     "source_data_deletion_label": "Source Data Deletion Requests",
     "source_data_deletion_text": "**Source Data Deletion Requests**",
     "source_data_deletion_labels": ["Back", "Menu"],
+    "source_data_deletion_action_labels": [
+        "Add Request",
+        "Approve",
+        "Reject",
+        "Review Target",
+        "Review Retry",
+        "Requester Notified",
+        "Complete",
+        "Data Not Found",
+        "Confirm Start",
+    ],
     "source_data_deletion_review_text": (
         "🛡️ **Review Source Data Deletion target**\n\n"
         "request={request}\n"

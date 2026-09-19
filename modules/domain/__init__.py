@@ -4191,6 +4191,9 @@ class LanguageSelection:
     source_data_deletion_label: str | None = None
     source_data_deletion_text: str | None = None
     source_data_deletion_labels: tuple[str, str] | None = None
+    source_data_deletion_action_labels: (
+        tuple[str, str, str, str, str, str, str, str, str] | None
+    ) = None
     source_data_deletion_review_text: str | None = None
     source_data_deletion_input_texts: tuple[str, str, str] | None = None
     source_data_audit_text: str | None = None

@@ -2062,6 +2062,40 @@ _SOURCE_DATA_DELETION_ACTION_COPY = {
     },
 }
 
+_SOURCE_DATA_DELETION_ACTION_KEYS = (
+    "add",
+    "approve",
+    "reject",
+    "review",
+    "retry",
+    "notify",
+    "complete",
+    "data_not_found",
+    "confirm_start",
+)
+
+
+def _source_data_deletion_actions(
+    *, locale: str, selection: LanguageSelection | None
+) -> dict[str, str]:
+    """Return static or validated dynamic Source Data Deletion actions."""
+    if locale in SUPPORTED_LOCALES:
+        return _SOURCE_DATA_DELETION_ACTION_COPY[locale]
+    if (
+        selection is not None
+        and selection.locale == locale
+        and selection.source_data_deletion_action_labels is not None
+    ):
+        return dict(
+            zip(
+                _SOURCE_DATA_DELETION_ACTION_KEYS,
+                selection.source_data_deletion_action_labels,
+                strict=True,
+            )
+        )
+    raise RuntimeError("Conversation Language has no Source Data Deletion actions")
+
+
 _SOURCE_DATA_AUDIT_COPY = {
     "en": (
         "🧾 **Source Data Audit**\n\nBody-free retention events kept for 90 days.",
@@ -16562,9 +16596,7 @@ def _source_data_deletion_message(
         }
     else:
         deletion_copy = _SOURCE_DATA_DELETION_COPY["en"]
-    actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
-        locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
-    )
+    actions = _source_data_deletion_actions(locale=locale, selection=selection)
     lines = [deletion_copy["heading"]]
     button_rows: list[tuple[tuple[str, str], ...]] = [
         ((actions["add"], f"sdd:intake:{screen_revision}"),),
@@ -16673,9 +16705,7 @@ def _source_data_deletion_review_message(
         back = deletion_copy["back"]
         menu = deletion_copy["menu"]
         text_template = deletion_copy["review"]
-    actions = _SOURCE_DATA_DELETION_ACTION_COPY.get(
-        locale, _SOURCE_DATA_DELETION_ACTION_COPY["en"]
-    )
+    actions = _source_data_deletion_actions(locale=locale, selection=selection)
     token = _source_data_deletion_callback_token(request.request_id)
     text = text_template.format(
         request=request.request_id,
