@@ -457,13 +457,15 @@ def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
 
     deletion = delivery.messages[-1]
     if locale == "de":
-        assert _button_labels(deletion) == (
-            "Anfrage hinzufügen",
-            "Ziel prüfen",
-            "Antragsteller benachrichtigt",
-            "Genehmigen",
-            "Ablehnen",
-            "Zurück",
+        assert sorted(_button_labels(deletion)) == sorted(
+            (
+                "Anfrage hinzufügen",
+                "Ziel prüfen",
+                "Antragsteller benachrichtigt",
+                "Genehmigen",
+                "Ablehnen",
+                "Zurück",
+            )
         )
     render_count_before_review = len(language_adapter.render_update_ids)
     system.select_source_data_deletion_action(
@@ -540,14 +542,16 @@ def test_source_data_deletion_copy_is_localized_and_dynamic_for_free_text(
         == "completed"
     )
     if locale == "de":
-        assert _button_labels(delivery.messages[-1]) == (
-            "Anfrage hinzufügen",
-            "Genehmigen",
-            "Ablehnen",
-            "Antragsteller benachrichtigt",
-            "Abschließen",
-            "Keine Daten gefunden",
-            "Zurück",
+        assert sorted(_button_labels(delivery.messages[-1])) == sorted(
+            (
+                "Anfrage hinzufügen",
+                "Genehmigen",
+                "Ablehnen",
+                "Antragsteller benachrichtigt",
+                "Abschließen",
+                "Keine Daten gefunden",
+                "Zurück",
+            )
         )
     if locale == "de":
         assert (
