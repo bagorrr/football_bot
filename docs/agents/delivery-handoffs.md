@@ -341,16 +341,41 @@ destination model `gpt-5.6-luna` and reasoning effort `max`, and end.
 
 Do not begin another implementation ticket in the same thread.
 
-The callback is sent only after durable GitHub status. It includes task kind
-and status, subordinate task identity, transition idempotency key,
-requested/effective model and reasoning effort, specification/ticket/PR, fixed
-base and exact head, commits, local/hosted checks, mergeability,
-total/unresolved review threads, separate axis findings, artifact URL,
-new-commit status, scope deviations, and exact next action. Do not send
-progress callbacks, retry a successful send, or ask the product owner to relay
-the handoff. GitHub remains authoritative. After dispatch, the coordinator
-does not monitor the task; only this terminal callback resumes the automatic
-subordinate stage.
+The callback is sent only after durable GitHub status. It is a compact,
+structured wake-up envelope rather than a second durable record; GitHub remains
+authoritative. It contains:
+
+- the current stage, task kind, terminal status, and terminal outcome;
+- the subordinate task identity and transition idempotency key;
+- requested and effective model and reasoning effort;
+- links to the repository, specification, ticket, pull request, and canonical
+  durable artifact;
+- every exact SHA needed for unambiguous reconciliation, including the fixed
+  base and exact head whenever both are relevant; one SHA is not a limit, and
+  unrelated SHAs must not be included;
+- the compact commit list required by this repository;
+- concise local and hosted check statuses;
+- concise mergeability status;
+- concise total and unresolved review-thread counts;
+- concise separate Standards and Spec findings or outcomes;
+- whether a new commit appeared after verification;
+- scope deviations, or an explicit `none`; and
+- exactly one concrete next action.
+
+Repository-required structured fields are mandatory within this common
+envelope, including the commit list and review-thread counts above; keep them
+compact. Before sending, verify that the receiving coordinator can access the
+canonical linked context. Fields already available through those links are
+represented by the links and concise outcomes; include directly only essential
+context unavailable through them. Do not duplicate linked specifications,
+instructions, histories, full findings, secrets, full logs, or other large
+data; never include secret values. A transient failed callback delivery may be
+retried with the same transition key only; every retry MUST remain one delivery
+attempt for the same logical callback and MUST NOT create a second logical
+callback. After one successful terminal callback, no retry is permitted. Do not
+send progress callbacks or ask the product owner to relay the handoff. After
+dispatch, the coordinator does not monitor the task; only this terminal
+callback resumes the automatic subordinate stage.
 
 ## Review and fix protocol
 
