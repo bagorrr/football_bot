@@ -120,7 +120,6 @@ def separate_migration_database_login(
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
     assert [path.name for path in _migration_paths()][-18:] == [
-        "0048_persist_dynamic_result_callback_copy.sql",
         "0049_result_conversation.sql",
         "0050_bot_assistant_execution.sql",
         "0051_source_data_deletion.sql",
@@ -138,6 +137,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0063_semantic_origin_update_id.sql",
         "0064_runtime_readiness_and_ingestion_bootstrap.sql",
         "0065_source_chat_ingestion_read_policy.sql",
+        "0066_source_chat_ingestion_checkpoint_read_policy.sql",
     ]
 
 
@@ -1018,6 +1018,15 @@ def test_ingestion_source_chat_projections_are_read_only_under_force_rls(
                     removed_at,
                 ),
             )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.telegram_channel_difference_checkpoints (
+                peer_kind, telegram_chat_id, registry_generation,
+                channel_pts, advanced_at
+            ) VALUES ('channel', 4303, 1, 74303, %s)
+            """,
+            (recorded_at,),
+        )
 
     ingestion_url = runtime_database_url(
         fresh_database_url,
@@ -1084,6 +1093,12 @@ def test_ingestion_source_chat_projections_are_read_only_under_force_rls(
         )
         is None
     )
+    ingestion_context = ingestion_store.source_chat_ingestion_context(
+        identity=TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4303),
+        registry_generation=1,
+    )
+    assert ingestion_context is not None
+    assert ingestion_context.checkpoint == TelegramChannelCheckpoint(pts=74303)
 
 
 def test_bot_assistant_can_read_only_the_current_tournament_projection(

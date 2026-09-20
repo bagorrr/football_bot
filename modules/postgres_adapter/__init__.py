@@ -218,6 +218,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0063_semantic_origin_update_id.sql",
     "0064_runtime_readiness_and_ingestion_bootstrap.sql",
     "0065_source_chat_ingestion_read_policy.sql",
+    "0066_source_chat_ingestion_checkpoint_read_policy.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -287,6 +288,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "b543c9190bafe36a006c0ce01eb2224c19f9a0e760132bf0d967b58d487c921b",
     "daa33b855d2ccc7ea94d72df15b6c2638a75a9807bba1200bf1d50651c19504a",
     "d705c082f90d75f1884cf745044eba9aed5d279f72ae36c51aa92fb31f5a3dd4",
+    "1b58be73fb4ebee429eacf48f7342c8e44964200d30dedbaebba6652e3f4669f",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
