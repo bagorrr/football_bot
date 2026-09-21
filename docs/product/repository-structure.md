@@ -7,9 +7,10 @@ The originating decision is
 Runtime and data-flow details are canonical in
 [`classification-pipeline.md`](classification-pipeline.md) and
 [ADR 0001](../adr/0001-use-a-durable-model-classification-service.md).
-Free-form Bot Assistant model execution is canonical in
+Free-form execution policy and the current T3 implementation are canonical in
 [`bot-assistant-model-execution.md`](bot-assistant-model-execution.md) and
-[ADR 0009](../adr/0009-keep-bot-assistant-execution-direct-and-application-authoritative.md).
+[Ticket #102](https://github.com/bagorrr/football_bot/issues/102); [ADR 0009](../adr/0009-keep-bot-assistant-execution-direct-and-application-authoritative.md)
+records the authority boundary.
 
 ## Repository boundary
 
@@ -110,7 +111,7 @@ versioned contracts and carry stable identifiers, not adapter-specific objects.
 
 ## Initial process roles
 
-Run five independently restartable roles:
+Run five independently restartable long-running services for these roles:
 
 1. **Telegram ingestion worker** — owns the configured user-authorized
    MTProto/Telethon session, application-owned Telegram difference checkpoints,
@@ -129,11 +130,20 @@ Run five independently restartable roles:
    presentation. It has no separate conversation worker or durable model
    queue.
 
+The sixth functional role is T3: a stateless, one-shot Python Codex SDK worker
+process started and managed by Bot Assistant for each permitted semantic or
+free-form turn. A permitted retry starts a fresh one-shot attempt. T3 is not an
+independently restartable service, has no separate service-health state or
+durable queue, and owns no application state. Its ChatGPT-subscription
+authentication, `gpt-5.6-luna`/`high` policy, isolation, deadline, and failure
+contract are canonical in [`bot-assistant-model-execution.md`](bot-assistant-model-execution.md),
+[Ticket #102](https://github.com/bagorrr/football_bot/issues/102), and the
+[2026-09-14 owner amendment](https://github.com/bagorrr/football_bot/issues/99#issuecomment-5664415306).
+
 The backend may expose health, administration, and application endpoints
-without becoming a sixth owner of domain state. Application and recommendation
-commands may initially run from the same deployment image, but ingestion,
-classification, and Bot Assistant delivery remain separate process and secret
-boundaries.
+without adding another state owner. Application and recommendation commands may
+initially run from the same deployment image, but ingestion, classification,
+and Bot Assistant delivery remain separate process and secret boundaries.
 
 ## Initial persistence and queue topology
 
@@ -164,20 +174,23 @@ weaken the transactional handoff or replay contract.
 | --- | --- | --- |
 | Ingestion | Telegram `api_id`/`api_hash`, protected Telethon authentication, least-privilege checkpoint/inbox database credential | Bot token, Codex/Responses credential, Bot User data access |
 | Classification | Dedicated ChatGPT/Codex or service credential and least-privilege job/context access | Telethon session, Bot token, publication or matching write authority |
-| Bot Assistant | Bot token, dedicated Bot Assistant model credential, and user/delivery database access | Telethon session, classifier credential, unrestricted raw Source Message access, general web or write-capable model tools |
+| Bot Assistant | Bot token, user/delivery database access, and the dedicated Bot Assistant ChatGPT-subscription store used by its T3 child | Telethon session, classifier credential, unrestricted raw Source Message access, general web or write-capable model tools |
+| T3 worker child process | Dedicated ChatGPT-subscription `CODEX_HOME` and validated T3 configuration projection | Bot token, Telegram configuration, database/application/deployment/classifier credentials, general web or write-capable model tools |
 | Application and recommendation | Least-privilege domain-state database access | Telegram or classifier authentication unless a specific adapter composition requires it |
 
-The Codex CLI PoC runs under its own unprivileged OS identity with a dedicated
-`CODEX_HOME`, explicit `gpt-5.6-sol` and `high` reasoning settings, ignored
-personal configuration, an isolated minimal workspace, and no application
-secrets. Runtime model policy never comes from an operator's personal Codex
-configuration.
+The Source Message Classification Codex CLI PoC runs under its own
+unprivileged OS identity with a dedicated `CODEX_HOME`, explicit
+`gpt-5.6-sol` and `high` reasoning settings, ignored personal configuration,
+an isolated minimal workspace, and no application secrets. Runtime model
+policy never comes from an operator's personal Codex configuration.
 
-The test-MVP Bot Assistant adapter uses a separate dedicated service identity,
-credential boundary, `CODEX_HOME`, prompt, response contract, and context
-policy. It invokes one direct ephemeral process per permitted turn, disables
-Codex web search and every other model tool, and has no classifier queue or raw
-Source Message access.
+The test-MVP Bot Assistant adapter starts the T3 Python SDK worker as a fresh
+child process within the Bot Assistant service. T3 uses its separate protected
+ChatGPT-subscription `CODEX_HOME`, prompt, response contract, context policy,
+and explicit sanitized configuration projection. It disables Codex web search
+and every other model tool and has no classifier queue or raw Source Message
+access. The worker exits after one result envelope; any permitted retry starts
+another one-shot process.
 
 The Telethon `StringSession` remains an authentication secret only. It is not a
 Telegram checkpoint. PostgreSQL stores the application-owned recoverable

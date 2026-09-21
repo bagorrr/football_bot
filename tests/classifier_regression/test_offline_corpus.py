@@ -68,6 +68,7 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    SearchAreaInterpretation,
 )
 from modules.ports import (
     ClassifierAdapterResult,
@@ -1033,6 +1034,11 @@ class _RecordedTournamentResolver:
     def opportunity_revision_id(self, proposal_id: str) -> str:
         return f"recorded-opportunity-revision:{proposal_id}"
 
+    def resolve_location_mention(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution:
+        return self.resolve(query)
+
     def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
         assert query.stage is ConversationStage.SEARCH_AREA
         return LocationResolution(
@@ -1065,6 +1071,11 @@ class _RecordedTournamentResolver:
                 ),
             )
         )
+
+    def resolve_search_area(
+        self, query: LocationResolutionQuery
+    ) -> tuple[SearchAreaInterpretation, ...]:
+        return ()
 
 
 def _tournament_promotion_payload(

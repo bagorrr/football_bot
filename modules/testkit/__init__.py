@@ -76,6 +76,8 @@ from modules.domain import (
     RequiredDate,
     RequiredDateConfirmationEvent,
     ResultConversation,
+    SearchAreaCandidate,
+    SearchAreaInterpretation,
     SearchResult,
     SourceChatAddressKind,
     SourceChatAdmissionResolution,
@@ -402,6 +404,13 @@ class ControlledTelegramIngestionAdapter:
         """Accept the production scope lookup without making controlled data live."""
         del lookup
 
+    def configure_source_scope_activation_lookup(
+        self,
+        lookup: Callable[[TelegramPeerIdentity, int], tuple[datetime, str] | None],
+    ) -> None:
+        """Accept the production activation lookup without making data live."""
+        del lookup
+
     def configure_source_message_revision_lookup(
         self,
         lookup: Callable[
@@ -496,6 +505,18 @@ class ControlledTelegramIngestionAdapter:
                 "controlled transport boundary is unavailable"
             )
         return boundaries.pop(0)
+
+    def capture_account_checkpoint(self) -> TelegramAccountCheckpoint:
+        """Keep explicit provider checkpoint capture outside controlled tests."""
+        raise AssertionError("controlled account checkpoint capture is not configured")
+
+    def capture_channel_checkpoint(
+        self, identity: TelegramPeerIdentity
+    ) -> TelegramChannelCheckpoint:
+        """Keep explicit provider checkpoint capture outside controlled tests."""
+        raise AssertionError(
+            f"controlled channel checkpoint capture is not configured: {identity}"
+        )
 
     def add_account_difference_event(
         self,
@@ -2093,8 +2114,10 @@ class ControlledLocationResolverAdapter:
         """Return a stable accepted Opportunity revision identity."""
         return f"opportunity-revision:{proposal_id}"
 
-    def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
-        """Resolve deterministic acceptance phrases without provider access."""
+    def _resolve_location_mention(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution:
+        """Resolve deterministic fixtures using Location Mention candidates."""
         self.queries.append(query)
         country_label = {
             "en": "Russia",
@@ -2339,17 +2362,89 @@ class ControlledLocationResolverAdapter:
             )
         return LocationResolution(interpretations=())
 
+    def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
+        """Return the legacy Search Area shape with Search Area candidates."""
+        resolution = self._resolve_location_mention(query)
+        return LocationResolution(
+            interpretations=tuple(
+                replace(
+                    interpretation,
+                    places=tuple(
+                        _as_search_area_candidate(candidate)
+                        for candidate in interpretation.places
+                    ),
+                )
+                for interpretation in resolution.interpretations
+            )
+        )
+
+    def resolve_location_mention(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution:
+        """Return Location Candidates for a Source Message Location Mention."""
+        return self._resolve_location_mention(query)
+
+    def resolve_search_area(
+        self, query: LocationResolutionQuery
+    ) -> tuple[SearchAreaInterpretation, ...]:
+        """Adapt controlled fixtures to any Bot User geography stage."""
+        resolution = self.resolve(query)
+        return tuple(
+            SearchAreaInterpretation(
+                candidates=(
+                    ()
+                    if interpretation.whole_city
+                    else tuple(
+                        _as_search_area_candidate(candidate)
+                        for candidate in interpretation.places
+                    )
+                ),
+                resolver_version=next(
+                    (candidate.resolver_version for candidate in interpretation.places),
+                    "controlled-resolver-v1",
+                ),
+                glossary_version=interpretation.glossary_version,
+                whole_city=interpretation.whole_city,
+            )
+            for interpretation in resolution.interpretations
+        )
+
+
+def _as_search_area_candidate(
+    candidate: LocationCandidate | SearchAreaCandidate,
+) -> SearchAreaCandidate:
+    if isinstance(candidate, SearchAreaCandidate):
+        return candidate
+    return SearchAreaCandidate(
+        place_id=candidate.place_id,
+        display_name=candidate.display_name,
+        geographic_type=candidate.geographic_type,
+        country_id=candidate.country_id,
+        city_id=candidate.city_id,
+        verified_parent_ids=candidate.verified_parent_ids,
+        parent_display_names=candidate.parent_display_names,
+        iana_timezone=candidate.iana_timezone,
+        resolver_version=candidate.resolver_version,
+        glossary_version=candidate.glossary_version,
+        localized_display_names=candidate.localized_display_names,
+        verified_disjoint_place_ids=candidate.verified_disjoint_place_ids,
+    )
+
 
 class ControlledConversationLanguageAdapter:
     """Deterministic free-text interpretation with no live model call."""
 
-    def interpret(self, text: str) -> LanguageSelection | None:
+    def interpret(
+        self, text: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
         """Recognize one acceptance fixture and reject every ambiguous input."""
         if text.strip().casefold() != "deutsch":
             return None
-        return self.render("de")
+        return self.render("de", update_id=update_id)
 
-    def render(self, locale: str) -> LanguageSelection | None:
+    def render(
+        self, locale: str, *, update_id: str | None = None
+    ) -> LanguageSelection | None:
         """Render the one validated non-static acceptance locale."""
         if locale != "de":
             return None
@@ -2429,6 +2524,35 @@ class ControlledConversationLanguageAdapter:
                 "Die Ansicht enthält keine Nachrichtentexte."
             ),
             source_data_deletion_labels=("Zurück", "Menü"),
+            source_data_deletion_action_labels=(
+                "Anfrage hinzufügen",
+                "Genehmigen",
+                "Ablehnen",
+                "Ziel prüfen",
+                "Erneut prüfen",
+                "Antragsteller benachrichtigt",
+                "Abschließen",
+                "Keine Daten gefunden",
+                "Start bestätigen",
+            ),
+            source_data_deletion_review_text=(
+                "🛡️ **Ziel der Löschung von Source Data prüfen**\n\n"
+                "request={request}\n"
+                "source_author={source_author}\n"
+                "source_chat={source_chat}\n"
+                "support_case={support_case}\n"
+                "status={status}\n\n"
+                "Diese Operation startet die auf die Anfrage begrenzte "
+                "Unterdrückung und Löschung. Bestätigen Sie ausdrücklich."
+            ),
+            source_data_deletion_input_texts=(
+                "Geben Sie genau request_id=<opaque> source_author=<numeric> "
+                "source_chat=<exact Source Chat key> support_case=<opaque> ein. "
+                "Fügen Sie keinen Textkörper ein.",
+                "Geben Sie einen begrenzten Ablehnungsgrund ohne Leerzeichen ein.",
+                "Geben Sie den Nachweiszeiger ohne Textkörper für das Ergebnis "
+                "{outcome} ein.",
+            ),
             source_data_audit_text=(
                 "🧾 **Datenaufbewahrungs-Audit**\n\n"
                 "Ereignisse ohne Nachrichtentext werden 90 Tage aufbewahrt."
@@ -4697,7 +4821,7 @@ class AcceptanceSpine:
         role = self._roles[RuntimeRole.BOT_ASSISTANT]
         current = self.conversation_state(telegram_user_id)
         draft = role.store.discovery_draft(telegram_user_id)
-        selection = _conversation_language(role).render(locale)
+        selection = _conversation_language(role).render(locale, update_id=update_id)
         if selection is not None and selection.locale != locale:
             raise RuntimeError("controlled language change rendered another locale")
         result_context = (
@@ -5109,6 +5233,7 @@ def boot_acceptance_spine(
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
     telegram_admin_user_id: int | None = None,
+    telegram_admin_user_ids: Mapping[RuntimeRole, int | None] | None = None,
     classifier_projection: Mapping[str, object] | None = None,
 ) -> AcceptanceSpine:
     """Provision the administrative test seam and boot each role separately.
@@ -5196,7 +5321,11 @@ def boot_acceptance_spine(
                 else None
             ),
             telegram_admin_user_id=(
-                telegram_admin_user_id
+                (
+                    telegram_admin_user_ids.get(role)
+                    if telegram_admin_user_ids is not None
+                    else telegram_admin_user_id
+                )
                 if role in {RuntimeRole.APPLICATION, RuntimeRole.BOT_ASSISTANT}
                 else None
             ),
@@ -5227,6 +5356,7 @@ def boot_legacy_acceptance_spine(
     date_interpretation: DateInterpretationAdapter | None = None,
     timezone_data: TimezoneDataAdapter | None = None,
     telegram_admin_user_id: int | None = None,
+    telegram_admin_user_ids: Mapping[RuntimeRole, int | None] | None = None,
     classifier_projection: Mapping[str, object] | None = None,
 ) -> AcceptanceSpine:
     """Boot a named legacy fixture with its compatibility opt-out enabled."""
@@ -5243,6 +5373,7 @@ def boot_legacy_acceptance_spine(
         date_interpretation=date_interpretation,
         timezone_data=timezone_data,
         telegram_admin_user_id=telegram_admin_user_id,
+        telegram_admin_user_ids=telegram_admin_user_ids,
         classifier_projection=classifier_projection,
     )
 

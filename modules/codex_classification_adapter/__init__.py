@@ -25,6 +25,7 @@ from modules.ports import (
 )
 
 EXECUTION_TIMEOUT_SECONDS = 180
+CODEX_CLI_VERSION = "codex-cli 0.144.4"
 
 
 class CodexProcessRunner(Protocol):

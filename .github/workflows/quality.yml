@@ -35,6 +35,7 @@ jobs:
               tests/system/test_migrations.py
               tests/system/test_opponent_search.py
               tests/system/test_required_date.py
+              tests/system/test_source_data_deletion.py
               tests/system/test_transfer_search.py
           - shard: remaining-system-2
             pytest_args: >-
@@ -80,16 +81,21 @@ jobs:
 
           with psycopg.connect(os.environ["TEST_DATABASE_URL"]) as connection:
               with connection.cursor() as cursor:
-                  cursor.execute("SELECT current_user, current_database()")
-                  current_user, current_database = cursor.fetchone()
+                  cursor.execute(
+                      "SELECT current_user, current_database(), "
+                      "current_setting('server_version_num')"
+                  )
+                  current_user, current_database, server_version_num = cursor.fetchone()
 
           if (current_user, current_database) != ("postgres", "postgres"):
               raise SystemExit(
                   "unexpected PostgreSQL identity: "
                   f"{current_user}@{current_database}"
               )
+          if not str(server_version_num).startswith("16"):
+              raise SystemExit("postgresql contract is not major version 16")
 
-          print("connected as postgres to database postgres")
+          print("postgresql_contract=ready major=16 identity=postgres@postgres")
       - name: Run repository static quality checks
         if: ${{ matrix.shard == 'unit-static' }}
         run: |

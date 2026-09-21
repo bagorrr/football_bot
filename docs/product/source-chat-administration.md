@@ -31,8 +31,10 @@ The ordinary Bot Assistant is also the administrator interface. There is no
 separate administrator bot and no `/admin` command.
 
 The configured administrator Telegram account is also the user-authorized
-MTProto/Telethon ingestion account for the test MVP. Its exact username and
-numeric ID remain protected operational configuration.
+MTProto/Telethon ingestion account for the test MVP. Its numeric Telegram
+identity is configured as `TELEGRAM_ADMIN_USER_ID`. Telegram usernames are
+provider-resolved protected metadata, not configured identities or
+authorization inputs.
 
 `Settings` contains `Administration` only when the incoming Telegram user ID
 exactly equals the protected configured `TELEGRAM_ADMIN_USER_ID`. Other Bot
@@ -51,10 +53,11 @@ The Russian master menu is:
 The deletion-request action displays the number of overdue requests. Every
 administrator view and mutation is body-free audited.
 
-Personal Telegram user IDs, the ingestion account username, invite links,
-support conversations, and session credentials are operational data. Store
-them only in protected configuration or operational storage, never in Git,
-ordinary logs, prompts, analytics, or GitHub Issues.
+Personal Telegram user IDs, invite links, support conversations, and session
+credentials are operational data. Store them only in protected configuration
+or operational storage. Keep provider-resolved usernames in protected
+operational storage, not runtime configuration, and never expose this data in
+Git, ordinary logs, prompts, analytics, or GitHub Issues.
 
 Administration and Source Data Deletion Request turns use deterministic
 application commands and fixed presentation. They never expose the free-form

@@ -2058,6 +2058,13 @@ class BotApiIngress:
         finally:
             self.store.release_poll_lease(claim_token=lease_token)
 
+    def verify_readiness(self) -> BotApiIdentity:
+        """Verify Bot API identity and the private admin destination read-only."""
+        self._ensure_ready()
+        if self._bot_identity is None:
+            raise BotApiIdentityMismatchError("authenticated bot identity unavailable")
+        return self._bot_identity
+
     def _ensure_ready(self) -> None:
         identity = self.transport.get_me()
         if (
@@ -2412,10 +2419,8 @@ class BotApiHttpTransport:
     ) -> None:
         if request_timeout_seconds <= 0:
             raise ValueError("Bot API request timeout must be positive")
-        if not api_root.endswith("/"):
-            api_root += "/"
         self._configuration = configuration
-        self._api_root = api_root
+        self._api_root = api_root.rstrip("/")
         self._request_timeout_seconds = request_timeout_seconds
         self._opener = opener
         self._reconciliation = reconciliation

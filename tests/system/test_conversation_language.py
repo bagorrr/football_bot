@@ -964,7 +964,7 @@ def test_other_runtime_roles_cannot_read_bot_user_language_state(
 
 
 class _UntrustedFixedLanguageAdapter:
-    def interpret(self, text: str) -> LanguageSelection | None:
+    def interpret(self, text: str, *, update_id: str) -> LanguageSelection | None:
         return LanguageSelection(
             locale="en",
             confirmation="unreviewed confirmation",
@@ -972,8 +972,8 @@ class _UntrustedFixedLanguageAdapter:
             direction_labels=("bad", "bad", "bad", "bad", "bad", "bad", "bad"),
         )
 
-    def render(self, locale: str) -> LanguageSelection | None:
-        return self.interpret(locale)
+    def render(self, locale: str, *, update_id: str | None) -> LanguageSelection | None:
+        return self.interpret(locale, update_id=update_id or "")
 
 
 def test_application_forces_reviewed_copy_for_free_text_fixed_language() -> None:
@@ -1013,8 +1013,8 @@ def test_application_forces_reviewed_copy_for_free_text_fixed_language() -> None
 
 
 class _UnknownLocaleAdapter(_UntrustedFixedLanguageAdapter):
-    def interpret(self, text: str) -> LanguageSelection | None:
-        proposal = super().interpret(text)
+    def interpret(self, text: str, *, update_id: str) -> LanguageSelection | None:
+        proposal = super().interpret(text, update_id=update_id)
         assert proposal is not None
         return LanguageSelection(
             locale="zzz",
@@ -1061,9 +1061,11 @@ def test_application_rejects_an_unowned_free_text_locale() -> None:
 class _RecognizedFreeTextLocaleAdapter(_UntrustedFixedLanguageAdapter):
     def __init__(self, locale: str) -> None:
         self._locale = locale
+        self.interpret_update_ids: list[str] = []
 
-    def interpret(self, text: str) -> LanguageSelection | None:
-        proposal = super().interpret(text)
+    def interpret(self, text: str, *, update_id: str) -> LanguageSelection | None:
+        self.interpret_update_ids.append(update_id)
+        proposal = super().interpret(text, update_id=update_id)
         assert proposal is not None
         return LanguageSelection(
             locale=self._locale,
@@ -1129,13 +1131,15 @@ def test_application_accepts_recognized_free_text_language_catalog_entries(
 class _CountingAmbiguousLanguageAdapter:
     def __init__(self) -> None:
         self.interpretations = 0
+        self.update_ids: list[str] = []
 
-    def interpret(self, text: str) -> LanguageSelection | None:
+    def interpret(self, text: str, *, update_id: str) -> LanguageSelection | None:
         self.interpretations += 1
+        self.update_ids.append(update_id)
         time.sleep(0.05)
         return None
 
-    def render(self, locale: str) -> LanguageSelection | None:
+    def render(self, locale: str, *, update_id: str | None) -> LanguageSelection | None:
         return None
 
 
@@ -1143,11 +1147,14 @@ class _CountingRenderLanguageAdapter(_RecognizedFreeTextLocaleAdapter):
     def __init__(self) -> None:
         super().__init__("de")
         self.renders = 0
+        self.render_update_ids: list[str] = []
 
-    def render(self, locale: str) -> LanguageSelection | None:
+    def render(self, locale: str, *, update_id: str | None) -> LanguageSelection | None:
         self.renders += 1
+        if update_id is not None:
+            self.render_update_ids.append(update_id)
         time.sleep(0.05)
-        return self.interpret(locale)
+        return self.interpret(locale, update_id=update_id or "")
 
 
 def test_replayed_start_does_not_repeat_free_text_language_rendering() -> None:
@@ -1192,6 +1199,7 @@ def test_replayed_start_does_not_repeat_free_text_language_rendering() -> None:
             future.result()
 
     assert language_adapter.renders == 1
+    assert language_adapter.render_update_ids == ["replayed-start-render"]
 
 
 def test_replayed_ambiguous_update_does_not_repeat_semantic_interpretation() -> None:
@@ -1231,6 +1239,7 @@ def test_replayed_ambiguous_update_does_not_repeat_semantic_interpretation() -> 
             future.result()
 
     assert language_adapter.interpretations == 1
+    assert language_adapter.update_ids == ["replayed-ambiguous-interpretation"]
     assert len(telegram_delivery.messages) == 3
 
 

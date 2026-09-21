@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from threading import Thread
 from types import SimpleNamespace
 
 import pytest
-from telethon import types  # type: ignore[import-untyped]
+from telethon import TelegramClient, functions, types  # type: ignore[import-untyped]
+from telethon.errors import (  # type: ignore[import-untyped]
+    ChannelPrivateError,
+    PersistentTimestampEmptyError,
+)
+from telethon.sessions import StringSession  # type: ignore[import-untyped]
 
 from modules.domain import (
     IngestionFailureReason,
@@ -39,6 +47,8 @@ from modules.telethon_ingestion import (
     TelethonConformance,
     TelethonConformanceError,
     TelethonIngestionAdapter,
+    TelethonLoopLifecycleError,
+    TelethonLoopOwner,
     TelethonProvider,
     TelethonRuntime,
     TelethonTransportError,
@@ -51,12 +61,13 @@ class _RecordingTelethonSource:
         self.account_result: TelegramDifferenceResult | None = None
         self.history_calls = 0
         self.raise_on_history = False
+        self.scope_refreshes: list[tuple[object, ...]] = []
 
     def refresh_source_scope(
         self,
-        approved_source_chats: object,
+        approved_source_chats: Iterable[object],
     ) -> None:
-        del approved_source_chats
+        self.scope_refreshes.append(tuple(approved_source_chats))
 
     def configure_clock(self, clock: object) -> None:
         del clock
@@ -76,6 +87,14 @@ class _RecordingTelethonSource:
     def capture_source_chat_registration_boundary(
         self, identity: TelegramPeerIdentity
     ) -> str:
+        raise AssertionError(identity)
+
+    def capture_account_checkpoint(self) -> TelegramAccountCheckpoint:
+        raise AssertionError
+
+    def capture_channel_checkpoint(
+        self, identity: TelegramPeerIdentity
+    ) -> TelegramChannelCheckpoint:
         raise AssertionError(identity)
 
     def get_account_difference_event(
@@ -567,6 +586,324 @@ def test_production_telethon_provider_is_lazy_and_wires_live_client_boundary() -
     assert client.calls[-2:] == ["catch_up", "run_until_disconnected"]
 
 
+def test_provider_captures_complete_account_state_and_channel_pts() -> None:
+    account_response = SimpleNamespace(
+        pts=101,
+        qts=202,
+        seq=303,
+        date=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+    )
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    client = _DifferenceClientProbe(
+        [account_response, SimpleNamespace(full_chat=SimpleNamespace(pts=404))]
+    )
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+
+    assert provider.capture_account_checkpoint() == TelegramAccountCheckpoint(
+        pts=101,
+        qts=202,
+        seq=303,
+        date=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+    )
+    assert provider.capture_channel_checkpoint(identity) == TelegramChannelCheckpoint(
+        pts=404
+    )
+    assert isinstance(client.requests[0], functions.updates.GetStateRequest)
+    assert isinstance(client.requests[1], functions.channels.GetFullChannelRequest)
+    assert client.history_kwargs is None
+
+
+def test_provider_awaits_telethon_sync_wrapper_on_client_loop() -> None:
+    calls: list[str] = []
+
+    async def async_catch_up() -> None:
+        calls.append("catch_up")
+
+    def sync_wrapper() -> object:
+        coroutine = async_catch_up()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            raise RuntimeError("sync wrapper cannot run without a loop") from None
+        return coroutine
+
+    setattr(sync_wrapper, "__tl.sync", async_catch_up)
+
+    class _SyncWrapperClient(_ProductionClientProbe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.loop = asyncio.new_event_loop()
+            self.__dict__["catch_up"] = sync_wrapper
+
+        def run_until_disconnected(self) -> None:
+            calls.append("run_until_disconnected")
+
+    client = _SyncWrapperClient()
+    provider = TelethonProvider(client=client)
+    try:
+        provider.start_live_ingestion(lambda _identity: None)
+        provider.run_live_ingestion()
+    finally:
+        client.loop.close()
+
+    assert calls == ["catch_up", "run_until_disconnected"]
+
+
+def test_provider_awaits_live_call_with_real_telethon_loop_property() -> None:
+    calls: list[str] = []
+    errors: list[BaseException] = []
+
+    client = TelegramClient(
+        StringSession(),
+        123456,
+        "controlled-api-hash",
+        catch_up=False,
+    )
+
+    def set_client_attribute(name: str, value: object) -> None:
+        setattr(client, name, value)
+
+    async def async_catch_up() -> None:
+        calls.append("catch_up")
+        assert asyncio.get_running_loop() is not None
+
+    set_client_attribute("catch_up", async_catch_up)
+    set_client_attribute(
+        "run_until_disconnected",
+        lambda: calls.append("run_until_disconnected"),
+    )
+    provider = TelethonProvider(client=client)
+    provider.start_live_ingestion(lambda _identity: None)
+
+    def run_live_transport() -> None:
+        try:
+            provider.run_live_ingestion()
+        except BaseException as error:
+            errors.append(error)
+
+    live_thread = Thread(target=run_live_transport)
+    live_thread.start()
+    live_thread.join(timeout=2)
+
+    assert not live_thread.is_alive()
+    assert errors == []
+    assert calls == ["catch_up", "run_until_disconnected"]
+    assert isinstance(type(client).loop, property)
+
+
+def test_provider_awaits_sync_wrapped_client_request() -> None:
+    response = SimpleNamespace(
+        pts=1,
+        qts=2,
+        seq=3,
+        date=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+    )
+
+    class _SyncCallableClient:
+        def __init__(self) -> None:
+            self.responses = [response]
+            self.requests: list[object] = []
+
+        async def async_call(self, request: object) -> object:
+            self.requests.append(request)
+            return self.responses.pop(0)
+
+        def __call__(self, request: object) -> object:
+            coroutine = self.async_call(request)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                raise RuntimeError("sync wrapper cannot run without a loop") from None
+            return coroutine
+
+    _SyncCallableClient.__call__.__dict__["__tl.sync"] = _SyncCallableClient.async_call
+    client = _SyncCallableClient()
+
+    assert TelethonProvider(client=client).capture_account_checkpoint() == (
+        TelegramAccountCheckpoint(1, 2, 3, response.date)
+    )
+    assert isinstance(client.requests[0], functions.updates.GetStateRequest)
+
+
+def test_provider_schedules_async_transport_calls_on_its_running_client_loop() -> None:
+    loop = asyncio.new_event_loop()
+    loop_started = asyncio.Event()
+    observed_loops: list[asyncio.AbstractEventLoop] = []
+
+    class _LoopClient:
+        def __init__(self) -> None:
+            self.loop = loop
+
+        async def connect(self) -> None:
+            observed_loops.append(asyncio.get_running_loop())
+
+        async def is_user_authorized(self) -> bool:
+            observed_loops.append(asyncio.get_running_loop())
+            return True
+
+        async def get_me(self) -> object:
+            observed_loops.append(asyncio.get_running_loop())
+            return SimpleNamespace(id=123456)
+
+    def run_loop() -> None:
+        asyncio.set_event_loop(loop)
+        loop.call_soon(loop_started.set)
+        loop.run_forever()
+
+    thread = Thread(target=run_loop, daemon=True)
+    thread.start()
+    try:
+        assert asyncio.run_coroutine_threadsafe(loop_started.wait(), loop).result(
+            timeout=2
+        )
+        provider = TelethonProvider(client=_LoopClient())
+
+        assert provider.authenticate() == 123456
+        assert observed_loops == [loop, loop, loop]
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
+def test_provider_reuses_one_loop_across_auth_and_checkpoint_calls() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    observed_loops: list[asyncio.AbstractEventLoop] = []
+
+    class _SequentialClient:
+        def __init__(self) -> None:
+            self.bound_loop: asyncio.AbstractEventLoop | None = None
+            self.calls: list[str] = []
+
+        async def _observe(self, name: str) -> None:
+            loop = asyncio.get_running_loop()
+            if self.bound_loop is None:
+                self.bound_loop = loop
+            elif loop is not self.bound_loop:
+                raise RuntimeError("Telethon client loop changed")
+            observed_loops.append(loop)
+            self.calls.append(name)
+
+        async def connect(self) -> None:
+            await self._observe("connect")
+
+        async def is_user_authorized(self) -> bool:
+            await self._observe("is_user_authorized")
+            return True
+
+        async def get_me(self) -> object:
+            await self._observe("get_me")
+            return SimpleNamespace(id=123456)
+
+        async def get_entity(self, _entity: object) -> object:
+            await self._observe("get_entity")
+            return _channel_entity()
+
+        async def __call__(self, request: object) -> object:
+            if isinstance(request, functions.updates.GetStateRequest):
+                await self._observe("get_state")
+                return SimpleNamespace(
+                    pts=101,
+                    qts=202,
+                    seq=303,
+                    date=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+                )
+            if isinstance(request, functions.channels.GetFullChannelRequest):
+                await self._observe("get_full_channel")
+                return SimpleNamespace(full_chat=SimpleNamespace(pts=404))
+            raise AssertionError(type(request).__name__)
+
+    client = _SequentialClient()
+    provider = TelethonProvider(client=client, approved_source_chats=(identity,))
+    try:
+        assert provider.authenticate() == 123456
+        assert provider.capture_account_checkpoint() == TelegramAccountCheckpoint(
+            pts=101,
+            qts=202,
+            seq=303,
+            date=datetime(2026, 9, 18, 12, 0, tzinfo=UTC),
+        )
+        assert provider.capture_channel_checkpoint(identity) == (
+            TelegramChannelCheckpoint(pts=404)
+        )
+    finally:
+        if client.bound_loop is not None and not client.bound_loop.is_closed():
+            client.bound_loop.close()
+
+    assert client.calls == [
+        "connect",
+        "is_user_authorized",
+        "get_me",
+        "get_state",
+        "get_entity",
+        "get_full_channel",
+    ]
+    assert observed_loops
+    assert {id(loop) for loop in observed_loops} == {id(observed_loops[0])}
+
+
+def test_provider_uses_one_loop_owner_for_conformance_and_live_ingestion() -> None:
+    observed_loops: list[asyncio.AbstractEventLoop] = []
+
+    class _OwnedClient:
+        async def _observe(self) -> None:
+            observed_loops.append(asyncio.get_running_loop())
+
+        async def connect(self) -> None:
+            await self._observe()
+
+        async def is_user_authorized(self) -> bool:
+            await self._observe()
+            return True
+
+        async def get_me(self) -> object:
+            await self._observe()
+            return SimpleNamespace(id=123456)
+
+        def add_event_handler(self, _callback: object, _event: object) -> None:
+            observed_loops.append(asyncio.get_running_loop())
+
+        async def catch_up(self) -> None:
+            await self._observe()
+
+        async def run_until_disconnected(self) -> None:
+            await self._observe()
+
+    owner = TelethonLoopOwner()
+    owner.start()
+    owned_loop = owner.loop
+    provider = TelethonProvider(client=_OwnedClient(), loop_owner=owner)
+    try:
+        assert provider.authenticate() == 123456
+        provider.start_live_ingestion(lambda _identity: None)
+        live_thread = Thread(target=provider.run_live_ingestion)
+        live_thread.start()
+        live_thread.join(timeout=2)
+        assert not live_thread.is_alive()
+    finally:
+        owner.close()
+
+    assert observed_loops
+    assert {id(loop) for loop in observed_loops} == {id(owned_loop)}
+
+
+def test_provider_reports_closed_loop_owner_as_typed_redacted_failure() -> None:
+    class _Client:
+        async def connect(self) -> None:
+            raise AssertionError("closed loop must reject before client invocation")
+
+    owner = TelethonLoopOwner()
+    owner.start()
+    provider = TelethonProvider(client=_Client(), loop_owner=owner)
+    owner.close()
+
+    with pytest.raises(TelethonLoopLifecycleError) as error:
+        provider.authenticate()
+
+    assert error.value.reason is IngestionFailureReason.CHECKPOINT_UNAVAILABLE
+    assert str(error.value) == "Telegram event loop lifecycle failed"
+
+
 class _DifferenceClientProbe:
     def __init__(
         self,
@@ -574,17 +911,21 @@ class _DifferenceClientProbe:
         *,
         entities: list[object] | None = None,
         history_messages: list[object] | None = None,
+        request_error: Exception | None = None,
     ) -> None:
         self.responses = responses
         self.entities = entities or []
         self.default_entity = _channel_entity()
         self.history_messages = history_messages or []
+        self.request_error = request_error
         self.requests: list[object] = []
         self.entity_requests: list[object] = []
         self.history_kwargs: dict[str, object] | None = None
 
     def __call__(self, request: object) -> object:
         self.requests.append(request)
+        if self.request_error is not None:
+            raise self.request_error
         return self.responses.pop(0)
 
     def get_entity(self, entity: object) -> object:
@@ -1378,9 +1719,11 @@ def test_provider_ignores_scheduled_updates() -> None:
         assert result.to_checkpoint == TelegramChannelCheckpoint(pts=11)
 
 
-def test_provider_rejects_non_final_channel_registration_boundary() -> None:
+def test_provider_rejects_invalid_channel_registration_checkpoint() -> None:
     identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
-    client = _DifferenceClientProbe([SimpleNamespace(pts=11, final=False)])
+    client = _DifferenceClientProbe(
+        [SimpleNamespace(full_chat=SimpleNamespace(pts=-1))]
+    )
     provider = TelethonProvider(
         client=client,
         approved_source_chats=(identity,),
@@ -1391,6 +1734,59 @@ def test_provider_rejects_non_final_channel_registration_boundary() -> None:
 
     assert error.value.reason is IngestionFailureReason.CHECKPOINT_UNAVAILABLE
     assert client.responses == []
+
+
+@pytest.mark.parametrize(
+    ("request_error", "expected_reason"),
+    (
+        pytest.param(
+            PersistentTimestampEmptyError(object()),
+            IngestionFailureReason.CHECKPOINT_UNAVAILABLE,
+            id="request-contract",
+        ),
+        pytest.param(
+            ChannelPrivateError(object()),
+            IngestionFailureReason.ACCESS_LOST,
+            id="access",
+        ),
+    ),
+)
+def test_provider_classifies_registration_boundary_provider_errors(
+    request_error: Exception,
+    expected_reason: IngestionFailureReason,
+) -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    provider = TelethonProvider(
+        client=_DifferenceClientProbe([], request_error=request_error),
+        approved_source_chats=(identity,),
+    )
+
+    with pytest.raises(TelethonTransportError) as error:
+        provider.capture_source_chat_registration_boundary(identity)
+
+    assert error.value.reason is expected_reason
+
+
+def test_registration_boundary_reuses_resolved_channel_entity() -> None:
+    identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    resolved_entity = _channel_entity()
+    client = _DifferenceClientProbe(
+        [SimpleNamespace(full_chat=SimpleNamespace(pts=11))],
+        entities=[resolved_entity],
+    )
+    provider = TelethonProvider(client=client)
+
+    resolution = provider.resolve_source_chat("@resolved_source")
+    assert resolution.identity == identity
+
+    assert provider.capture_source_chat_registration_boundary(identity) == (
+        "channel-pts:11"
+    )
+    assert client.entity_requests == ["@resolved_source"]
+    assert len(client.requests) == 1
+    request = client.requests[0]
+    assert isinstance(request, functions.channels.GetFullChannelRequest)
+    assert request.channel == types.InputChannel(42, 9)
 
 
 def test_unrelated_account_updates_are_body_free_checkpoint_progress() -> None:
@@ -2293,6 +2689,15 @@ def test_admitted_source_chat_refreshes_active_scope_and_runtime_conformance() -
         approved_source_chats=(initial_identity,),
         live_update_callback=callback_identities.append,
     )
+    processing_started_at = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+    transport_boundary = "channel-pts:10"
+    adapter.configure_source_scope_activation_lookup(
+        lambda identity, generation: (
+            (processing_started_at, transport_boundary)
+            if identity == new_identity and generation == 2
+            else None
+        )
+    )
     resolution = SourceChatAdmissionResolution(
         identity=new_identity,
         address_kind=SourceChatAddressKind.PUBLIC_USERNAME,
@@ -2302,13 +2707,60 @@ def test_admitted_source_chat_refreshes_active_scope_and_runtime_conformance() -
     adapter.admit_source_chat(
         resolution,
         registry_generation=2,
-        processing_started_at=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
-        transport_boundary="channel-pts:10",
+        processing_started_at=processing_started_at,
+        transport_boundary=transport_boundary,
     )
 
     assert new_identity in runtime.conformance_scope
     adapter.notify_live_update(new_identity)
     assert callback_identities == [new_identity]
+
+
+@pytest.mark.parametrize(
+    "current_boundary",
+    (None, (datetime(2026, 9, 1, 10, 0, tzinfo=UTC), "channel-pts:9")),
+)
+def test_admitted_source_chat_does_not_refresh_stale_scope(
+    current_boundary: tuple[datetime, str] | None,
+) -> None:
+    values = {
+        "TELEGRAM_API_ID": "123456",
+        "TELEGRAM_API_HASH": "controlled-api-hash",
+        "TELEGRAM_SESSION_STRING": "controlled-session",
+        "TELEGRAM_ADMIN_USER_ID": "789012",
+    }
+    initial_identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 42)
+    stale_identity = TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 43)
+    runtime = TelethonRuntime.from_mapping(values, client_factory=lambda _: object())
+    runtime.verify_conformance(
+        transport=ControlledTelethonTransport(),
+        approved_source_chats=(initial_identity,),
+    )
+    source = _RecordingTelethonSource()
+    adapter = TelethonIngestionAdapter(
+        runtime=runtime,
+        source=source,
+        approved_source_chats=(initial_identity,),
+    )
+    adapter.configure_source_scope_activation_lookup(
+        lambda identity, generation: (
+            current_boundary if identity == stale_identity and generation == 2 else None
+        )
+    )
+
+    adapter.admit_source_chat(
+        SourceChatAdmissionResolution(
+            identity=stale_identity,
+            address_kind=SourceChatAddressKind.PUBLIC_USERNAME,
+            current_address="@stale_source",
+        ),
+        registry_generation=2,
+        processing_started_at=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        transport_boundary="channel-pts:10",
+    )
+
+    assert source.scope_refreshes == []
+    assert stale_identity not in runtime.conformance_scope
 
 
 def test_history_uses_ascending_lower_boundary_and_stops_at_upper_boundary() -> None:

@@ -29,6 +29,7 @@ from modules.domain import (
     LocationInterpretation,
     LocationResolution,
     LocationResolutionQuery,
+    SearchAreaInterpretation,
 )
 
 
@@ -206,6 +207,11 @@ class _LocalizedLocationResolver:
     def opportunity_revision_id(self, proposal_id: str) -> str:
         return f"revision:{proposal_id}"
 
+    def resolve_location_mention(
+        self, query: LocationResolutionQuery
+    ) -> LocationResolution:
+        return self.resolve(query)
+
     def resolve(self, query: LocationResolutionQuery) -> LocationResolution:
         place_labels = {
             "en": "Central Station",
@@ -234,12 +240,26 @@ class _LocalizedLocationResolver:
                             iana_timezone="Europe/Paris",
                             resolver_version="controlled-resolver-v1",
                             glossary_version="location-glossary-v1",
+                            localized_display_names=tuple(
+                                (
+                                    locale,
+                                    label
+                                    if locale == query.locale
+                                    else place_labels["en"],
+                                )
+                                for locale, label in place_labels.items()
+                            ),
                         ),
                     ),
                     glossary_version="location-glossary-v1",
                 ),
             )
         )
+
+    def resolve_search_area(
+        self, query: LocationResolutionQuery
+    ) -> tuple[SearchAreaInterpretation, ...]:
+        return ()
 
 
 class _RussianOnlyLocationResolver(_LocalizedLocationResolver):

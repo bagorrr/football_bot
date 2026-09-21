@@ -476,6 +476,7 @@ def test_in_person_coaching_direction_persists_matches_and_renders(
         telegram_user_id=bot_user_id,
         text=requested_start_text,
     )
+    assert date_interpretation.queries[-1].update_id == f"start-date-value:{direction}"
     system.commit_coaching_search_detail(
         update_id=f"schedule-done:{direction}",
         telegram_user_id=bot_user_id,

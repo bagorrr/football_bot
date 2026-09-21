@@ -136,6 +136,7 @@ A Sub-city Area preserves its geographic type. Supported types include:
 
 - an official administrative district;
 - a neighborhood, microdistrict, or other named locality;
+- a named street;
 - the vicinity of a metro station or transport hub;
 - the vicinity of a known landmark;
 - a normalized address or its vicinity.
