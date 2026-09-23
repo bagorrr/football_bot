@@ -376,7 +376,7 @@ def build_runtime_service(
             telegram_admin_user_id=int(admin_id),
         )
         handler = BotApiConversationHandler(
-            cast(Any, application),
+            application._conversation_onboarding(),
             administrator_user_id=bot_api.configuration.administrator_user_id,
         )
         ingress = BotApiIngress(

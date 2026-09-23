@@ -11,6 +11,7 @@ from typing import Any, cast
 import pytest
 
 from apps import runtime_service
+from modules.bot_api import BotApiUpdate
 from modules.contracts import ContractEnvelope, ContractName, RuntimeRole
 from modules.domain import (
     IngestionFailureReason,
@@ -107,6 +108,7 @@ def test_bot_assistant_production_composition_uses_real_adapters_and_t1_boundary
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from modules import postgres_adapter
+    from modules.application import ConversationOnboarding
     from modules.codex_bot_assistant_adapter import CodexSdkBotAssistantAdapter
     from modules.codex_semantic_adapters import (
         CodexConversationLanguageAdapter,
@@ -114,6 +116,18 @@ def test_bot_assistant_production_composition_uses_real_adapters_and_t1_boundary
     )
 
     monkeypatch.setattr(postgres_adapter, "PostgresRoleStore", _ReadyStore)
+    started: list[tuple[str, int, str | None]] = []
+
+    def record_start(
+        _onboarding: ConversationOnboarding,
+        *,
+        update_id: str,
+        telegram_user_id: int,
+        telegram_language_hint: str | None,
+    ) -> None:
+        started.append((update_id, telegram_user_id, telegram_language_hint))
+
+    monkeypatch.setattr(ConversationOnboarding, "start", record_start)
 
     service = runtime_service.build_runtime_service(
         "bot_assistant",
@@ -150,6 +164,21 @@ def test_bot_assistant_production_composition_uses_real_adapters_and_t1_boundary
     assert service.application.telegram_admin_user_id == 123456
     assert service.application.telegram_ingestion is None
     assert service.bot_api_conformance is not None
+
+    assert service.bot_api_ingress.consumer(
+        BotApiUpdate.from_mapping(
+            {
+                "update_id": 20,
+                "message": {
+                    "message_id": 1,
+                    "from": {"id": 111222, "language_code": "ru"},
+                    "chat": {"id": 111222, "type": "private"},
+                    "text": "/start",
+                },
+            }
+        )
+    )
+    assert started == [("20", 111222, "ru")]
 
 
 def test_runtime_readiness_uses_only_read_only_bot_api_checks(
