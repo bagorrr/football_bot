@@ -487,6 +487,69 @@ SQL
 
 Never drop a role that owns a retained schema.
 
+### T2 checkpoint stop-condition recovery
+
+The repository includes one separate, operator-only recovery path for the
+specific case where every currently enabled Source Chat has an existing,
+current-generation `source_stream|checkpoint_unavailable` failure. It does not
+initialize checkpoints, capture Telegram state, replay history, alter offsets,
+or remove any outbox or deletion-barrier record. It only changes the validated
+failure rows' `active` flag.
+
+This command must use a separately authorized recovery database connection. Do
+not use a runtime URL or `MIGRATION_DATABASE_URL`; the command rejects all five
+runtime roles and `football_migrations`, and requires the connection to have
+`SELECT,UPDATE` on `football_runtime.ingestion_failures` plus RLS bypass through
+the approved database-operator identity. Keep the URL password in the
+protected `PGPASSFILE`, never in a command line or transcript.
+
+Stop all five long-running services and record a custom-format backup,
+successful `pg_restore --list`, and a successful isolated restore before the
+recovery. With the services still stopped, inspect the failure identities using
+the recovery connection. This is read-only and prints no message content:
+
+```text
+psql "${RECOVERY_DATABASE_URL}" -X --set=ON_ERROR_STOP=1 \
+  --tuples-only --no-align <<'SQL'
+SELECT failure_id, peer_kind, telegram_chat_id, registry_generation
+FROM football_runtime.ingestion_failures
+WHERE scope = 'source_stream'
+  AND failure_reason = 'checkpoint_unavailable'
+  AND active
+ORDER BY failure_id;
+SQL
+```
+
+Confirm that the report contains exactly the four intended current-generation
+rows. Run the recovery only with those exact UUIDs and with every evidence
+flag. The command performs a transaction-local advisory lock, verifies the
+four enabled Source Chats, their generation-bound activation boundaries,
+account/channel checkpoints, completed seven-day history rows, and the exact
+confirmed failure identities before the narrow update. Its output contains
+only redacted before/after counts:
+
+```text
+/opt/football-bot/current/.venv/bin/python -I -B \
+  /opt/football-bot/current/apps/t2_checkpoint_recovery.py \
+  --apply \
+  --services-stopped \
+  --backup-verified \
+  --isolated-restore-verified \
+  --rollback-ready \
+  --failure-id '<uuid-1>' \
+  --failure-id '<uuid-2>' \
+  --failure-id '<uuid-3>' \
+  --failure-id '<uuid-4>'
+```
+
+Any scope, identity, generation, count, checkpoint, evidence, or postflight
+mismatch blocks the transaction. A successful second run with the same four
+UUIDs is a no-op and reports zero deactivated failures. If the command is
+blocked or its outcome is uncertain, keep all services stopped, retain the
+backup, and reconcile before retrying. Restoring the verified backup is a
+separate explicit recovery decision; this command never performs it
+automatically.
+
 ## Protected acceptance gate
 
 Run the separately authorized protected live smoke only against the exact
