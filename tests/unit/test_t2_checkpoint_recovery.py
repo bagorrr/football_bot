@@ -162,6 +162,35 @@ def test_recovery_is_idempotent_and_preserves_checkpoint_state() -> None:
     ) == durable_state
 
 
+def test_recovery_ignores_inactive_historical_failure_for_current_generation() -> None:
+    snapshot = _snapshot()
+    current_failure_id = UUID("00000000-0000-0000-0000-000000000005")
+    historical_failure = replace(snapshot.failures[0], active=False)
+    current_failure = replace(
+        historical_failure,
+        failure_id=current_failure_id,
+        active=True,
+    )
+    store = _Store(
+        replace(
+            snapshot,
+            failures=(historical_failure, current_failure, *snapshot.failures[1:]),
+        )
+    )
+
+    report = recover_t2_checkpoint_state(
+        store=store,
+        confirmation=_confirmation(
+            (current_failure_id, *FAILURE_IDS[1:]),
+        ),
+    )
+
+    expected_active_ids = tuple(sorted((current_failure_id, *FAILURE_IDS[1:]), key=str))
+    assert report.before.active_checkpoint_failures == 4
+    assert report.after.active_checkpoint_failures == 0
+    assert store.clear_calls == [expected_active_ids]
+
+
 def test_recovery_requires_exact_current_failure_confirmation() -> None:
     store = _Store(_snapshot())
 

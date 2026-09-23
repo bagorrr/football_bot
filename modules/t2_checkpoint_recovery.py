@@ -454,6 +454,7 @@ def _plan_recovery(
     current_failures: dict[
         tuple[TelegramPeerIdentity, int], T2CheckpointRecoveryFailure
     ] = {}
+    confirmed_failure_ids = set(confirmation.failure_ids)
     for failure in snapshot.failures:
         if (
             not isinstance(failure.failure_id, UUID)
@@ -469,9 +470,14 @@ def _plan_recovery(
         key = (failure.source_chat_identity, failure.registry_generation)
         if key not in expected_keys:
             continue
-        if key in current_failures:
-            _fail(T2CheckpointRecoveryReason.FAILURE_MISMATCH)
-        current_failures[key] = failure
+        existing = current_failures.get(key)
+        if existing is None:
+            current_failures[key] = failure
+        elif existing.active:
+            if failure.active:
+                _fail(T2CheckpointRecoveryReason.FAILURE_MISMATCH)
+        elif failure.active or failure.failure_id in confirmed_failure_ids:
+            current_failures[key] = failure
     if set(current_failures) != expected_keys:
         _fail(T2CheckpointRecoveryReason.FAILURE_MISMATCH)
     for key, failure in current_failures.items():
