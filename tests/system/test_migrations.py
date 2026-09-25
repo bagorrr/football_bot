@@ -120,7 +120,6 @@ def separate_migration_database_login(
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
     assert [path.name for path in _migration_paths()][-20:] == [
-        "0049_result_conversation.sql",
         "0050_bot_assistant_execution.sql",
         "0051_source_data_deletion.sql",
         "0052_source_data_deletion_review_fixes.sql",
@@ -140,6 +139,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0066_source_chat_ingestion_checkpoint_read_policy.sql",
         "0067_one_source_gap_boundary.sql",
         "0068_gap_edit_existing_message_read.sql",
+        "0069_gap_history_admission_boundary.sql",
     ]
 
 
