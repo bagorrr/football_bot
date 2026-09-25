@@ -220,6 +220,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0065_source_chat_ingestion_read_policy.sql",
     "0066_source_chat_ingestion_checkpoint_read_policy.sql",
     "0067_one_source_gap_boundary.sql",
+    "0068_gap_edit_existing_message_read.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -291,6 +292,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "d705c082f90d75f1884cf745044eba9aed5d279f72ae36c51aa92fb31f5a3dd4",
     "1b58be73fb4ebee429eacf48f7342c8e44964200d30dedbaebba6652e3f4669f",
     "4b40f90b297e97b39702aab3b2874f2d41c9441bb69d3ca40255cbeda8e78b35",
+    "22b0409593e3f5a2544d542d6712ac98f94d8fe4efccc0cf675e5ad2d3bdf078",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -6009,20 +6011,14 @@ class PostgresRoleStore:
                 if gap_row is None:
                     raise LookupError("Source Chat gap boundary is unavailable")
                 gap_boundary_at = gap_row["gap_started_at"]
-                if (
-                    event.kind is SourceEventKind.EDIT
-                    and gap_boundary_at is not None
-                    and (
-                        event.message_created_at is None
-                        or event.message_created_at <= gap_boundary_at
-                    )
-                ):
-                    prior_event = connection.execute(
+                if event.kind is SourceEventKind.EDIT and gap_boundary_at is not None:
+                    prior_create = connection.execute(
                         """
                         SELECT 1 FROM football_runtime.source_event_records
                         WHERE peer_kind = %s AND telegram_chat_id = %s
                           AND registry_generation = %s
                           AND telegram_message_id = %s
+                          AND event_kind = 'create'
                         LIMIT 1
                         """,
                         (
@@ -6032,7 +6028,42 @@ class PostgresRoleStore:
                             event.telegram_message_id,
                         ),
                     ).fetchone()
-                    if prior_event is None:
+                    existing_message = connection.execute(
+                        """
+                        SELECT football_runtime.source_message_exists_for_ingestion(
+                            %s, %s, %s, %s
+                        ) AS exists_for_ingestion
+                        """,
+                        (
+                            identity.kind.value,
+                            identity.telegram_id,
+                            registry_generation,
+                            event.telegram_message_id,
+                        ),
+                    ).fetchone()
+                    if prior_create is None and not (
+                        existing_message is not None
+                        and existing_message["exists_for_ingestion"]
+                    ):
+                        skip_envelope = replace(
+                            envelope,
+                            subject_id=f"gap-boundary-edit-skip:{envelope.message_id}",
+                            subject_revision=1,
+                            idempotency_key=(
+                                f"gap-boundary-edit-skipped:{envelope.message_id}"
+                            ),
+                            payload={
+                                "ingestion_outcome_id": str(envelope.message_id),
+                                "outcome": "gap_boundary_edit_skipped",
+                                "source_chat_key": peer_key,
+                                "telegram_peer_kind": identity.kind.value,
+                                "telegram_chat_id": identity.telegram_id,
+                                "registry_generation": registry_generation,
+                            },
+                        )
+                        _insert_outbox(connection, skip_envelope)
+                        if inject_database_failure:
+                            raise OutboxConflictError
                         advance_history_progress("not_processable")
                         advance_checkpoint()
                         return True
@@ -6476,7 +6507,10 @@ class PostgresRoleStore:
                     received_at,
                 ),
             )
-            if payload.get("outcome") == "protected_content_skipped":
+            if payload.get("outcome") in {
+                "protected_content_skipped",
+                "gap_boundary_edit_skipped",
+            }:
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
             event_time = datetime.fromisoformat(str(payload["event_time"]))

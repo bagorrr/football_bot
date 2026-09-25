@@ -4815,6 +4815,23 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
                 identity=identity, registry_generation=1
             )
             checkpoint = TelegramChannelCheckpoint(101)
+            telethon.add_channel_difference_event(
+                identity=identity,
+                from_checkpoint=checkpoint,
+                to_checkpoint=TelegramChannelCheckpoint(102),
+                source_event_id="source-event:known-before-gap-edit",
+                telegram_message_id=998,
+                revision=2,
+                kind=SourceEventKind.EDIT,
+                body="Earlier first-seen edit that became a Source Message.",
+                event_time=start + timedelta(milliseconds=800),
+                message_created_at=start + timedelta(milliseconds=500),
+                registry_generation=1,
+            )
+            assert system.process_next_channel_telegram_difference(
+                identity=identity, registry_generation=1
+            )
+            checkpoint = TelegramChannelCheckpoint(102)
         telethon.add_difference_too_long_channel_difference(
             identity=identity, checkpoint=checkpoint
         )
@@ -4827,7 +4844,7 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
     )
     while system.process_next_source_event():
         pass
-    assert len(system.source_messages()) == 1
+    assert len(system.source_messages()) == 2
 
     failures = system.ingestion_failures()
     selected = next(
@@ -4851,7 +4868,7 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
         identity=identities[0],
         registry_generation=1,
         failure_id=selected.ingestion_failure_id,
-        expected_previous_pts=101,
+        expected_previous_pts=102,
         services_stopped=True,
         backup_digest_verified=True,
         isolated_restore_verified=True,
@@ -4876,7 +4893,7 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
         3,
         1,
     )
-    assert len(system.source_messages()) == 1
+    assert len(system.source_messages()) == 2
     with psycopg.connect(fresh_database_url) as connection:
         assert connection.execute(
             "SELECT count(*) FROM football_runtime.ingestion_failures WHERE active"
@@ -4905,7 +4922,7 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
     assert system.process_next_channel_telegram_difference(
         identity=identities[0], registry_generation=1
     )
-    assert len(system.source_events()) == 1
+    assert len(system.source_events()) == 2
 
     telethon.add_channel_difference_event(
         identity=identities[0],
@@ -4917,16 +4934,37 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
         kind=SourceEventKind.EDIT,
         body="An edited message from the unprocessed interval.",
         event_time=boundary_at + timedelta(seconds=1),
-        message_created_at=pre_capture_at + timedelta(seconds=1),
+        message_created_at=boundary_at + timedelta(seconds=1),
         registry_generation=1,
     )
     clock.advance_to(boundary_at + timedelta(seconds=2))
+    with pytest.raises(InjectedFailureError):
+        system.process_next_channel_telegram_difference(
+            identity=identities[0],
+            registry_generation=1,
+            inject_database_failure=True,
+        )
+    assert system.channel_ingestion_checkpoint(
+        identity=identities[0], registry_generation=1
+    ) == TelegramChannelCheckpoint(111)
+    assert len(system.source_event_contracts()) == 2
     assert system.process_next_channel_telegram_difference(
         identity=identities[0], registry_generation=1
     )
-    assert len(system.source_events()) == 1
-    assert not system.process_next_source_event()
-    assert len(system.source_messages()) == 1
+    assert len(system.source_events()) == 2
+    assert system.channel_ingestion_checkpoint(
+        identity=identities[0], registry_generation=1
+    ) == TelegramChannelCheckpoint(112)
+    assert system.process_next_source_event()
+    assert len(system.source_messages()) == 2
+    skip = system.source_event_contracts()[-1]
+    assert isinstance(skip.payload, dict)
+    assert skip.payload["outcome"] == "gap_boundary_edit_skipped"
+    assert "An edited message from the unprocessed interval." not in repr(skip)
+    assert system.protected_content_skips() == ()
+    assert not system.classifier_commands_for_revision(
+        "source-chat:channel:4800500:generation:1:message:1000:revision:2"
+    )
 
     telethon.add_channel_difference_event(
         identity=identities[0],
@@ -4944,9 +4982,9 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
     assert system.process_next_channel_telegram_difference(
         identity=identities[0], registry_generation=1
     )
-    assert len(system.source_events()) == 2
+    assert len(system.source_events()) == 3
     assert system.process_next_source_event()
-    assert len(system.source_messages()) == 2
+    assert len(system.source_messages()) == 3
 
     telethon.add_channel_difference_event(
         identity=identities[0],
@@ -4957,7 +4995,7 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
         revision=2,
         kind=SourceEventKind.EDIT,
         body="First observed edit of a post-boundary message.",
-        event_time=boundary_at + timedelta(seconds=5),
+        event_time=boundary_at + timedelta(seconds=3),
         message_created_at=boundary_at + timedelta(seconds=3),
         registry_generation=1,
     )
@@ -4965,16 +5003,26 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
     assert system.process_next_channel_telegram_difference(
         identity=identities[0], registry_generation=1
     )
+    assert system.channel_ingestion_checkpoint(
+        identity=identities[0], registry_generation=1
+    ) == TelegramChannelCheckpoint(114)
     assert system.process_next_source_event()
     assert len(system.source_messages()) == 3
+    skip = system.source_event_contracts()[-1]
+    assert isinstance(skip.payload, dict)
+    assert skip.payload["outcome"] == "gap_boundary_edit_skipped"
+    assert "First observed edit of a post-boundary message." not in repr(skip)
+    assert not system.classifier_commands_for_revision(
+        "source-chat:channel:4800500:generation:1:message:1002:revision:2"
+    )
 
     telethon.add_channel_difference_event(
         identity=identities[0],
         from_checkpoint=TelegramChannelCheckpoint(114),
         to_checkpoint=TelegramChannelCheckpoint(115),
         source_event_id="source-event:existing-before-gap-edit",
-        telegram_message_id=999,
-        revision=2,
+        telegram_message_id=998,
+        revision=3,
         kind=SourceEventKind.EDIT,
         body="Earlier durable source message, edited later.",
         event_time=boundary_at + timedelta(seconds=7),
@@ -4989,8 +5037,40 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
     messages = {
         message.telegram_message_id: message for message in system.source_messages()
     }
-    assert set(messages) == {999, 1001, 1002}
-    assert messages[999].body == "Earlier durable source message, edited later."
+    assert set(messages) == {998, 999, 1001}
+    assert messages[998].body == "Earlier durable source message, edited later."
+
+    telethon.add_channel_difference_event(
+        identity=identities[0],
+        from_checkpoint=TelegramChannelCheckpoint(115),
+        to_checkpoint=TelegramChannelCheckpoint(116),
+        source_event_id="source-event:known-after-gap-edit",
+        telegram_message_id=1001,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body="Fresh source message, edited after its durable create.",
+        event_time=boundary_at + timedelta(seconds=9),
+        message_created_at=boundary_at,
+        registry_generation=1,
+    )
+    clock.advance_to(boundary_at + timedelta(seconds=10))
+    assert system.process_next_channel_telegram_difference(
+        identity=identities[0], registry_generation=1
+    )
+    assert system.process_next_source_event()
+    messages = {
+        message.telegram_message_id: message for message in system.source_messages()
+    }
+    assert messages[1001].body == (
+        "Fresh source message, edited after its durable create."
+    )
+    assert all(
+        system.channel_ingestion_checkpoint(
+            identity=identity, registry_generation=index + 1
+        )
+        == TelegramChannelCheckpoint(100 + index)
+        for index, identity in enumerate(identities[1:], start=1)
+    )
 
 
 def test_session_revocation_stops_the_whole_ingestion_role() -> None:

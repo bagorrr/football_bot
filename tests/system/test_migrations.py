@@ -119,7 +119,7 @@ def separate_migration_database_login(
 
 def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None:
     """Keep post-main migrations in one contiguous numeric range."""
-    assert [path.name for path in _migration_paths()][-19:] == [
+    assert [path.name for path in _migration_paths()][-20:] == [
         "0049_result_conversation.sql",
         "0050_bot_assistant_execution.sql",
         "0051_source_data_deletion.sql",
@@ -139,6 +139,7 @@ def test_live_main_migrations_precede_the_contiguous_source_chat_range() -> None
         "0065_source_chat_ingestion_read_policy.sql",
         "0066_source_chat_ingestion_checkpoint_read_policy.sql",
         "0067_one_source_gap_boundary.sql",
+        "0068_gap_edit_existing_message_read.sql",
     ]
 
 
@@ -1028,6 +1029,21 @@ def test_ingestion_source_chat_projections_are_read_only_under_force_rls(
             """,
             (recorded_at,),
         )
+        connection.execute(
+            """
+            INSERT INTO football_runtime.source_messages (
+                source_message_id, peer_kind, telegram_chat_id,
+                registry_generation, telegram_message_id,
+                current_revision, event_kind, body, event_time,
+                recorded_at, tombstoned, bounded_metadata
+            ) VALUES (
+                'source-chat:channel:4303:generation:1:message:99',
+                'channel', 4303, 1, 99, 1, 'create', 'Known message',
+                %s, %s, false, %s::jsonb
+            )
+            """,
+            (recorded_at, recorded_at, json.dumps(empty_bounded_source_metadata())),
+        )
 
     ingestion_url = runtime_database_url(
         fresh_database_url,
@@ -1057,6 +1073,19 @@ def test_ingestion_source_chat_projections_are_read_only_under_force_rls(
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             connection.execute(
                 "SELECT peer_kind FROM football_runtime.source_chat_registry"
+            ).fetchall()
+        assert connection.execute(
+            """
+            SELECT football_runtime.source_message_exists_for_ingestion(
+                'channel', 4303, 1, 99
+            ), football_runtime.source_message_exists_for_ingestion(
+                'channel', 4303, 1, 100
+            )
+            """
+        ).fetchone() == (True, False)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute(
+                "SELECT body FROM football_runtime.source_messages"
             ).fetchall()
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             connection.execute(
