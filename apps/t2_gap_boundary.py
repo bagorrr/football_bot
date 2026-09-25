@@ -183,10 +183,24 @@ def _backup_verified(path: Path, digest: str) -> bool:
 
 def _confirmation() -> T2GapBoundaryConfirmation:
     raw_path = os.environ.get(_MANIFEST_ENV, "")
-    if not raw_path or not _private_file(Path(raw_path)):
+    path = Path(raw_path)
+    if not raw_path or not path.is_absolute():
         raise ValueError
     try:
-        manifest = json.loads(Path(raw_path).read_text(encoding="utf-8"))
+        if path.is_relative_to(_ROOT) or path.resolve(strict=True).is_relative_to(
+            _ROOT
+        ):
+            raise ValueError
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, encoding="utf-8") as confirmation_file:
+            info = os.fstat(confirmation_file.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != 0
+                or info.st_mode & 0o7777 != 0o600
+            ):
+                raise ValueError
+            manifest = json.load(confirmation_file)
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise ValueError from None
     if not isinstance(manifest, dict) or set(manifest) != _MANIFEST_KEYS:
@@ -247,7 +261,7 @@ class _CurrentProvider:
 
     def capture_channel_checkpoint(
         self, identity: TelegramPeerIdentity
-    ) -> TelegramChannelCheckpoint:
+    ) -> tuple[TelegramChannelCheckpoint, datetime]:
         if not _services_stopped():
             raise T2CheckpointRecoveryError(
                 reason=T2CheckpointRecoveryReason.SERVICES_NOT_STOPPED
@@ -262,24 +276,23 @@ class _CurrentProvider:
             transport=provider, approved_source_chats=(identity,)
         )
         checkpoint = provider.capture_channel_checkpoint(identity)
+        captured_at = datetime.now(UTC)
         if not _services_stopped():
             raise T2CheckpointRecoveryError(
                 reason=T2CheckpointRecoveryReason.SERVICES_NOT_STOPPED
             )
-        return checkpoint
+        return checkpoint, captured_at
 
 
 def _run() -> T2GapBoundaryReport:
     confirmation = _confirmation()
-    boundary_at = datetime.now(UTC)
-    validate_t2_gap_confirmation(confirmation, boundary_at)
+    validate_t2_gap_confirmation(confirmation, datetime.now(UTC))
     database_url = os.environ.get(_DATABASE_ENV)
     if not database_url:
         raise ValueError
     return PostgresT2GapBoundaryRecovery(database_url).recover(
         source=_CurrentProvider(),
         confirmation=confirmation,
-        boundary_at=boundary_at,
     )
 
 

@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
+import os
+import stat
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
 
 from apps import t2_checkpoint_recovery as recovery_app
+from apps import t2_gap_boundary as gap_app
 from modules.domain import (
     IngestionFailureReason,
     IngestionFailureScope,
@@ -26,6 +32,7 @@ from modules.t2_checkpoint_recovery import (
     T2CheckpointRecoverySnapshot,
     T2GapBoundaryConfirmation,
     T2GapBoundaryRecord,
+    T2GapBoundaryReport,
     recover_t2_checkpoint_state,
     recover_t2_gap_boundary,
 )
@@ -353,6 +360,76 @@ def test_recovery_requires_explicit_apply(
     )
 
 
+@pytest.mark.parametrize(
+    "provenance", ("user_owned", "wrong_mode", "inside_repo", "valid")
+)
+def test_gap_cli_enforces_confirmation_provenance_before_database(
+    provenance: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manifest = tmp_path / "confirmation.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "expected_revision": "a" * 40,
+                "peer_kind": "channel",
+                "telegram_chat_id": 1,
+                "registry_generation": 1,
+                "failure_id": str(FAILURE_IDS[0]),
+                "expected_previous_pts": 11,
+                "owner_decision_recorded": True,
+                "services_stopped": True,
+                "backup_path": str(tmp_path / "backup.dump"),
+                "backup_sha256": "b" * 64,
+                "isolated_restore_verified": True,
+                "isolated_restore_backup_sha256": "b" * 64,
+                "rollback_ready": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest.chmod(0o600)
+    if provenance == "inside_repo":
+        monkeypatch.setattr(gap_app, "_ROOT", tmp_path)
+    if provenance != "user_owned":
+        mode = 0o400 if provenance == "wrong_mode" else 0o600
+        monkeypatch.setattr(
+            os,
+            "fstat",
+            lambda _fd: SimpleNamespace(st_mode=stat.S_IFREG | mode, st_uid=0),
+        )
+    monkeypatch.setenv("T2_GAP_CONFIRMATION_FILE", str(manifest))
+    monkeypatch.setenv("RECOVERY_DATABASE_URL", "postgresql:///unused")
+    monkeypatch.setattr(gap_app, "_services_stopped", lambda: True)
+    monkeypatch.setattr(gap_app, "_backup_verified", lambda *_: True)
+    monkeypatch.setattr(gap_app, "_revision_verified", lambda *_: True)
+
+    database_opens: list[str] = []
+
+    class FakeRecovery:
+        def __init__(self, _database_url: str) -> None:
+            database_opens.append(_database_url)
+
+        def recover(self, **_kwargs: object) -> T2GapBoundaryReport:
+            return T2GapBoundaryReport(4, 3, True)
+
+    monkeypatch.setattr(gap_app, "PostgresT2GapBoundaryRecovery", FakeRecovery)
+
+    result = gap_app.main(["--apply"])
+    output = capsys.readouterr().out
+    if provenance == "valid":
+        assert (result, database_opens) == (0, ["postgresql:///unused"])
+        assert '"outcome":"pass"' in output
+    else:
+        assert (result, database_opens) == (78, [])
+        assert output == (
+            '{"event":"t2_gap_boundary","outcome":"blocked",'
+            '"reason":"configuration_invalid"}\n'
+        )
+
+
 def test_confirmed_gap_boundary_is_durable_and_exact_repeat_is_inert() -> None:
     snapshot = _gap_snapshot()
 
@@ -392,20 +469,20 @@ def test_confirmed_gap_boundary_is_durable_and_exact_repeat_is_inert() -> None:
 
         def capture_channel_checkpoint(
             self, identity: TelegramPeerIdentity
-        ) -> TelegramChannelCheckpoint:
+        ) -> tuple[TelegramChannelCheckpoint, datetime]:
             assert identity == IDENTITIES[0]
             self.calls += 1
-            return TelegramChannelCheckpoint(pts=21)
+            return TelegramChannelCheckpoint(pts=21), NOW + timedelta(seconds=2)
 
     store = GapStore(snapshot)
     source = Source()
     confirmation = _gap_confirmation()
 
     first = recover_t2_gap_boundary(
-        source=source, store=store, confirmation=confirmation, boundary_at=NOW
+        source=source, store=store, confirmation=confirmation
     )
     second = recover_t2_gap_boundary(
-        source=source, store=store, confirmation=confirmation, boundary_at=NOW
+        source=source, store=store, confirmation=confirmation
     )
 
     assert (first.advanced, second.advanced, source.calls) == (True, False, 1)
@@ -417,7 +494,7 @@ def test_confirmed_gap_boundary_is_durable_and_exact_repeat_is_inert() -> None:
         new_pts=21,
         old_processing_started_at=NOW,
         old_transport_boundary="channel-pts:11",
-        new_processing_started_at=NOW,
+        new_processing_started_at=NOW + timedelta(seconds=2),
     )
     assert store.snapshot.channel_checkpoints[1:] == snapshot.channel_checkpoints[1:]
     assert store.snapshot.failures[1:] == snapshot.failures[1:]
@@ -435,15 +512,14 @@ def test_gap_boundary_refuses_a_nonadvancing_provider_cursor() -> None:
     class Source:
         def capture_channel_checkpoint(
             self, identity: TelegramPeerIdentity
-        ) -> TelegramChannelCheckpoint:
-            return TelegramChannelCheckpoint(11)
+        ) -> tuple[TelegramChannelCheckpoint, datetime]:
+            return TelegramChannelCheckpoint(11), NOW
 
     with pytest.raises(T2CheckpointRecoveryError) as raised:
         recover_t2_gap_boundary(
             source=Source(),
             store=Store(_gap_snapshot()),
             confirmation=_gap_confirmation(),
-            boundary_at=NOW,
         )
 
     assert (

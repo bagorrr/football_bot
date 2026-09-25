@@ -192,7 +192,7 @@ class T2GapBoundaryReport:
 class T2GapBoundarySource(Protocol):
     def capture_channel_checkpoint(
         self, identity: TelegramPeerIdentity
-    ) -> TelegramChannelCheckpoint: ...
+    ) -> tuple[TelegramChannelCheckpoint, datetime]: ...
 
 
 class T2GapBoundaryStore(Protocol):
@@ -210,7 +210,6 @@ def recover_t2_gap_boundary(
     source: T2GapBoundarySource,
     store: T2GapBoundaryStore,
     confirmation: T2GapBoundaryConfirmation,
-    boundary_at: datetime,
 ) -> T2GapBoundaryReport:
     """Move one stopped channel to a freshly captured provider boundary.
 
@@ -218,7 +217,7 @@ def recover_t2_gap_boundary(
     postflight inside one transaction. The stopped interval remains in a
     body-free recovery record and is never read from message history.
     """
-    validate_t2_gap_confirmation(confirmation, boundary_at)
+    _validate_gap_prerequisites(confirmation)
     before = store.read_snapshot(confirmed_failure_ids=(confirmation.failure_id,))
     prior_gap = store.read_gap(confirmation.failure_id)
     _validate_gap_snapshot(before, confirmation, prior_gap)
@@ -233,10 +232,8 @@ def recover_t2_gap_boundary(
     original = next(
         boundary for boundary in before.activation_boundaries if boundary[:2] == key
     )
-    if boundary_at < original[2]:
-        _fail(T2CheckpointRecoveryReason.CHECKPOINT_MISMATCH)
     try:
-        provider = source.capture_channel_checkpoint(confirmation.identity)
+        provider, boundary_at = source.capture_channel_checkpoint(confirmation.identity)
     except T2CheckpointRecoveryError:
         raise
     except Exception:
@@ -247,6 +244,9 @@ def recover_t2_gap_boundary(
         or not confirmation.expected_previous_pts < provider.pts <= _POSTGRES_BIGINT_MAX
     ):
         _fail(T2CheckpointRecoveryReason.PROVIDER_BOUNDARY_UNAVAILABLE)
+    validate_t2_gap_confirmation(confirmation, boundary_at)
+    if boundary_at < original[2]:
+        _fail(T2CheckpointRecoveryReason.CHECKPOINT_MISMATCH)
     boundary = T2GapBoundaryRecord(
         failure_id=confirmation.failure_id,
         identity=confirmation.identity,
@@ -300,6 +300,12 @@ def recover_t2_gap_boundary(
 def validate_t2_gap_confirmation(
     confirmation: T2GapBoundaryConfirmation, boundary_at: datetime
 ) -> None:
+    _validate_gap_prerequisites(confirmation)
+    if not isinstance(boundary_at, datetime) or boundary_at.tzinfo is None:
+        _fail(T2CheckpointRecoveryReason.CONFIGURATION_INVALID)
+
+
+def _validate_gap_prerequisites(confirmation: T2GapBoundaryConfirmation) -> None:
     if not confirmation.services_stopped:
         _fail(T2CheckpointRecoveryReason.SERVICES_NOT_STOPPED)
     if not confirmation.backup_digest_verified:
@@ -320,8 +326,6 @@ def validate_t2_gap_confirmation(
         or not isinstance(confirmation.failure_id, UUID)
         or type(confirmation.expected_previous_pts) is not int
         or confirmation.expected_previous_pts < 0
-        or not isinstance(boundary_at, datetime)
-        or boundary_at.tzinfo is None
     ):
         _fail(T2CheckpointRecoveryReason.CONFIGURATION_INVALID)
 
@@ -525,7 +529,6 @@ class PostgresT2GapBoundaryRecovery:
         *,
         source: T2GapBoundarySource,
         confirmation: T2GapBoundaryConfirmation,
-        boundary_at: datetime,
     ) -> T2GapBoundaryReport:
         try:
             with psycopg.connect(
@@ -547,7 +550,6 @@ class PostgresT2GapBoundaryRecovery:
                     source=source,
                     store=_PostgresRecoveryTransaction(connection),
                     confirmation=confirmation,
-                    boundary_at=boundary_at,
                 )
         except T2CheckpointRecoveryError:
             raise

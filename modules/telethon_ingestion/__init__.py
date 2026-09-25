@@ -3007,6 +3007,16 @@ class TelethonProvider:
         resolved_kind = kind or (
             SourceEventKind.EDIT if edit_date is not None else SourceEventKind.CREATE
         )
+        message_created_at = getattr(message, "date", None)
+        if message_created_at is not None and (
+            not isinstance(message_created_at, datetime)
+            or message_created_at.tzinfo is None
+        ):
+            raise TelethonTransportError(
+                "Telegram message creation time is unavailable",
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+                scope=IngestionFailureScope.SOURCE_STREAM,
+            )
         derived_transport_event_id, derived_transport_order = self._transport_details(
             kind=resolved_kind,
             message_id=message_id,
@@ -3064,6 +3074,7 @@ class TelethonProvider:
                 revision=revision,
                 kind=resolved_kind,
                 event_time=event_time,
+                message_created_at=message_created_at,
                 registry_generation=generation,
                 from_history=from_history,
                 transport_event_id=transport_event_id,
@@ -3090,6 +3101,7 @@ class TelethonProvider:
             kind=resolved_kind,
             body=body,
             event_time=event_time,
+            message_created_at=message_created_at,
             registry_generation=generation,
             bounded_metadata=bounded_metadata,
             reply_to_telegram_message_id=reply_to_message_id,

@@ -1578,7 +1578,7 @@ def _validate_source_event_recorded(
     ):
         raise TypeError("SourceEventRecorded transport boundary proof is invalid")
     if transport_proven_post_boundary and (
-        from_history or peer_kind != "channel" or event_kind != "edit"
+        from_history or peer_kind != "channel" or event_kind not in {"create", "edit"}
     ):
         raise ValueError("SourceEventRecorded transport boundary proof is invalid")
     event_time = datetime.fromisoformat(_required_text(payload, "event_time"))

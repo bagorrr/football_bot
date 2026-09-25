@@ -2387,6 +2387,7 @@ def test_restarted_provider_distinguishes_same_time_edit_pts_occurrences() -> No
         revision_history_lookup=revision_history,
     ).get_channel_difference_event(identity, checkpoint, 1)
     assert isinstance(first, TelegramDifferenceEvent)
+    assert first.message_created_at == event_time
     durable_history.append(
         (
             first.revision,
