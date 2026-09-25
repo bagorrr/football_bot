@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, NoReturn, Protocol
@@ -57,6 +57,9 @@ class T2CheckpointRecoveryReason(StrEnum):
     ACCESS_DENIED = "access_denied"
     DATABASE_UNAVAILABLE = "database_unavailable"
     DATABASE_FAILED = "database_failed"
+    REVISION_MISMATCH = "revision_mismatch"
+    OWNER_DECISION_MISSING = "owner_decision_missing"
+    PROVIDER_BOUNDARY_UNAVAILABLE = "provider_boundary_unavailable"
 
 
 class T2CheckpointRecoveryError(RuntimeError):
@@ -104,6 +107,8 @@ class T2CheckpointRecoverySnapshot:
         tuple[TelegramPeerIdentity, int, TelegramHistoryProgress], ...
     ]
     failures: tuple[T2CheckpointRecoveryFailure, ...]
+    active_global_failures: int = 0
+    gap_boundaries: tuple[T2GapBoundaryRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +148,288 @@ class T2CheckpointRecoveryStore(Protocol):
     ) -> tuple[UUID, ...]:
         """Deactivate exactly the already-validated active failure rows."""
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class T2GapBoundaryConfirmation:
+    """Private operator selection and verified prerequisites for one gap."""
+
+    identity: TelegramPeerIdentity
+    registry_generation: int
+    failure_id: UUID
+    expected_previous_pts: int
+    services_stopped: bool
+    backup_digest_verified: bool
+    isolated_restore_verified: bool
+    rollback_ready: bool
+    revision_verified: bool
+    owner_decision_recorded: bool
+
+
+@dataclass(frozen=True, slots=True)
+class T2GapBoundaryRecord:
+    """Body-free audit of the interval skipped by the new provider cursor."""
+
+    failure_id: UUID
+    identity: TelegramPeerIdentity
+    registry_generation: int
+    old_pts: int
+    new_pts: int
+    old_processing_started_at: datetime
+    old_transport_boundary: str
+    new_processing_started_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class T2GapBoundaryReport:
+    """Redacted status; no peer identifiers or checkpoint values."""
+
+    before_active_source_failures: int
+    after_active_source_failures: int
+    advanced: bool
+
+
+class T2GapBoundarySource(Protocol):
+    def capture_channel_checkpoint(
+        self, identity: TelegramPeerIdentity
+    ) -> tuple[TelegramChannelCheckpoint, datetime]: ...
+
+
+class T2GapBoundaryStore(Protocol):
+    def read_snapshot(
+        self, *, confirmed_failure_ids: tuple[UUID, ...]
+    ) -> T2CheckpointRecoverySnapshot: ...
+
+    def read_gap(self, failure_id: UUID) -> T2GapBoundaryRecord | None: ...
+
+    def apply_gap(self, boundary: T2GapBoundaryRecord) -> None: ...
+
+
+def recover_t2_gap_boundary(
+    *,
+    source: T2GapBoundarySource,
+    store: T2GapBoundaryStore,
+    confirmation: T2GapBoundaryConfirmation,
+) -> T2GapBoundaryReport:
+    """Move one stopped channel to a freshly captured provider boundary.
+
+    The PostgreSQL store keeps preflight, provider capture, mutation, and
+    postflight inside one transaction. The stopped interval remains in a
+    body-free recovery record and is never read from message history.
+    """
+    _validate_gap_prerequisites(confirmation)
+    before = store.read_snapshot(confirmed_failure_ids=(confirmation.failure_id,))
+    prior_gap = store.read_gap(confirmation.failure_id)
+    _validate_gap_snapshot(before, confirmation, prior_gap)
+    if prior_gap is not None:
+        return T2GapBoundaryReport(
+            before_active_source_failures=_active_source_failure_count(before),
+            after_active_source_failures=_active_source_failure_count(before),
+            advanced=False,
+        )
+
+    key = (confirmation.identity, confirmation.registry_generation)
+    original = next(
+        boundary for boundary in before.activation_boundaries if boundary[:2] == key
+    )
+    try:
+        provider, boundary_at = source.capture_channel_checkpoint(confirmation.identity)
+    except T2CheckpointRecoveryError:
+        raise
+    except Exception:
+        _fail(T2CheckpointRecoveryReason.PROVIDER_BOUNDARY_UNAVAILABLE)
+    if (
+        not isinstance(provider, TelegramChannelCheckpoint)
+        or type(provider.pts) is not int
+        or not confirmation.expected_previous_pts < provider.pts <= _POSTGRES_BIGINT_MAX
+    ):
+        _fail(T2CheckpointRecoveryReason.PROVIDER_BOUNDARY_UNAVAILABLE)
+    validate_t2_gap_confirmation(confirmation, boundary_at)
+    if boundary_at < original[2]:
+        _fail(T2CheckpointRecoveryReason.CHECKPOINT_MISMATCH)
+    boundary = T2GapBoundaryRecord(
+        failure_id=confirmation.failure_id,
+        identity=confirmation.identity,
+        registry_generation=confirmation.registry_generation,
+        old_pts=confirmation.expected_previous_pts,
+        new_pts=provider.pts,
+        old_processing_started_at=original[2],
+        old_transport_boundary=original[3],
+        new_processing_started_at=boundary_at,
+    )
+    store.apply_gap(boundary)
+    after = store.read_snapshot(confirmed_failure_ids=(confirmation.failure_id,))
+    if store.read_gap(confirmation.failure_id) != boundary:
+        _fail(T2CheckpointRecoveryReason.MUTATION_MISMATCH)
+    expected = replace(
+        before,
+        activation_boundaries=tuple(
+            (identity, generation, boundary_at, f"channel-pts:{provider.pts}")
+            if (identity, generation) == key
+            else item
+            for item in before.activation_boundaries
+            for identity, generation in (item[:2],)
+        ),
+        channel_checkpoints=tuple(
+            (identity, generation, provider) if (identity, generation) == key else item
+            for item in before.channel_checkpoints
+            for identity, generation in (item[:2],)
+        ),
+        failures=tuple(
+            replace(failure, active=False)
+            if failure.failure_id == confirmation.failure_id
+            else failure
+            for failure in before.failures
+        ),
+        gap_boundaries=tuple(
+            sorted(
+                (*before.gap_boundaries, boundary),
+                key=lambda item: str(item.failure_id),
+            )
+        ),
+    )
+    if after != expected:
+        _fail(T2CheckpointRecoveryReason.MUTATION_MISMATCH)
+    return T2GapBoundaryReport(
+        before_active_source_failures=_active_source_failure_count(before),
+        after_active_source_failures=_active_source_failure_count(after),
+        advanced=True,
+    )
+
+
+def validate_t2_gap_confirmation(
+    confirmation: T2GapBoundaryConfirmation, boundary_at: datetime
+) -> None:
+    _validate_gap_prerequisites(confirmation)
+    if not isinstance(boundary_at, datetime) or boundary_at.tzinfo is None:
+        _fail(T2CheckpointRecoveryReason.CONFIGURATION_INVALID)
+
+
+def _validate_gap_prerequisites(confirmation: T2GapBoundaryConfirmation) -> None:
+    if not confirmation.services_stopped:
+        _fail(T2CheckpointRecoveryReason.SERVICES_NOT_STOPPED)
+    if not confirmation.backup_digest_verified:
+        _fail(T2CheckpointRecoveryReason.BACKUP_NOT_VERIFIED)
+    if not confirmation.isolated_restore_verified:
+        _fail(T2CheckpointRecoveryReason.ISOLATED_RESTORE_NOT_VERIFIED)
+    if not confirmation.rollback_ready:
+        _fail(T2CheckpointRecoveryReason.ROLLBACK_NOT_READY)
+    if not confirmation.revision_verified:
+        _fail(T2CheckpointRecoveryReason.REVISION_MISMATCH)
+    if not confirmation.owner_decision_recorded:
+        _fail(T2CheckpointRecoveryReason.OWNER_DECISION_MISSING)
+    if (
+        not isinstance(confirmation.identity, TelegramPeerIdentity)
+        or confirmation.identity.kind is not TelegramPeerKind.CHANNEL
+        or type(confirmation.registry_generation) is not int
+        or confirmation.registry_generation < 1
+        or not isinstance(confirmation.failure_id, UUID)
+        or type(confirmation.expected_previous_pts) is not int
+        or confirmation.expected_previous_pts < 0
+    ):
+        _fail(T2CheckpointRecoveryReason.CONFIGURATION_INVALID)
+
+
+def _validate_gap_snapshot(
+    snapshot: T2CheckpointRecoverySnapshot,
+    confirmation: T2GapBoundaryConfirmation,
+    prior_gap: T2GapBoundaryRecord | None,
+) -> None:
+    try:
+        scope = validate_t2_checkpoint_scope(snapshot.active_scope)
+    except T2CheckpointBootstrapError:
+        _fail(T2CheckpointRecoveryReason.SCOPE_MISMATCH)
+    keys = set(scope)
+    key = (confirmation.identity, confirmation.registry_generation)
+    if key not in keys or snapshot.active_global_failures:
+        _fail(T2CheckpointRecoveryReason.SCOPE_MISMATCH)
+    boundaries = _boundary_map(snapshot, keys)
+    channels = _channel_map(snapshot, keys)
+    histories = _history_map(snapshot, keys)
+    if snapshot.account_checkpoint is None or not _valid_account_checkpoint(
+        snapshot.account_checkpoint
+    ):
+        _fail(T2CheckpointRecoveryReason.CHECKPOINT_MISMATCH)
+    for identity, generation in scope:
+        item = boundaries[(identity, generation)]
+        checkpoint = channels[(identity, generation)]
+        history_boundary = min(
+            (
+                gap.old_processing_started_at
+                for gap in snapshot.gap_boundaries
+                if (gap.identity, gap.registry_generation) == (identity, generation)
+            ),
+            default=item[2],
+        )
+        try:
+            expected_window = SourceChatHistoryWindow.before(history_boundary)
+        except ValueError:
+            _fail(T2CheckpointRecoveryReason.CHECKPOINT_MISMATCH)
+        progress = histories[(identity, generation)]
+        if (
+            item[2].tzinfo is None
+            or type(checkpoint.pts) is not int
+            or checkpoint.pts > _POSTGRES_BIGINT_MAX
+            or checkpoint.pts < _admission_pts(item[3])
+            or progress.completed is not True
+            or progress.last_outcome != "completed"
+            or progress.window_start != expected_window.start_at
+            or progress.window_end != expected_window.end_at
+        ):
+            _fail(T2CheckpointRecoveryReason.CHECKPOINT_MISMATCH)
+    selected_checkpoint = channels[key].pts
+    current: dict[tuple[TelegramPeerIdentity, int], T2CheckpointRecoveryFailure] = {}
+    for failure in snapshot.failures:
+        failure_key = (failure.source_chat_identity, failure.registry_generation)
+        if failure_key not in keys or not failure.active:
+            continue
+        if failure_key in current:
+            _fail(T2CheckpointRecoveryReason.FAILURE_MISMATCH)
+        current[failure_key] = failure
+    selected = next(
+        (
+            item
+            for item in snapshot.failures
+            if item.failure_id == confirmation.failure_id
+        ),
+        None,
+    )
+    if (
+        selected is None
+        or selected.scope is not IngestionFailureScope.SOURCE_STREAM
+        or selected.reason is not IngestionFailureReason.DIFFERENCE_TOO_LONG
+        or (selected.source_chat_identity, selected.registry_generation) != key
+    ):
+        _fail(T2CheckpointRecoveryReason.FAILURE_MISMATCH)
+    if prior_gap is None:
+        if (
+            selected.active is not True
+            or set(current) != keys
+            or current[key] != selected
+            or selected_checkpoint != confirmation.expected_previous_pts
+        ):
+            _fail(T2CheckpointRecoveryReason.FAILURE_MISMATCH)
+    elif (
+        prior_gap.failure_id != confirmation.failure_id
+        or (prior_gap.identity, prior_gap.registry_generation) != key
+        or prior_gap.old_pts != confirmation.expected_previous_pts
+        or selected.active is not False
+        or key in current
+        or set(current) != keys - {key}
+        or selected_checkpoint < prior_gap.new_pts
+        or boundaries[key][2] != prior_gap.new_processing_started_at
+        or boundaries[key][3] != f"channel-pts:{prior_gap.new_pts}"
+    ):
+        _fail(T2CheckpointRecoveryReason.FAILURE_MISMATCH)
+
+
+def _active_source_failure_count(snapshot: T2CheckpointRecoverySnapshot) -> int:
+    current_scope = set(snapshot.active_scope)
+    return sum(
+        failure.active
+        and (failure.source_chat_identity, failure.registry_generation) in current_scope
+        for failure in snapshot.failures
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +515,47 @@ class PostgresT2CheckpointRecovery:
         except psycopg.Error:
             _fail(T2CheckpointRecoveryReason.DATABASE_FAILED)
         except (TypeError, ValueError, KeyError):
+            _fail(T2CheckpointRecoveryReason.DATABASE_FAILED)
+
+
+class PostgresT2GapBoundaryRecovery:
+    """One operator transaction around the provider capture and state change."""
+
+    def __init__(self, database_url: str) -> None:
+        self._database_url = database_url
+
+    def recover(
+        self,
+        *,
+        source: T2GapBoundarySource,
+        confirmation: T2GapBoundaryConfirmation,
+    ) -> T2GapBoundaryReport:
+        try:
+            with psycopg.connect(
+                self._database_url, row_factory=dict_row
+            ) as connection:
+                _require_gap_operator_connection(connection)
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (_RECOVERY_LOCK_KEY,),
+                )
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (
+                        f"source-chat:{confirmation.identity.kind.value}:"
+                        f"{confirmation.identity.telegram_id}",
+                    ),
+                )
+                return recover_t2_gap_boundary(
+                    source=source,
+                    store=_PostgresRecoveryTransaction(connection),
+                    confirmation=confirmation,
+                )
+        except T2CheckpointRecoveryError:
+            raise
+        except (psycopg.OperationalError, psycopg.InterfaceError):
+            _fail(T2CheckpointRecoveryReason.DATABASE_UNAVAILABLE)
+        except (psycopg.Error, TypeError, ValueError, KeyError):
             _fail(T2CheckpointRecoveryReason.DATABASE_FAILED)
 
 
@@ -370,6 +698,24 @@ class _PostgresRecoveryTransaction:
             )
             for row in failure_rows
         )
+        global_row = self._connection.execute(
+            """
+            SELECT count(*) AS active_count
+            FROM football_runtime.ingestion_failures
+            WHERE scope IN ('account_stream', 'ingestion_role') AND active
+            """
+        ).fetchone()
+        if global_row is None:
+            _fail(T2CheckpointRecoveryReason.DATABASE_FAILED)
+        gap_rows = self._connection.execute(
+            """
+            SELECT failure_id, peer_kind, telegram_chat_id, registry_generation,
+                   old_pts, new_pts, old_processing_started_at,
+                   old_transport_boundary, new_processing_started_at
+            FROM football_runtime.source_stream_gap_boundaries
+            ORDER BY failure_id
+            """
+        ).fetchall()
         return T2CheckpointRecoverySnapshot(
             active_scope=active_scope,
             activation_boundaries=activation_boundaries,
@@ -377,7 +723,102 @@ class _PostgresRecoveryTransaction:
             channel_checkpoints=channel_checkpoints,
             history_progress=history_progress,
             failures=failures,
+            active_global_failures=global_row["active_count"],
+            gap_boundaries=tuple(_gap_record_from_row(row) for row in gap_rows),
         )
+
+    def read_gap(self, failure_id: UUID) -> T2GapBoundaryRecord | None:
+        row = self._connection.execute(
+            """
+            SELECT failure_id, peer_kind, telegram_chat_id, registry_generation,
+                   old_pts, new_pts, old_processing_started_at,
+                   old_transport_boundary, new_processing_started_at
+            FROM football_runtime.source_stream_gap_boundaries
+            WHERE failure_id = %s
+            """,
+            (failure_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _gap_record_from_row(row)
+
+    def apply_gap(self, boundary: T2GapBoundaryRecord) -> None:
+        kind = boundary.identity.kind.value
+        chat_id = boundary.identity.telegram_id
+        generation = boundary.registry_generation
+        registry = self._connection.execute(
+            """
+            UPDATE football_runtime.source_chat_registry
+            SET processing_started_at = %s,
+                transport_boundary = %s
+            WHERE peer_kind = %s AND telegram_chat_id = %s
+              AND registry_generation = %s AND enabled
+              AND permanently_removed_at IS NULL
+              AND initial_consent_attestation = 'confirmed'
+              AND processing_started_at = %s
+              AND transport_boundary = %s
+            """,
+            (
+                boundary.new_processing_started_at,
+                f"channel-pts:{boundary.new_pts}",
+                kind,
+                chat_id,
+                generation,
+                boundary.old_processing_started_at,
+                boundary.old_transport_boundary,
+            ),
+        )
+        checkpoint = self._connection.execute(
+            """
+            UPDATE football_runtime.telegram_channel_difference_checkpoints
+            SET channel_pts = %s, advanced_at = %s
+            WHERE peer_kind = %s AND telegram_chat_id = %s
+              AND registry_generation = %s AND channel_pts = %s
+            """,
+            (
+                boundary.new_pts,
+                boundary.new_processing_started_at,
+                kind,
+                chat_id,
+                generation,
+                boundary.old_pts,
+            ),
+        )
+        failure = self._connection.execute(
+            """
+            UPDATE football_runtime.ingestion_failures
+            SET active = FALSE
+            WHERE failure_id = %s AND scope = 'source_stream'
+              AND failure_reason = 'difference_too_long'
+              AND peer_kind = %s AND telegram_chat_id = %s
+              AND registry_generation = %s AND active
+            """,
+            (boundary.failure_id, kind, chat_id, generation),
+        )
+        if (registry.rowcount, checkpoint.rowcount, failure.rowcount) != (1, 1, 1):
+            _fail(T2CheckpointRecoveryReason.MUTATION_MISMATCH)
+        inserted = self._connection.execute(
+            """
+            INSERT INTO football_runtime.source_stream_gap_boundaries (
+                failure_id, peer_kind, telegram_chat_id, registry_generation,
+                old_pts, new_pts, old_processing_started_at,
+                old_transport_boundary, new_processing_started_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                boundary.failure_id,
+                kind,
+                chat_id,
+                generation,
+                boundary.old_pts,
+                boundary.new_pts,
+                boundary.old_processing_started_at,
+                boundary.old_transport_boundary,
+                boundary.new_processing_started_at,
+            ),
+        )
+        if inserted.rowcount != 1:
+            _fail(T2CheckpointRecoveryReason.MUTATION_MISMATCH)
 
     def deactivate_checkpoint_failures(
         self,
@@ -438,8 +879,16 @@ def _plan_recovery(
             or checkpoint.pts < admission_pts
         ):
             _fail(T2CheckpointRecoveryReason.CHECKPOINT_MISMATCH)
+        history_boundary = min(
+            (
+                gap.old_processing_started_at
+                for gap in snapshot.gap_boundaries
+                if (gap.identity, gap.registry_generation) == (identity, generation)
+            ),
+            default=boundary[2],
+        )
         try:
-            expected_window = SourceChatHistoryWindow.before(boundary[2])
+            expected_window = SourceChatHistoryWindow.before(history_boundary)
         except ValueError:
             _fail(T2CheckpointRecoveryReason.CHECKPOINT_MISMATCH)
         progress = histories[(identity, generation)]
@@ -640,6 +1089,7 @@ def _durable_state(
         snapshot.account_checkpoint,
         snapshot.channel_checkpoints,
         snapshot.history_progress,
+        snapshot.gap_boundaries,
     )
 
 
@@ -688,6 +1138,40 @@ def _require_operator_connection(connection: psycopg.Connection[Any]) -> None:
         _fail(T2CheckpointRecoveryReason.ACCESS_DENIED)
     if not row["has_table_privilege"]:
         _fail(T2CheckpointRecoveryReason.ACCESS_DENIED)
+
+
+def _require_gap_operator_connection(connection: psycopg.Connection[Any]) -> None:
+    _require_operator_connection(connection)
+    for table, privilege in (
+        ("source_chat_registry", "SELECT"),
+        ("source_chat_registry", "UPDATE"),
+        ("telegram_channel_difference_checkpoints", "SELECT"),
+        ("telegram_channel_difference_checkpoints", "UPDATE"),
+        ("source_stream_gap_boundaries", "SELECT"),
+        ("source_stream_gap_boundaries", "INSERT"),
+    ):
+        row = connection.execute(
+            "SELECT has_table_privilege(current_user, %s, %s) AS permitted",
+            (f"football_runtime.{table}", privilege),
+        ).fetchone()
+        if row is None or not row["permitted"]:
+            _fail(T2CheckpointRecoveryReason.ACCESS_DENIED)
+
+
+def _gap_record_from_row(row: dict[str, Any]) -> T2GapBoundaryRecord:
+    return T2GapBoundaryRecord(
+        failure_id=row["failure_id"],
+        identity=TelegramPeerIdentity(
+            kind=TelegramPeerKind(row["peer_kind"]),
+            telegram_id=row["telegram_chat_id"],
+        ),
+        registry_generation=row["registry_generation"],
+        old_pts=row["old_pts"],
+        new_pts=row["new_pts"],
+        old_processing_started_at=row["old_processing_started_at"],
+        old_transport_boundary=row["old_transport_boundary"],
+        new_processing_started_at=row["new_processing_started_at"],
+    )
 
 
 def _fail(reason: T2CheckpointRecoveryReason) -> NoReturn:

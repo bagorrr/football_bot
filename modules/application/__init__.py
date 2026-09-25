@@ -18261,6 +18261,31 @@ class RuntimeApplication:
                 return self._stop_account_stream_for_transport_failure(
                     reason=IngestionFailureReason.CHECKPOINT_UNAVAILABLE
                 )
+        try:
+            gap_boundary = self.store.source_chat_history_gap_boundary(
+                identity=identity,
+                registry_generation=registry_generation,
+            )
+            if gap_boundary is not None:
+                progress = self.store.source_chat_history_progress(
+                    identity=identity,
+                    registry_generation=registry_generation,
+                )
+                if (
+                    progress is None
+                    or progress.completed is not True
+                    or progress.last_outcome != "completed"
+                    or progress.window_end != gap_boundary
+                    or progress.window_start != gap_boundary - timedelta(days=7)
+                ):
+                    raise ValueError("Source Chat admission history is invalid")
+                return False
+        except (LookupError, ValueError):
+            return self._stop_source_stream_for_transport_failure(
+                identity=identity,
+                registry_generation=registry_generation,
+                reason=IngestionFailureReason.CHECKPOINT_INVALID,
+            )
         window_end = context.processing_started_at
         window_start = window_end - timedelta(days=7)
         try:

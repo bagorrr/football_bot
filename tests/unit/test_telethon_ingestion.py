@@ -2305,6 +2305,7 @@ def test_live_and_history_edits_share_a_route_independent_identity() -> None:
         body="same edit",
     )
     live_message.edit_date = edit_date
+    live_message.date = "malformed original timestamp"
     live_provider = TelethonProvider(
         client=_DifferenceClientProbe(
             [
@@ -2340,6 +2341,7 @@ def test_live_and_history_edits_share_a_route_independent_identity() -> None:
 
     assert isinstance(live, TelegramDifferenceEvent)
     assert isinstance(history, TelegramDifferenceEvent)
+    assert live.event_time == edit_date
     assert live.source_event_id == history.source_event_id
 
 

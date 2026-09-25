@@ -42,6 +42,10 @@ from modules.domain import (
     TelegramProtectionUnavailableEvent,
 )
 from modules.ports import ClassifierAdapterResult, ClassifierRequest
+from modules.t2_checkpoint_recovery import (
+    PostgresT2GapBoundaryRecovery,
+    T2GapBoundaryConfirmation,
+)
 from modules.telethon_ingestion import (
     TelethonIngestionAdapter,
     TelethonProvider,
@@ -4751,6 +4755,331 @@ def test_unrecoverable_difference_and_gap_stop_their_source_streams() -> None:
         system.operator_alert(contract.message_id).failure_scope
         for contract in system.source_stream_stop_contracts()
     } == {"source_stream"}
+
+
+def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
+    fresh_database_url: str,
+) -> None:
+    start = datetime(2026, 9, 24, 10, 0, tzinfo=UTC)
+    clock = FrozenClock(start - timedelta(days=30))
+    telethon = ControlledTelegramIngestionAdapter()
+    identities = tuple(
+        TelegramPeerIdentity(TelegramPeerKind.CHANNEL, 4_800_500 + index)
+        for index in range(4)
+    )
+    system = boot_legacy_acceptance_spine(
+        admin_database_url=fresh_database_url,
+        clock=clock,
+        telegram_ingestion=telethon,
+        telegram_delivery=ControlledTelegramDeliveryAdapter(),
+        model=ControlledModelAdapter(),
+        location_resolver=ControlledLocationResolverAdapter(),
+        telegram_admin_user_id=48_005,
+    )
+    system.reset()
+    for index, identity in enumerate(identities):
+        address = f"@synthetic_gap_boundary_{index}"
+        checkpoint = TelegramChannelCheckpoint(100 + index)
+        telethon.allow_public_username(
+            address=address,
+            identity=identity,
+            transport_boundary=f"channel-pts:{checkpoint.pts}",
+        )
+        _register_source_chat(
+            system,
+            clock=clock,
+            registered_at=start + timedelta(seconds=index),
+            administrator_id=48_005,
+            address=address,
+            update_suffix=f"gap-boundary-{index}",
+            already_in_source_chats=index > 0,
+        )
+        assert not system.process_next_source_chat_history(
+            identity=identity, registry_generation=index + 1
+        )
+        if index == 0:
+            telethon.add_channel_difference_event(
+                identity=identity,
+                from_checkpoint=checkpoint,
+                to_checkpoint=TelegramChannelCheckpoint(101),
+                source_event_id="source-event:before-gap-boundary",
+                telegram_message_id=999,
+                revision=1,
+                kind=SourceEventKind.CREATE,
+                body="Earlier durable source message.",
+                event_time=start + timedelta(milliseconds=500),
+                registry_generation=1,
+            )
+            clock.advance_to(start + timedelta(seconds=1))
+            assert system.process_next_channel_telegram_difference(
+                identity=identity, registry_generation=1
+            )
+            checkpoint = TelegramChannelCheckpoint(101)
+            telethon.add_channel_difference_event(
+                identity=identity,
+                from_checkpoint=checkpoint,
+                to_checkpoint=TelegramChannelCheckpoint(102),
+                source_event_id="source-event:known-before-gap-edit",
+                telegram_message_id=998,
+                revision=2,
+                kind=SourceEventKind.EDIT,
+                body="Earlier first-seen edit that became a Source Message.",
+                event_time=start + timedelta(milliseconds=800),
+                registry_generation=1,
+            )
+            assert system.process_next_channel_telegram_difference(
+                identity=identity, registry_generation=1
+            )
+            checkpoint = TelegramChannelCheckpoint(102)
+        telethon.add_difference_too_long_channel_difference(
+            identity=identity, checkpoint=checkpoint
+        )
+        assert system.process_next_channel_telegram_difference(
+            identity=identity, registry_generation=index + 1
+        )
+
+    system.initialize_account_ingestion_checkpoint(
+        TelegramAccountCheckpoint(100, 0, 100, start)
+    )
+    while system.process_next_source_event():
+        pass
+    assert len(system.source_messages()) == 2
+    original_history = system.source_chat_history_progress(
+        identity=identities[0], registry_generation=1
+    )
+
+    failures = system.ingestion_failures()
+    selected = next(
+        failure for failure in failures if failure.source_chat_identity == identities[0]
+    )
+
+    class CurrentProvider:
+        calls = 0
+
+        def capture_channel_checkpoint(
+            self, identity: TelegramPeerIdentity
+        ) -> tuple[TelegramChannelCheckpoint, datetime]:
+            assert identity == identities[0]
+            self.calls += 1
+            return TelegramChannelCheckpoint(110), boundary_at
+
+    pre_capture_at = start + timedelta(minutes=1)
+    boundary_at = pre_capture_at + timedelta(seconds=2)
+    provider = CurrentProvider()
+    confirmation = T2GapBoundaryConfirmation(
+        identity=identities[0],
+        registry_generation=1,
+        failure_id=selected.ingestion_failure_id,
+        expected_previous_pts=102,
+        services_stopped=True,
+        backup_digest_verified=True,
+        isolated_restore_verified=True,
+        rollback_ready=True,
+        revision_verified=True,
+        owner_decision_recorded=True,
+    )
+    report = PostgresT2GapBoundaryRecovery(fresh_database_url).recover(
+        source=provider,
+        confirmation=confirmation,
+    )
+    assert (
+        report.before_active_source_failures,
+        report.after_active_source_failures,
+    ) == (4, 3)
+    repeat = PostgresT2GapBoundaryRecovery(fresh_database_url).recover(
+        source=provider,
+        confirmation=confirmation,
+    )
+    assert (repeat.advanced, repeat.before_active_source_failures, provider.calls) == (
+        False,
+        3,
+        1,
+    )
+    assert len(system.source_messages()) == 2
+    history_requests = len(telethon.history_requests)
+    assert not system.process_next_source_chat_history(
+        identity=identities[0], registry_generation=1
+    )
+    assert (
+        system.source_chat_history_progress(
+            identity=identities[0], registry_generation=1
+        )
+        == original_history
+    )
+    assert len(telethon.history_requests) == history_requests
+    with psycopg.connect(fresh_database_url) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM football_runtime.ingestion_failures WHERE active"
+        ).fetchone() == (3,)
+    assert all(
+        system.channel_ingestion_checkpoint(
+            identity=identity, registry_generation=index + 1
+        )
+        == TelegramChannelCheckpoint(100 + index)
+        for index, identity in enumerate(identities[1:], start=1)
+    )
+
+    telethon.add_channel_difference_event(
+        identity=identities[0],
+        from_checkpoint=TelegramChannelCheckpoint(110),
+        to_checkpoint=TelegramChannelCheckpoint(111),
+        source_event_id="source-event:skipped-gap-boundary",
+        telegram_message_id=1000,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Message from the unprocessed interval.",
+        event_time=pre_capture_at + timedelta(seconds=1),
+        registry_generation=1,
+    )
+    clock.advance_to(boundary_at + timedelta(seconds=1))
+    assert system.process_next_channel_telegram_difference(
+        identity=identities[0], registry_generation=1
+    )
+    assert len(system.source_events()) == 2
+
+    telethon.add_channel_difference_event(
+        identity=identities[0],
+        from_checkpoint=TelegramChannelCheckpoint(111),
+        to_checkpoint=TelegramChannelCheckpoint(112),
+        source_event_id="source-event:skipped-gap-boundary-edit",
+        telegram_message_id=1000,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body="An edited message from the unprocessed interval.",
+        event_time=boundary_at + timedelta(seconds=1),
+        registry_generation=1,
+    )
+    clock.advance_to(boundary_at + timedelta(seconds=2))
+    with pytest.raises(InjectedFailureError):
+        system.process_next_channel_telegram_difference(
+            identity=identities[0],
+            registry_generation=1,
+            inject_database_failure=True,
+        )
+    assert system.channel_ingestion_checkpoint(
+        identity=identities[0], registry_generation=1
+    ) == TelegramChannelCheckpoint(111)
+    assert len(system.source_event_contracts()) == 2
+    assert system.process_next_channel_telegram_difference(
+        identity=identities[0], registry_generation=1
+    )
+    assert len(system.source_events()) == 2
+    assert system.channel_ingestion_checkpoint(
+        identity=identities[0], registry_generation=1
+    ) == TelegramChannelCheckpoint(112)
+    assert system.process_next_source_event()
+    assert len(system.source_messages()) == 2
+    skip = system.source_event_contracts()[-1]
+    assert isinstance(skip.payload, dict)
+    assert skip.payload["outcome"] == "gap_boundary_edit_skipped"
+    assert "An edited message from the unprocessed interval." not in repr(skip)
+    assert system.protected_content_skips() == ()
+    assert not system.classifier_commands_for_revision(
+        "source-chat:channel:4800500:generation:1:message:1000:revision:2"
+    )
+
+    telethon.add_channel_difference_event(
+        identity=identities[0],
+        from_checkpoint=TelegramChannelCheckpoint(112),
+        to_checkpoint=TelegramChannelCheckpoint(113),
+        source_event_id="source-event:after-gap-boundary",
+        telegram_message_id=1001,
+        revision=1,
+        kind=SourceEventKind.CREATE,
+        body="Fresh source message after the confirmed boundary.",
+        event_time=boundary_at - timedelta(microseconds=1),
+        registry_generation=1,
+    )
+    clock.advance_to(boundary_at + timedelta(seconds=4))
+    assert system.process_next_channel_telegram_difference(
+        identity=identities[0], registry_generation=1
+    )
+    assert len(system.source_events()) == 3
+    assert system.process_next_source_event()
+    assert len(system.source_messages()) == 3
+
+    telethon.add_channel_difference_event(
+        identity=identities[0],
+        from_checkpoint=TelegramChannelCheckpoint(113),
+        to_checkpoint=TelegramChannelCheckpoint(114),
+        source_event_id="source-event:first-seen-after-gap-edit",
+        telegram_message_id=1002,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body="First observed edit of a post-boundary message.",
+        event_time=boundary_at + timedelta(seconds=3),
+        registry_generation=1,
+    )
+    clock.advance_to(boundary_at + timedelta(seconds=6))
+    assert system.process_next_channel_telegram_difference(
+        identity=identities[0], registry_generation=1
+    )
+    assert system.channel_ingestion_checkpoint(
+        identity=identities[0], registry_generation=1
+    ) == TelegramChannelCheckpoint(114)
+    assert system.process_next_source_event()
+    assert len(system.source_messages()) == 3
+    skip = system.source_event_contracts()[-1]
+    assert isinstance(skip.payload, dict)
+    assert skip.payload["outcome"] == "gap_boundary_edit_skipped"
+    assert "First observed edit of a post-boundary message." not in repr(skip)
+    assert not system.classifier_commands_for_revision(
+        "source-chat:channel:4800500:generation:1:message:1002:revision:2"
+    )
+
+    telethon.add_channel_difference_event(
+        identity=identities[0],
+        from_checkpoint=TelegramChannelCheckpoint(114),
+        to_checkpoint=TelegramChannelCheckpoint(115),
+        source_event_id="source-event:existing-before-gap-edit",
+        telegram_message_id=998,
+        revision=3,
+        kind=SourceEventKind.EDIT,
+        body="Earlier durable source message, edited later.",
+        event_time=boundary_at + timedelta(seconds=7),
+        registry_generation=1,
+    )
+    clock.advance_to(boundary_at + timedelta(seconds=8))
+    assert system.process_next_channel_telegram_difference(
+        identity=identities[0], registry_generation=1
+    )
+    assert system.process_next_source_event()
+    messages = {
+        message.telegram_message_id: message for message in system.source_messages()
+    }
+    assert set(messages) == {998, 999, 1001}
+    assert messages[998].body == "Earlier durable source message, edited later."
+
+    telethon.add_channel_difference_event(
+        identity=identities[0],
+        from_checkpoint=TelegramChannelCheckpoint(115),
+        to_checkpoint=TelegramChannelCheckpoint(116),
+        source_event_id="source-event:known-after-gap-edit",
+        telegram_message_id=1001,
+        revision=2,
+        kind=SourceEventKind.EDIT,
+        body="Fresh source message, edited after its durable create.",
+        event_time=boundary_at + timedelta(seconds=9),
+        registry_generation=1,
+    )
+    clock.advance_to(boundary_at + timedelta(seconds=10))
+    assert system.process_next_channel_telegram_difference(
+        identity=identities[0], registry_generation=1
+    )
+    assert system.process_next_source_event()
+    messages = {
+        message.telegram_message_id: message for message in system.source_messages()
+    }
+    assert messages[1001].body == (
+        "Fresh source message, edited after its durable create."
+    )
+    assert all(
+        system.channel_ingestion_checkpoint(
+            identity=identity, registry_generation=index + 1
+        )
+        == TelegramChannelCheckpoint(100 + index)
+        for index, identity in enumerate(identities[1:], start=1)
+    )
 
 
 def test_session_revocation_stops_the_whole_ingestion_role() -> None:

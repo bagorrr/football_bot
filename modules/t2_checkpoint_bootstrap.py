@@ -137,6 +137,15 @@ class T2CheckpointStore(Protocol):
         """Read one durable bounded-history state without changing it."""
         ...
 
+    def source_chat_history_gap_boundary(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> datetime | None:
+        """Read the original admission time for a confirmed current gap."""
+        ...
+
     def initialize_source_chat_history_progress(
         self,
         *,
@@ -348,14 +357,22 @@ def _history_states(
         if boundary is None:
             _fail(IngestionFailureReason.CHECKPOINT_UNAVAILABLE)
         processing_started_at, _transport_boundary = boundary
+        gap_boundary = store.source_chat_history_gap_boundary(
+            identity=identity,
+            registry_generation=generation,
+        )
         try:
-            window = SourceChatHistoryWindow.before(processing_started_at)
+            window = SourceChatHistoryWindow.before(
+                gap_boundary if gap_boundary is not None else processing_started_at
+            )
         except ValueError:
             _fail(IngestionFailureReason.CHECKPOINT_INVALID)
         existing = store.source_chat_history_progress(
             identity=identity,
             registry_generation=generation,
         )
+        if gap_boundary is not None and existing is None:
+            _fail(IngestionFailureReason.CHECKPOINT_INVALID)
         if existing is not None and (
             not isinstance(existing, TelegramHistoryProgress)
             or existing.window_start != window.start_at

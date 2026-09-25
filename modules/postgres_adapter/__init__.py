@@ -219,6 +219,9 @@ _LEGACY_MIGRATION_NAMES = (
     "0064_runtime_readiness_and_ingestion_bootstrap.sql",
     "0065_source_chat_ingestion_read_policy.sql",
     "0066_source_chat_ingestion_checkpoint_read_policy.sql",
+    "0067_one_source_gap_boundary.sql",
+    "0068_gap_edit_existing_message_read.sql",
+    "0069_gap_history_admission_boundary.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -289,6 +292,9 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "daa33b855d2ccc7ea94d72df15b6c2638a75a9807bba1200bf1d50651c19504a",
     "d705c082f90d75f1884cf745044eba9aed5d279f72ae36c51aa92fb31f5a3dd4",
     "1b58be73fb4ebee429eacf48f7342c8e44964200d30dedbaebba6652e3f4669f",
+    "4b40f90b297e97b39702aab3b2874f2d41c9441bb69d3ca40255cbeda8e78b35",
+    "22b0409593e3f5a2544d542d6712ac98f94d8fe4efccc0cf675e5ad2d3bdf078",
+    "fec0a80853c5f290e97f5c52449805b3619b713af48d502f31d336d37efc4d75",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1461,7 +1467,8 @@ class PostgresAcceptanceObserver:
     def reset(self) -> None:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
-            TRUNCATE football_runtime.bot_callback_outbox,
+            TRUNCATE football_runtime.source_stream_gap_boundaries,
+                     football_runtime.bot_callback_outbox,
                      football_runtime.bot_api_delivery_reconciliation,
                      football_runtime.bot_api_retention_alerts,
                      football_runtime.bot_api_updates,
@@ -4859,6 +4866,30 @@ class PostgresRoleStore:
             advanced_at=row["advanced_at"],
         )
 
+    def source_chat_history_gap_boundary(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> datetime | None:
+        """Read the original admission time for a confirmed current gap."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT football_runtime.read_source_stream_gap_original_started_at(
+                    %s, %s, %s
+                )
+                """,
+                (identity.kind.value, identity.telegram_id, registry_generation),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        if not isinstance(row[0], datetime) or row[0].tzinfo is None:
+            raise ValueError("Source Chat history gap boundary is invalid")
+        return row[0]
+
     @staticmethod
     def _record_history_progress_in(
         connection: psycopg.Connection[Any],
@@ -5984,6 +6015,84 @@ class PostgresRoleStore:
             source_message_id = canonical_source_message_id(
                 peer_key, registry_generation, event.telegram_message_id
             )
+            gap_boundary_at = None
+            if (
+                channel_route
+                and isinstance(event, TelegramDifferenceEvent)
+                and not event.from_history
+                and event.kind in {SourceEventKind.CREATE, SourceEventKind.EDIT}
+            ):
+                gap_row = connection.execute(
+                    """
+                    SELECT football_runtime.read_source_stream_gap_started_at(
+                        %s, %s, %s
+                    ) AS gap_started_at
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                    ),
+                ).fetchone()
+                if gap_row is None:
+                    raise LookupError("Source Chat gap boundary is unavailable")
+                gap_boundary_at = gap_row["gap_started_at"]
+                if event.kind is SourceEventKind.EDIT and gap_boundary_at is not None:
+                    prior_create = connection.execute(
+                        """
+                        SELECT 1 FROM football_runtime.source_event_records
+                        WHERE peer_kind = %s AND telegram_chat_id = %s
+                          AND registry_generation = %s
+                          AND telegram_message_id = %s
+                          AND event_kind = 'create'
+                        LIMIT 1
+                        """,
+                        (
+                            identity.kind.value,
+                            identity.telegram_id,
+                            registry_generation,
+                            event.telegram_message_id,
+                        ),
+                    ).fetchone()
+                    existing_message = connection.execute(
+                        """
+                        SELECT football_runtime.source_message_exists_for_ingestion(
+                            %s, %s, %s, %s
+                        ) AS exists_for_ingestion
+                        """,
+                        (
+                            identity.kind.value,
+                            identity.telegram_id,
+                            registry_generation,
+                            event.telegram_message_id,
+                        ),
+                    ).fetchone()
+                    if prior_create is None and not (
+                        existing_message is not None
+                        and existing_message["exists_for_ingestion"]
+                    ):
+                        skip_envelope = replace(
+                            envelope,
+                            subject_id=f"gap-boundary-edit-skip:{envelope.message_id}",
+                            subject_revision=1,
+                            idempotency_key=(
+                                f"gap-boundary-edit-skipped:{envelope.message_id}"
+                            ),
+                            payload={
+                                "ingestion_outcome_id": str(envelope.message_id),
+                                "outcome": "gap_boundary_edit_skipped",
+                                "source_chat_key": peer_key,
+                                "telegram_peer_kind": identity.kind.value,
+                                "telegram_chat_id": identity.telegram_id,
+                                "registry_generation": registry_generation,
+                            },
+                        )
+                        _insert_outbox(connection, skip_envelope)
+                        if inject_database_failure:
+                            raise OutboxConflictError
+                        advance_history_progress("not_processable")
+                        advance_checkpoint()
+                        return True
             replay_barrier_active = False
             if event.kind is not SourceEventKind.DELETE:
                 replay_event_time = (
@@ -6045,7 +6154,13 @@ class PostgresRoleStore:
                 channel_route
                 and isinstance(event, TelegramDifferenceEvent)
                 and not event.from_history
-                and event.kind is SourceEventKind.EDIT
+                and (
+                    event.kind is SourceEventKind.EDIT
+                    or (
+                        event.kind is SourceEventKind.CREATE
+                        and gap_boundary_at is not None
+                    )
+                )
                 and channel_event_is_after_boundary
             )
             if transport_proven_post_boundary:
@@ -6092,6 +6207,30 @@ class PostgresRoleStore:
                         identity.telegram_id,
                         registry_generation,
                         context["processing_started_at"] + timedelta(microseconds=1),
+                    ),
+                ).fetchone()
+                event_is_processable = active_row is not None and bool(
+                    active_row["event_is_processable"]
+                )
+            elif (
+                channel_route
+                and gap_boundary_at is not None
+                and event.kind is SourceEventKind.CREATE
+                and channel_event_is_after_boundary
+            ):
+                # The captured pts proves a new CREATE even when Telegram's
+                # second-resolution message time rounds below the local clock.
+                active_row = connection.execute(
+                    """
+                    SELECT football_runtime.source_chat_event_is_processable(
+                        %s, %s, %s, %s
+                    ) AS event_is_processable
+                    """,
+                    (
+                        identity.kind.value,
+                        identity.telegram_id,
+                        registry_generation,
+                        gap_boundary_at + timedelta(microseconds=1),
                     ),
                 ).fetchone()
                 event_is_processable = active_row is not None and bool(
@@ -6394,7 +6533,10 @@ class PostgresRoleStore:
                     received_at,
                 ),
             )
-            if payload.get("outcome") == "protected_content_skipped":
+            if payload.get("outcome") in {
+                "protected_content_skipped",
+                "gap_boundary_edit_skipped",
+            }:
                 _release_claim(connection, incoming.message_id)
                 return ConsumeResult.APPLIED
             event_time = datetime.fromisoformat(str(payload["event_time"]))
@@ -6452,7 +6594,8 @@ class PostgresRoleStore:
                 processable = (
                     payload.get("transport_proven_post_boundary") is True
                     and payload.get("telegram_peer_kind") == "channel"
-                    and payload.get("event_kind") == SourceEventKind.EDIT.value
+                    and payload.get("event_kind")
+                    in {SourceEventKind.CREATE.value, SourceEventKind.EDIT.value}
                     and not from_history
                 )
                 if processable:

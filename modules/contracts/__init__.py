@@ -622,12 +622,13 @@ class ContractEnvelope(RawContractEnvelope):
         if not isinstance(self.payload, dict):
             msg = "supported contract payload must be a JSON object"
             raise TypeError(msg)
-        protected_content_skip = (
+        body_free_ingestion_skip = (
             self.contract_name is ContractName.SOURCE_EVENT_RECORDED
             and self.contract_version == 4
-            and self.payload.get("outcome") == "protected_content_skipped"
+            and self.payload.get("outcome")
+            in {"protected_content_skipped", "gap_boundary_edit_skipped"}
         )
-        if not protected_content_skip:
+        if not body_free_ingestion_skip:
             fact = self.payload.get(definition.required_fact)
             if not isinstance(fact, str) or not fact:
                 msg = f"supported contract requires {definition.required_fact}"
@@ -648,8 +649,8 @@ class ContractEnvelope(RawContractEnvelope):
             self.contract_name is ContractName.SOURCE_EVENT_RECORDED
             and self.contract_version == 4
         ):
-            if protected_content_skip:
-                _validate_protected_content_skip(self, self.payload)
+            if body_free_ingestion_skip:
+                _validate_body_free_ingestion_skip(self, self.payload)
             else:
                 _validate_source_event_recorded(self, self.payload)
         elif (
@@ -1578,7 +1579,7 @@ def _validate_source_event_recorded(
     ):
         raise TypeError("SourceEventRecorded transport boundary proof is invalid")
     if transport_proven_post_boundary and (
-        from_history or peer_kind != "channel" or event_kind != "edit"
+        from_history or peer_kind != "channel" or event_kind not in {"create", "edit"}
     ):
         raise ValueError("SourceEventRecorded transport boundary proof is invalid")
     event_time = datetime.fromisoformat(_required_text(payload, "event_time"))
@@ -4273,7 +4274,7 @@ def _validate_transfer_seasonal_timing_fact(value: JsonValue) -> None:
     raise ValueError("transfer Seasonal Timing kind is invalid")
 
 
-def _validate_protected_content_skip(
+def _validate_body_free_ingestion_skip(
     envelope: RawContractEnvelope,
     payload: dict[str, JsonValue],
 ) -> None:
@@ -4286,7 +4287,8 @@ def _validate_protected_content_skip(
         "registry_generation",
     }:
         raise ValueError("SourceEventRecorded v4 contains unsupported or missing facts")
-    if payload.get("outcome") != "protected_content_skipped":
+    outcome = payload.get("outcome")
+    if outcome not in {"protected_content_skipped", "gap_boundary_edit_skipped"}:
         raise ValueError("SourceEventRecorded v4 outcome is invalid")
     peer_kind = _required_text(payload, "telegram_peer_kind")
     if peer_kind not in {"chat", "channel"}:
@@ -4301,11 +4303,21 @@ def _validate_protected_content_skip(
     ):
         raise ValueError("SourceEventRecorded v4 Source Chat identity is inconsistent")
     message_id = envelope.message_id
+    subject_prefix = (
+        "protected-content-skip"
+        if outcome == "protected_content_skipped"
+        else "gap-boundary-edit-skip"
+    )
+    idempotency_prefix = (
+        "protected-content-skipped"
+        if outcome == "protected_content_skipped"
+        else "gap-boundary-edit-skipped"
+    )
     if (
         payload["ingestion_outcome_id"] != str(message_id)
-        or envelope.subject_id != f"protected-content-skip:{message_id}"
+        or envelope.subject_id != f"{subject_prefix}:{message_id}"
         or envelope.subject_revision != 1
-        or envelope.idempotency_key != f"protected-content-skipped:{message_id}"
+        or envelope.idempotency_key != f"{idempotency_prefix}:{message_id}"
         or envelope.causation_id != message_id
     ):
         raise ValueError("SourceEventRecorded v4 identity is not canonical")
