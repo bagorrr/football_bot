@@ -219,6 +219,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0064_runtime_readiness_and_ingestion_bootstrap.sql",
     "0065_source_chat_ingestion_read_policy.sql",
     "0066_source_chat_ingestion_checkpoint_read_policy.sql",
+    "0067_one_source_gap_boundary.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -289,6 +290,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "daa33b855d2ccc7ea94d72df15b6c2638a75a9807bba1200bf1d50651c19504a",
     "d705c082f90d75f1884cf745044eba9aed5d279f72ae36c51aa92fb31f5a3dd4",
     "1b58be73fb4ebee429eacf48f7342c8e44964200d30dedbaebba6652e3f4669f",
+    "b8356e62d216f22e058e22b54e155e8b3399b4bb39c24237f3b5680e950f80e1",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -1461,7 +1463,8 @@ class PostgresAcceptanceObserver:
     def reset(self) -> None:
         """Clear synthetic acceptance records without changing the schema."""
         statement = """
-            TRUNCATE football_runtime.bot_callback_outbox,
+            TRUNCATE football_runtime.source_stream_gap_boundaries,
+                     football_runtime.bot_callback_outbox,
                      football_runtime.bot_api_delivery_reconciliation,
                      football_runtime.bot_api_retention_alerts,
                      football_runtime.bot_api_updates,

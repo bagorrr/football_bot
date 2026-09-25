@@ -24,7 +24,10 @@ from modules.t2_checkpoint_recovery import (
     T2CheckpointRecoveryFailure,
     T2CheckpointRecoveryReason,
     T2CheckpointRecoverySnapshot,
+    T2GapBoundaryConfirmation,
+    T2GapBoundaryRecord,
     recover_t2_checkpoint_state,
+    recover_t2_gap_boundary,
 )
 
 NOW = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
@@ -127,6 +130,42 @@ def _confirmation(
     )
 
 
+def _gap_snapshot() -> T2CheckpointRecoverySnapshot:
+    snapshot = _snapshot()
+    return replace(
+        snapshot,
+        failures=(
+            replace(
+                snapshot.failures[0], reason=IngestionFailureReason.DIFFERENCE_TOO_LONG
+            ),
+            replace(
+                snapshot.failures[1], reason=IngestionFailureReason.DIFFERENCE_TOO_LONG
+            ),
+            replace(
+                snapshot.failures[2], reason=IngestionFailureReason.DIFFERENCE_TOO_LONG
+            ),
+            replace(
+                snapshot.failures[3], reason=IngestionFailureReason.CHECKPOINT_INVALID
+            ),
+        ),
+    )
+
+
+def _gap_confirmation() -> T2GapBoundaryConfirmation:
+    return T2GapBoundaryConfirmation(
+        identity=IDENTITIES[0],
+        registry_generation=1,
+        failure_id=FAILURE_IDS[0],
+        expected_previous_pts=11,
+        services_stopped=True,
+        backup_digest_verified=True,
+        isolated_restore_verified=True,
+        rollback_ready=True,
+        revision_verified=True,
+        owner_decision_recorded=True,
+    )
+
+
 def test_recovery_is_idempotent_and_preserves_checkpoint_state() -> None:
     store = _Store(_snapshot())
     durable_state = (
@@ -160,6 +199,41 @@ def test_recovery_is_idempotent_and_preserves_checkpoint_state() -> None:
         store.snapshot.channel_checkpoints,
         store.snapshot.history_progress,
     ) == durable_state
+
+
+def test_checkpoint_recovery_keeps_the_original_history_window_after_a_gap() -> None:
+    snapshot = _snapshot()
+    later = NOW + timedelta(minutes=1)
+    store = _Store(
+        replace(
+            snapshot,
+            activation_boundaries=(
+                (IDENTITIES[0], 1, later, "channel-pts:21"),
+                *snapshot.activation_boundaries[1:],
+            ),
+            channel_checkpoints=(
+                (IDENTITIES[0], 1, TelegramChannelCheckpoint(21)),
+                *snapshot.channel_checkpoints[1:],
+            ),
+            gap_boundaries=(
+                T2GapBoundaryRecord(
+                    failure_id=UUID("00000000-0000-0000-0000-000000000099"),
+                    identity=IDENTITIES[0],
+                    registry_generation=1,
+                    old_pts=11,
+                    new_pts=21,
+                    old_processing_started_at=NOW,
+                    old_transport_boundary="channel-pts:11",
+                    new_processing_started_at=later,
+                ),
+            ),
+        )
+    )
+
+    report = recover_t2_checkpoint_state(store=store, confirmation=_confirmation())
+
+    assert report.deactivated_failure_count == 4
+    assert store.snapshot.history_progress == snapshot.history_progress
 
 
 def test_recovery_ignores_inactive_historical_failure_for_current_generation() -> None:
@@ -276,4 +350,102 @@ def test_recovery_requires_explicit_apply(
     assert capsys.readouterr().out == (
         '{"event":"t2_checkpoint_recovery",'
         '"outcome":"blocked","reason":"explicit_apply_required"}\n'
+    )
+
+
+def test_confirmed_gap_boundary_is_durable_and_exact_repeat_is_inert() -> None:
+    snapshot = _gap_snapshot()
+
+    class GapStore(_Store):
+        boundary: T2GapBoundaryRecord | None = None
+
+        def read_gap(self, failure_id: UUID) -> T2GapBoundaryRecord | None:
+            assert failure_id == FAILURE_IDS[0]
+            return self.boundary
+
+        def apply_gap(self, boundary: T2GapBoundaryRecord) -> None:
+            self.boundary = boundary
+            self.snapshot = replace(
+                self.snapshot,
+                activation_boundaries=(
+                    (
+                        IDENTITIES[0],
+                        1,
+                        boundary.new_processing_started_at,
+                        f"channel-pts:{boundary.new_pts}",
+                    ),
+                    *self.snapshot.activation_boundaries[1:],
+                ),
+                channel_checkpoints=(
+                    (IDENTITIES[0], 1, TelegramChannelCheckpoint(boundary.new_pts)),
+                    *self.snapshot.channel_checkpoints[1:],
+                ),
+                failures=(
+                    replace(self.snapshot.failures[0], active=False),
+                    *self.snapshot.failures[1:],
+                ),
+                gap_boundaries=(boundary,),
+            )
+
+    class Source:
+        calls = 0
+
+        def capture_channel_checkpoint(
+            self, identity: TelegramPeerIdentity
+        ) -> TelegramChannelCheckpoint:
+            assert identity == IDENTITIES[0]
+            self.calls += 1
+            return TelegramChannelCheckpoint(pts=21)
+
+    store = GapStore(snapshot)
+    source = Source()
+    confirmation = _gap_confirmation()
+
+    first = recover_t2_gap_boundary(
+        source=source, store=store, confirmation=confirmation, boundary_at=NOW
+    )
+    second = recover_t2_gap_boundary(
+        source=source, store=store, confirmation=confirmation, boundary_at=NOW
+    )
+
+    assert (first.advanced, second.advanced, source.calls) == (True, False, 1)
+    assert store.boundary == T2GapBoundaryRecord(
+        failure_id=FAILURE_IDS[0],
+        identity=IDENTITIES[0],
+        registry_generation=1,
+        old_pts=11,
+        new_pts=21,
+        old_processing_started_at=NOW,
+        old_transport_boundary="channel-pts:11",
+        new_processing_started_at=NOW,
+    )
+    assert store.snapshot.channel_checkpoints[1:] == snapshot.channel_checkpoints[1:]
+    assert store.snapshot.failures[1:] == snapshot.failures[1:]
+    assert store.snapshot.history_progress == snapshot.history_progress
+
+
+def test_gap_boundary_refuses_a_nonadvancing_provider_cursor() -> None:
+    class Store(_Store):
+        def read_gap(self, failure_id: UUID) -> T2GapBoundaryRecord | None:
+            return None
+
+        def apply_gap(self, boundary: T2GapBoundaryRecord) -> None:
+            raise AssertionError("a nonadvancing cursor must not be persisted")
+
+    class Source:
+        def capture_channel_checkpoint(
+            self, identity: TelegramPeerIdentity
+        ) -> TelegramChannelCheckpoint:
+            return TelegramChannelCheckpoint(11)
+
+    with pytest.raises(T2CheckpointRecoveryError) as raised:
+        recover_t2_gap_boundary(
+            source=Source(),
+            store=Store(_gap_snapshot()),
+            confirmation=_gap_confirmation(),
+            boundary_at=NOW,
+        )
+
+    assert (
+        raised.value.reason is T2CheckpointRecoveryReason.PROVIDER_BOUNDARY_UNAVAILABLE
     )

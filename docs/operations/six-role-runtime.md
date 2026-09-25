@@ -550,6 +550,69 @@ backup, and reconcile before retrying. Restoring the verified backup is a
 separate explicit recovery decision; this command never performs it
 automatically.
 
+### One Source Chat boundary after `difference_too_long`
+
+Ticket #124 adds a separate operator procedure for one owner-selected,
+already-approved channel. Apply migration `0067_one_source_gap_boundary.sql`
+and reconcile the reviewed deployed SHA before considering protected use. This
+procedure does not change the original consent attestation, Source Chat
+identity or generation, prior Source Messages, deletion barriers, or the other
+three streams. It retains the original admission boundary in a body-free gap
+record. The pre-boundary interval, including the consumed supplemental E2E
+input, is not ingested or claimed as complete.
+
+Before mutation, the operator must record privately:
+
+1. The exact deployed Git SHA and one current-generation
+   `source_stream|difference_too_long` failure UUID for the selected channel,
+   its current channel checkpoint, and the four enabled, nonremoved,
+   consent-confirmed channel generations. A different failure reason blocks
+   this procedure. Check that no account-wide or ingestion-role stop is active.
+2. All five long-running services are `inactive/dead`. The command also
+   verifies their states through systemd. Keep them stopped through recovery
+   and its postflight.
+3. A custom-format staging `pg_dump`, its SHA-256 digest, successful
+   `pg_restore --list`, and a successful `pg_restore --exit-on-error` into an
+   isolated temporary database. Record that the isolated restore used exactly
+   the backup digest being submitted.
+4. The owner's explicit one-channel gap and rollback decision. Restoring the
+   backup is a separate decision because it discards later database writes.
+
+Create a root-owned mode `0600` JSON confirmation file outside the repository.
+Its exact keys are `expected_revision`, `peer_kind` (`channel`),
+`telegram_chat_id`, `registry_generation`, `failure_id`,
+`expected_previous_pts`, `owner_decision_recorded`, `services_stopped`,
+`backup_path`, `backup_sha256`, `isolated_restore_verified`,
+`isolated_restore_backup_sha256`, and `rollback_ready`. The decision and status
+keys `owner_decision_recorded`, `services_stopped`,
+`isolated_restore_verified`, and `rollback_ready` are JSON booleans. The
+restore digest must equal `backup_sha256`. Keep the real peer ID, failure UUID,
+checkpoint, session, and
+database URL in protected storage only; never put them in Git, GitHub, shell
+arguments, or logs. Set `T2_GAP_CONFIRMATION_FILE` to that protected file and
+`RECOVERY_DATABASE_URL` to a separately authorized operator connection through
+the protected operator environment. Use a protected `PGPASSFILE`, not a URL
+containing a password. Do not use a runtime or migration database role. The
+one-shot command reads only the four T2 Telegram keys from the protected T5
+master file; it does not change that file or any runtime model setting:
+
+```text
+/opt/football-bot/current/.venv/bin/python -I -B \
+  /opt/football-bot/current/apps/t2_gap_boundary.py --apply
+```
+
+The command verifies the confirmation file and backup digest, the clean exact
+checkout, all five stopped services, database operator privileges, current
+scope and failure, and the provider's current channel `pts` without fetching
+messages or history. One transaction records the body-free skipped interval,
+sets that channel's processing and Telegram checkpoint boundaries, and
+deactivates only its exact failure row. A redacted typed `pass` changes the
+active source-stop count from four to three; an exact repeat reports
+`advanced:false` without another Telegram capture. A `blocked` result or
+uncertain exit leaves services stopped; inspect redacted status and database
+state before any retry. Never hand-edit `pts`, clear a failure flag alone, or
+run this procedure for the other three streams under #124.
+
 ## Protected acceptance gate
 
 Run the separately authorized protected live smoke only against the exact
