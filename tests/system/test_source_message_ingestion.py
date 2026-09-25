@@ -4825,7 +4825,6 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
                 kind=SourceEventKind.EDIT,
                 body="Earlier first-seen edit that became a Source Message.",
                 event_time=start + timedelta(milliseconds=800),
-                message_created_at=start + timedelta(milliseconds=500),
                 registry_generation=1,
             )
             assert system.process_next_channel_telegram_difference(
@@ -4845,6 +4844,9 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
     while system.process_next_source_event():
         pass
     assert len(system.source_messages()) == 2
+    original_history = system.source_chat_history_progress(
+        identity=identities[0], registry_generation=1
+    )
 
     failures = system.ingestion_failures()
     selected = next(
@@ -4894,6 +4896,17 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
         1,
     )
     assert len(system.source_messages()) == 2
+    history_requests = len(telethon.history_requests)
+    assert not system.process_next_source_chat_history(
+        identity=identities[0], registry_generation=1
+    )
+    assert (
+        system.source_chat_history_progress(
+            identity=identities[0], registry_generation=1
+        )
+        == original_history
+    )
+    assert len(telethon.history_requests) == history_requests
     with psycopg.connect(fresh_database_url) as connection:
         assert connection.execute(
             "SELECT count(*) FROM football_runtime.ingestion_failures WHERE active"
@@ -4934,7 +4947,6 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
         kind=SourceEventKind.EDIT,
         body="An edited message from the unprocessed interval.",
         event_time=boundary_at + timedelta(seconds=1),
-        message_created_at=boundary_at + timedelta(seconds=1),
         registry_generation=1,
     )
     clock.advance_to(boundary_at + timedelta(seconds=2))
@@ -4996,7 +5008,6 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
         kind=SourceEventKind.EDIT,
         body="First observed edit of a post-boundary message.",
         event_time=boundary_at + timedelta(seconds=3),
-        message_created_at=boundary_at + timedelta(seconds=3),
         registry_generation=1,
     )
     clock.advance_to(boundary_at + timedelta(seconds=6))
@@ -5026,7 +5037,6 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
         kind=SourceEventKind.EDIT,
         body="Earlier durable source message, edited later.",
         event_time=boundary_at + timedelta(seconds=7),
-        message_created_at=start + timedelta(milliseconds=500),
         registry_generation=1,
     )
     clock.advance_to(boundary_at + timedelta(seconds=8))
@@ -5050,7 +5060,6 @@ def test_one_confirmed_gap_boundary_admits_the_next_durable_source_event(
         kind=SourceEventKind.EDIT,
         body="Fresh source message, edited after its durable create.",
         event_time=boundary_at + timedelta(seconds=9),
-        message_created_at=boundary_at,
         registry_generation=1,
     )
     clock.advance_to(boundary_at + timedelta(seconds=10))

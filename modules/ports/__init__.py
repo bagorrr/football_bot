@@ -1451,6 +1451,15 @@ class AcceptanceRoleStore(ConversationStore, Protocol):
         """Read durable bounded-history progress without changing it."""
         ...
 
+    def source_chat_history_gap_boundary(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> datetime | None:
+        """Read the original admission time for a confirmed current gap."""
+        ...
+
     def record_source_chat_history_outcome(
         self,
         *,

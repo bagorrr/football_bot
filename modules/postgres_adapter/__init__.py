@@ -221,6 +221,7 @@ _LEGACY_MIGRATION_NAMES = (
     "0066_source_chat_ingestion_checkpoint_read_policy.sql",
     "0067_one_source_gap_boundary.sql",
     "0068_gap_edit_existing_message_read.sql",
+    "0069_gap_history_admission_boundary.sql",
 )
 
 _MATERIAL_SCHEMA_FINGERPRINTS = (
@@ -293,6 +294,7 @@ _MATERIAL_SCHEMA_FINGERPRINTS = (
     "1b58be73fb4ebee429eacf48f7342c8e44964200d30dedbaebba6652e3f4669f",
     "4b40f90b297e97b39702aab3b2874f2d41c9441bb69d3ca40255cbeda8e78b35",
     "22b0409593e3f5a2544d542d6712ac98f94d8fe4efccc0cf675e5ad2d3bdf078",
+    "fec0a80853c5f290e97f5c52449805b3619b713af48d502f31d336d37efc4d75",
 )
 
 _SUPPORTED_LEGACY_SCHEMA_PREFIXES = {
@@ -4863,6 +4865,30 @@ class PostgresRoleStore:
             last_source_event_id=row["last_source_event_id"],
             advanced_at=row["advanced_at"],
         )
+
+    def source_chat_history_gap_boundary(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> datetime | None:
+        """Read the original admission time for a confirmed current gap."""
+        if self._role is not RuntimeRole.INGESTION:
+            raise ConversationAccessDeniedError
+        with psycopg.connect(self._database_url) as connection:
+            row = connection.execute(
+                """
+                SELECT football_runtime.read_source_stream_gap_original_started_at(
+                    %s, %s, %s
+                )
+                """,
+                (identity.kind.value, identity.telegram_id, registry_generation),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        if not isinstance(row[0], datetime) or row[0].tzinfo is None:
+            raise ValueError("Source Chat history gap boundary is invalid")
+        return row[0]
 
     @staticmethod
     def _record_history_progress_in(

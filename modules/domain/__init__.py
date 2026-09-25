@@ -802,7 +802,6 @@ class _TelegramDifferenceProgress:
     revision: int
     kind: SourceEventKind
     event_time: datetime
-    message_created_at: datetime | None = None
     registry_generation: int = 1
     bounded_metadata: Mapping[str, Any] = field(
         default_factory=empty_bounded_source_metadata
@@ -841,11 +840,6 @@ class _TelegramDifferenceProgress:
             raise ValueError("Source Message identity and revision must be positive")
         if self.event_time.tzinfo is None:
             raise ValueError("Source Event time must be timezone-aware")
-        if self.message_created_at is not None and (
-            not isinstance(self.message_created_at, datetime)
-            or self.message_created_at.tzinfo is None
-        ):
-            raise ValueError("Telegram message creation time must be timezone-aware")
         if (self.transport_event_id is None) != (self.transport_order is None):
             raise ValueError("Telegram transport identity and order must be paired")
         if self.transport_event_id is not None and (

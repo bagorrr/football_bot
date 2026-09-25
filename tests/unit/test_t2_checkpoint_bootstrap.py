@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
@@ -131,6 +131,14 @@ class _Store:
     ) -> TelegramHistoryProgress | None:
         return self.history.get((identity, registry_generation))
 
+    def source_chat_history_gap_boundary(
+        self,
+        *,
+        identity: TelegramPeerIdentity,
+        registry_generation: int,
+    ) -> datetime | None:
+        return None
+
     def initialize_source_chat_history_progress(
         self,
         *,
@@ -229,6 +237,52 @@ def test_bootstrap_initializes_only_missing_state_from_verified_boundaries() -> 
     assert second.channel_checkpoints_initialized == 0
     assert second.history_progress_initialized == 0
     assert source.account_captures == 1
+
+
+def test_bootstrap_rechecks_original_completed_history_after_confirmed_gap() -> None:
+    class RecoveredStore(_Store):
+        recovered = False
+
+        def source_chat_ingestion_activation_boundary(
+            self,
+            *,
+            identity: TelegramPeerIdentity,
+            registry_generation: int,
+        ) -> tuple[datetime, str] | None:
+            if self.recovered and identity == IDENTITIES[0]:
+                return NOW + timedelta(minutes=1), "channel-pts:12"
+            return super().source_chat_ingestion_activation_boundary(
+                identity=identity, registry_generation=registry_generation
+            )
+
+        def source_chat_history_gap_boundary(
+            self,
+            *,
+            identity: TelegramPeerIdentity,
+            registry_generation: int,
+        ) -> datetime | None:
+            return NOW if self.recovered and identity == IDENTITIES[0] else None
+
+    source = _Source()
+    store = RecoveredStore()
+    bootstrap_t2_checkpoint_state(source=source, store=store, initialized_at=NOW)
+    original = store.history[(IDENTITIES[0], 1)]
+    store.recovered = True
+    store.channels[(IDENTITIES[0], 1)] = TelegramChannelCheckpoint(12)
+
+    report = bootstrap_t2_checkpoint_state(
+        source=source, store=store, initialized_at=NOW
+    )
+
+    assert report == type(report)(False, 0, 0)
+    assert store.history[(IDENTITIES[0], 1)] == original
+    assert len(store.history_initializations) == 4
+
+    del store.history[(IDENTITIES[0], 1)]
+    with pytest.raises(T2CheckpointBootstrapError) as error:
+        bootstrap_t2_checkpoint_state(source=source, store=store, initialized_at=NOW)
+    assert error.value.reason is IngestionFailureReason.CHECKPOINT_INVALID
+    assert len(store.history_initializations) == 4
 
 
 def test_bootstrap_preflights_channel_pts_before_writing_any_state() -> None:
